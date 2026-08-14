@@ -4,19 +4,33 @@ An automated, high-precision Python pipeline for the acquisition, reduction, tim
 
 ## 🔭 Pipeline Architecture
 
-The pipeline consists of five primary stages designed to transition from raw spacecraft data to physical stellar parameters:
+Five sequential stages take raw spacecraft data to physical stellar parameters. Each stage is a standalone script under `src/` and accepts an optional target-catalogue argument so a single batch can be processed in isolation.
 
-1.  **Target Selection (`TargetSelection.py`):** Queries the Kreiner (2004) database and cross-references VSX/GCVS to identify short-period binary candidates with TESS coverage.
-2.  **Data Acquisition (`DataAcquisition.py`):** Performs mission-standard cleaning of PDCSAP data, including hard bitmasking and 4σ statistical outlier rejection.
-3.  **O–C Analysis (`OCAnalysis.py`):** Utilizes the Kwee–van Woerden algorithm to extract precise barycentric times of minimum (ToM) and refine orbital ephemerides against a 20-year baseline.
-4.  **Stellar Modeling (`Modeling.py`):** Initializes high-resolution 3D stellar meshes using PHOEBE 2, incorporating dynamic radiative physics (von Zeipel's Law).
-5.  **Posterior Optimization (`Optimization.py`):** Solves the astrophysical inverse problem using the emcee affine-invariant MCMC sampler with MPI orchestration for high-performance computing.
+1. **Target Selection (`TargetSelection.py`):** Queries the Kreiner (2004) database and cross-references VSX/GCVS to identify short-period (P < 1 d), long-neglected EW/EB candidates with TESS coverage. Outputs `neglected_targets.csv`.
+2. **Data Acquisition (`DataAcquisition.py`):** Retrieves mission-standard PDCSAP light curves (SPOC → TESS-SPOC → QLP fallback, keyed on TIC ID to avoid name-resolution collisions), applies hard bitmasking and 4σ outlier rejection, and validates products by baseline/sector before use (rejecting corrupt partial-FFI stubs). Can stitch multiple sectors when coverage is thin.
+3. **O–C Analysis (`OCAnalysis.py`):** Extracts precise barycentric times of minimum via the Kwee–van Woerden algorithm and refines the linear ephemeris against the ~20-year Kreiner baseline. A fold-quality self-check rejects a refined period that folds worse than the catalogue period.
+4. **Stellar Modeling (`Modeling.py`):** Builds PHOEBE 2 forward-model bundles with blackbody atmospheres, the contact "double-flip" constraint hierarchy, dynamic gravity darkening (von Zeipel 1924 / Lucy 1967 across the 8000 K boundary), and Gaia DR3 temperature anchoring for the fixed primary.
+5. **Posterior Optimization (`Optimization.py`):** Solves the inverse problem with a Nelder–Mead pre-wash followed by the `emcee` affine-invariant MCMC sampler, MPI-parallelised over walkers. Chains are checkpointed and resumable, and posteriors are reported with asymmetric 1σ uncertainties.
+
+`GenerateThesisTables.py` renders a LaTeX results table from the per-target output.
 
 ## 📊 Scientific Context
 
-This project focuses on "Neglected" binary systems where historical ground-based timings have deviated significantly from modern predictions. The pipeline acts as a thermodynamic filter, identifying physical evolutions such as mass transfer and secular timing drifts.
+The project targets "neglected" binaries whose historical ground-based timings have drifted from modern predictions. With single-band photometry the light curve constrains the **fractional** radii (r = R/a), inclination, temperature ratio, and — for contact/total-eclipse systems — a photometric mass ratio; absolute masses and radii require spectroscopic follow-up.
 
-## 🛠️ Installation & Setup
+## 🗂️ Repository Layout
+
+```
+src/        pipeline stages 01–05 + the table generator
+audits/     standalone diagnostic scripts (light-curve, O–C, modeling, phase-offset)
+docs/       methodology notes and expansion plans
+data/       tominima tables and the sample definition (data/targets/)
+tools/      sync_from_working_tree.py — publish-mirror updater
+```
+
+Large data products (PHOEBE bundles, FITS light curves) and the private running log are intentionally not tracked here (see `.gitignore`).
+
+## 🛠️ Installation
 
 ```bash
 pip install phoebe emcee lightkurve numpy scipy matplotlib astropy astroquery mpi4py
@@ -24,10 +38,24 @@ pip install phoebe emcee lightkurve numpy scipy matplotlib astropy astroquery mp
 
 ## 🚀 Execution
 
-To run the full optimization suite using MPI parallelization:
+Run a stage against one batch (all stages take the same optional catalogue argument):
 
 ```bash
-mpirun --use-hwthread-cpus -n 14 python3 Optimization.py
+python src/DataAcquisition.py Targets/neglected_targets_batch1.csv
+python src/OCAnalysis.py      Targets/neglected_targets_batch1.csv
+python src/Modeling.py        Targets/neglected_targets_batch1.csv
+```
+
+Stage 05 runs under MPI (one walker per rank) and is resumable — re-running the same command continues an interrupted chain and skips completed targets:
+
+```bash
+mpirun --use-hwthread-cpus -n 14 python3 src/Optimization.py Targets/neglected_targets_batch1.csv
+```
+
+Run-size knobs are environment-overridable for fast smoke tests (defaults are production values):
+
+```bash
+MCMC_NITERS=45 MCMC_CHECKPOINT=15 MCMC_BURNIN=10 NM_MAXITER=20 python3 src/Optimization.py trial.csv
 ```
 
 ## 📄 License

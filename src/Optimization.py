@@ -1,505 +1,1051 @@
 """
 ================================================================================
-SCRIPT 05 — INVERSE PROBLEM & POSTERIOR OPTIMIZATION
+SCRIPT 05 — MCMC POSTERIOR OPTIMISATION (PHOEBE 2 + emcee)
 ================================================================================
-Thesis: Thermodynamic Analysis and Modeling of Blackbody Radiation in
-        Eclipsing Binary Systems Using Space-Based Photometry
+Summary:
+    Solves the astrophysical inverse problem by mapping the joint posterior
+    probability distribution over the free geometric and thermodynamic
+    parameters of each binary system. The optimisation proceeds in two stages:
 
-Methodology Step 4.5:
-    Solves the astrophysical inverse problem using the emcee affine-invariant 
-    MCMC sampler. Maps the joint posterior probability distribution for 
-    thermodynamic and geometric parameters. Utilizes MPI orchestration for 
-    High-Performance Computing (HPC) distribution of 3D mesh rendering.
+        Stage 1 — Nelder-Mead pre-wash:
+            A deterministic simplex optimiser performs ~200 iterations to locate
+            the χ² valley before MCMC begins. This prevents walkers from spending
+            burn-in cycles in unphysical parameter regions and reduces the risk of
+            early Roche-lobe overflow crashes.
+
+        Stage 2 — emcee MCMC sampling:
+            The affine-invariant ensemble sampler distributes MCMC_NWALKERS
+            parallel Markov chains across the parameter space. Because walkers
+            share position information through stretch moves, the sampler is
+            efficient across correlated, elongated posterior distributions — a
+            critical property for binary star inverse problems where inclination,
+            radius sum, and mass ratio are strongly degenerate in single-band
+            photometry.
+
+    Convergence is assessed via the integrated autocorrelation time τ and the
+    Gelman-Rubin R̂ statistic. A chain is declared converged when its length
+    exceeds 50τ and R̂ < 1.1 for all parameters.
+
+    The final best-fit model is computed with Wilson irradiation for contact
+    (EW) systems, capturing the strong mutual irradiation between overcontact
+    components that drives out-of-eclipse flux curvature.
+
+    MPI parallelisation distributes each per-walker PHOEBE 2 forward model
+    (the computational bottleneck) across available CPU threads. All file I/O
+    is performed exclusively by MPI rank 0 to prevent write collisions.
+
+Inputs:
+    neglected_targets.csv     — Target list from Script 01.
+    bundle_<star>.phoebe      — Initialised bundles from Script 04.
+
+Outputs:
+    results_<star>.csv            — Derived physical parameters with uncertainties.
+    bundle_<star>_final.phoebe    — Bundle with converged posterior distributions.
+    plots/phoebe_final_<star>.png — Best-fit model vs. TESS data plot.
 
 Dependencies:
     pip install phoebe emcee numpy matplotlib mpi4py
 
-Inputs:
-    benchmark_targets.csv — Pipeline target list.
-    bundle_<star>.phoebe  — Initialized models from Script 04.
+Run with MPI:
+    mpirun --use-hwthread-cpus -n 14 python3 05Optimization.py
 
-Outputs:
-    bundle_<star>_final.phoebe — Optimized bundles with converged posteriors.
-    results_<star>.csv         — Final derived physical parameters with errors.
-    plots/phoebe_final_<star>.png — Best-fit model verification.
+References:
+    Foreman-Mackey et al. (2013), PASP 125, 306 — emcee MCMC sampler.
+    Conroy et al. (2020), ApJS 250, 34 — PHOEBE 2 inverse-problem interface.
 ================================================================================
 """
 
-# ── Standard library imports ──────────────────────────────────────────────────
+# ── Standard library ──────────────────────────────────────────────────────────
 import csv
 import os
+import sys
 import warnings
+from typing import Optional
 
-# ── Third-party scientific library imports ────────────────────────────────────
+# Force PHOEBE to use only locally-installed passbands. On an offline/firewalled
+# host (e.g. WSL) PHOEBE otherwise tries to reach tables.phoebe-project.org for
+# passband update checks on essentially every forward model, and each attempt
+# blocks ~30–90 s × 3 retries — dominating the MCMC wall-clock (observed ~250 s
+# per step, almost all network timeout). TESS:T is already installed locally, so
+# disabling the online checks is safe. MUST be set before `import phoebe`.
+# (Override with PHOEBE_ENABLE_ONLINE_PASSBANDS=TRUE if a new passband is needed.)
+os.environ.setdefault("PHOEBE_ENABLE_ONLINE_PASSBANDS", "FALSE")
+
+# ── Scientific libraries ──────────────────────────────────────────────────────
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 import phoebe
-import emcee  
+import emcee
 
-# ── MPI HPC ORCHESTRATION ─────────────────────────────────────────────────────
-# We distribute the 3D mesh rendering (the computational bottleneck) across 
-# multiple logical threads while keeping the MCMC orchestration serial.
+# ── MPI parallelisation ───────────────────────────────────────────────────────
+# Each PHOEBE 2 forward model (one per MCMC walker per step) is dispatched to
+# a separate MPI worker. The master rank (0) orchestrates the sampler while
+# worker ranks execute run_compute() calls in parallel.
 try:
     from mpi4py import MPI
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()      # Rank 0: Master Orchestrator, Rank 1+: Worker Nodes
-    n_procs = comm.Get_size()   
+    mpi_comm      = MPI.COMM_WORLD
+    mpi_rank      = mpi_comm.Get_rank()
+    mpi_n_procs   = mpi_comm.Get_size()
 except ImportError:
-    rank = 0
-    n_procs = 1
+    mpi_rank    = 0
+    mpi_n_procs = 1
 
-def mprint(*args, **kwargs):
-    """Ensures terminal output is only generated by the Master node."""
-    if rank == 0:
+
+def master_print(*args, **kwargs) -> None:
+    """Print only from MPI rank 0 to avoid garbled interleaved output."""
+    if mpi_rank == 0:
         print(*args, **kwargs)
 
-if rank == 0:
-    mprint(f"\n[HPC] MPI Cluster initialized with {n_procs} processor cores.")
-# ─────────────────────────────────────────────────────────────────────────────
+
+if mpi_rank == 0:
+    master_print(f"\n[MPI] Cluster initialised: {mpi_n_procs} processor core(s).")
 
 warnings.filterwarnings("ignore")
 phoebe.logger(clevel="WARNING")
 
-PLOT_DIR = "plots"
-os.makedirs(PLOT_DIR, exist_ok=True)
+PLOT_OUTPUT_DIR: str = "plots"
+os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 1: CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
+# Temperature boundary for von Zeipel vs. Lucy bolometric coefficients.
+RADIATIVE_CONVECTIVE_BOUNDARY_K: float = 8_000.0
 
-# [EXPERT FIX] Corrected input file to match the output of previous pipeline stages.
-INPUT_CATALOG   = "neglected_targets.csv"
-SOLVER_STRATEGY = "emcee"  
 
-# MCMC parameters (Production run settings)
-MCMC_NWALKERS = 14         
-MCMC_NITER    = 2700       
-MCMC_BURNIN   = 400        
+# =============================================================================
+# SECTION 1 — CONFIGURATION
+# =============================================================================
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 2: FREE PARAMETER DEFINITIONS
-# ─────────────────────────────────────────────────────────────────────────────
+# Optional positional argument selects the target catalogue, so a single batch
+# can be optimised in isolation, e.g.:
+#   mpirun --use-hwthread-cpus -n 14 python3 -u 05Optimization.py \
+#       Targets/neglected_targets_batch1.csv 2>&1 | tee optimization_log.txt
+INPUT_CATALOG: str = sys.argv[1] if len(sys.argv) > 1 else "neglected_targets.csv"
 
-# For EW (contact) systems
-# [EXPERT FIX] The mass ratio (q) is notoriously degenerate with inclination and 
-# fillout factor in single-band photometry. It is explicitly kept FIXED at the 
-# Nelder-Mead derived value. Thesis documentation must note this physical assumption.
-FREE_PARAMETERS_CONTACT = {
-    "teff@secondary":      (3000, 10000, "Secondary effective temperature (K)"),
-    "incl@binary":         (50.0,  90.0, "Orbital inclination (degrees)"),
-    # [EXPERT FIX] Tightened fillout_factor limit from 0.95 to 0.70 to prevent 
-    # mesh collapse in highly distorted contact systems.
-    "fillout_factor@contact_envelope": (0.0, 0.70, "Fillout factor f"), 
+# MCMC sampler settings — production defaults, overridable via environment
+# variables for fast trial/smoke runs without editing this file, e.g.:
+#   MCMC_NITERS=45 MCMC_CHECKPOINT=15 MCMC_BURNIN=10 NM_MAXITER=20 \
+#       python3 05Optimization.py trial_05.csv
+# Under mpirun, export the vars and forward them: `export MCMC_NITERS=45; ...;
+#   mpirun -x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN -x NM_MAXITER ...`.
+MCMC_N_WALKERS: int = int(os.environ.get("MCMC_NWALKERS", 14))
+MCMC_N_ITERATIONS: int = int(os.environ.get("MCMC_NITERS", 2850))   # total steps per walker
+MCMC_BURN_IN_STEPS: int = int(os.environ.get("MCMC_BURNIN", 350))   # steps discarded before posterior
+
+# Nelder-Mead pre-wash iteration cap (Stage 1). Lower it for trial runs.
+NM_MAXITER: int = int(os.environ.get("NM_MAXITER", 200))
+
+# Checkpoint cadence: the MCMC runs in chunks of this many iterations, saving the
+# bundle (chains included) to disk after each chunk. This lets a long run be
+# stopped — even hard-killed — and resumed mid-chain from the last checkpoint,
+# which is essential for sharing a home desktop with the optimisation.
+MCMC_CHECKPOINT_NITERS: int = int(os.environ.get("MCMC_CHECKPOINT", 250))
+
+# Convergence criterion: chain must be longer than this multiple of τ.
+CONVERGENCE_MULTIPLIER: int = 50
+
+# Gelman-Rubin R̂ threshold below which a parameter is considered converged.
+RHAT_CONVERGENCE_THRESHOLD: float = 1.1
+
+
+# =============================================================================
+# SECTION 2 — FREE PARAMETER DEFINITIONS WITH PRIOR BOUNDS
+# =============================================================================
+# Format: "phoebe_twig": (lower_bound, upper_bound, "human description")
+#
+# The mass ratio q is held fixed for contact (EW) systems because it is
+# notoriously degenerate with inclination and fillout factor in single-band
+# photometry. This must be stated explicitly in the thesis methodology.
+#
+# For EB (detached) systems the inclination floor is set to 60° and radii
+# are capped at 1.0 to prevent ghost-star collapse (requiv → 0 or → overflow).
+
+FREE_PARAMS_CONTACT: dict[str, tuple[float, float, str]] = {
+    "teff@secondary":                   (3000, 10000, "Secondary effective temperature (K)"),
+    "incl@binary":                      (50.0,  90.0, "Orbital inclination (degrees)"),
+    "fillout_factor@contact_envelope":  (0.0,   0.50, "Contact fill-out factor f"),
+    # fillout upper limit tightened 0.70 -> 0.50: extreme overcontact geometries were
+    # failing the PHOEBE mesh ("Mesh failed / Projections are failing", lnprob=-inf)
+    # during the trial. 0.50 covers essentially all W UMa systems while keeping the
+    # walkers out of the mesh-collapse regime.
 }
 
-# For EB (detached/semi-detached) systems
-# [HARDENING] Radii capped at 1.0 and Inclination floor at 60.0 to prevent ghost-star collapse
-FREE_PARAMETERS_DETACHED = {
-    "teff@secondary":    (3000,  10000, "Secondary effective temperature (K)"),
-    "incl@binary":       (60.0,   90.0, "Orbital inclination (degrees)"),
-    "q@binary":          ( 0.1,    1.0, "Mass ratio m2/m1"),
-    "requiv@primary":    ( 0.1,    1.0, "Equivalent radius R1"),
-    "requiv@secondary":  ( 0.1,    1.0, "Equivalent radius R2"),
+FREE_PARAMS_DETACHED: dict[str, tuple[float, float, str]] = {
+    "teff@secondary":   (3000, 10000, "Secondary effective temperature (K)"),
+    "incl@binary":      (60.0,  90.0, "Orbital inclination (degrees)"),
+    "q@binary":         (0.1,   1.0,  "Mass ratio m₂/m₁"),
+    # NOTE: requiv is in SOLAR RADII; these placeholder bounds are REPLACED at
+    # runtime by sma-scaled Roche-lobe bounds in prepare_bundle_for_mcmc (the fit
+    # effectively constrains the fractional radius r = requiv / sma).
+    "requiv@primary":   (0.1,   1.0,  "Primary equivalent radius (R_sun; sma-scaled at runtime)"),
+    "requiv@secondary": (0.1,   1.0,  "Secondary equivalent radius (R_sun; sma-scaled at runtime)"),
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 3: HELPER FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
 
-def compute_chi2(b, free_params, dataset="lc01"):
-    """Computes the strict reduced chi-squared statistic (χ²_red).
-       [EXPERT FIX] Removed post-hoc flux scaling. The metric now mathematically 
-       reflects the exact residuals the solver is minimizing."""
+# =============================================================================
+# SECTION 3 — HELPER FUNCTIONS
+# =============================================================================
+
+def is_contact_morphology(gcvs_type: str) -> bool:
+    """
+    Decide whether a GCVS variability type denotes a contact (overcontact) binary.
+
+    Qualified contact codes ("EW/KW", "EW/DW", "EW:", "EW/RS", ...) must be
+    treated as contact systems; a bare `gcvs_type == "EW"` test misclassifies
+    them as detached and selects the wrong free-parameter set and irradiation
+    scheme. We strip the qualifier suffix and test only the leading code. This
+    must stay identical to the classifier in Script 04 so a bundle is optimised
+    under the same morphology it was built with.
+    """
+    base = gcvs_type.strip().upper().replace(":", "").split("/")[0]
+    return base == "EW"
+
+
+def eggleton_roche_radius(q: float) -> float:
+    """
+    Eggleton (1983) Roche-lobe radius in units of the semi-major axis.
+
+        r_L / a = 0.49 q^(2/3) / (0.6 q^(2/3) + ln(1 + q^(1/3)))
+
+    where q = M_star / M_companion for the star whose lobe is wanted. Used to cap
+    the detached requiv priors below Roche-lobe filling so the MCMC cannot stray
+    into L1-overflow geometries (the "potential > L1 critical value" condition seen
+    for TZ Lyr during Script 04 bundle construction).
+    """
+    q13 = q ** (1.0 / 3.0)
+    q23 = q13 * q13
+    return 0.49 * q23 / (0.6 * q23 + np.log(1.0 + q13))
+
+
+def compute_reduced_chi2(
+    bundle: object,
+    n_free_params: int,
+    dataset: str = "lc01",
+) -> tuple[float, float, int]:
+    """
+    Compute the reduced chi-squared goodness-of-fit statistic.
+
+    χ²_red = Σ[(O_i − C_i)² / σ_i²] / (N − n_free)
+
+    This metric reflects the exact residuals the MCMC sampler minimises
+    and is computed without any post-hoc flux rescaling.
+
+    Parameters
+    ----------
+    bundle:
+        PHOEBE 2 bundle with a computed solution model.
+    n_free_params:
+        Number of free parameters (degrees-of-freedom denominator term).
+    dataset:
+        PHOEBE 2 dataset label (default "lc01").
+
+    Returns
+    -------
+    chi2:
+        Raw chi-squared sum.
+    chi2_reduced:
+        Reduced chi-squared (chi2 / dof).
+    n_observations:
+        Number of observed data points.
+    """
     try:
-        obs_flux  = b.get_value("fluxes", dataset=dataset, context="dataset")
-        obs_sigma = b.get_value("sigmas", dataset=dataset, context="dataset")
-        syn_flux  = b.get_value("fluxes", dataset=dataset, model="solution_model")
+        obs_flux  = bundle.get_value("fluxes", dataset=dataset, context="dataset")
+        obs_sigma = bundle.get_value("sigmas", dataset=dataset, context="dataset")
+        syn_flux  = bundle.get_value("fluxes", dataset=dataset, model="solution_model")
 
-        n_obs     = len(obs_flux)
-        n_free    = len(free_params)
-        dof       = max(1, n_obs - n_free)
-        chi2      = np.sum(((obs_flux - syn_flux) / obs_sigma) ** 2)
-        return chi2, (chi2 / dof), n_obs
+        n_obs       = len(obs_flux)
+        dof         = max(1, n_obs - n_free_params)
+        chi2        = float(np.sum(((obs_flux - syn_flux) / obs_sigma) ** 2))
+        return chi2, chi2 / dof, n_obs
     except Exception:
         return np.inf, np.inf, 0
 
-def check_convergence(chains):
-    """[EXPERT FIX] Replaced Gelman-Rubin with Integrated Autocorrelation Time (τ).
-       emcee walkers are inherently correlated. To prove convergence, the chain 
-       length (N) must be strictly greater than 50 * τ."""
+
+def assess_autocorrelation_convergence(mcmc_chains: np.ndarray) -> np.ndarray:
+    """
+    Compute the integrated autocorrelation time τ for each free parameter.
+
+    A chain is converged when its length N satisfies N > CONVERGENCE_MULTIPLIER × τ.
+    The emcee autocorr module uses the Goodman & Weare (2010) windowing function
+    and returns the median τ across all walkers for each parameter dimension.
+
+    Parameters
+    ----------
+    mcmc_chains:
+        MCMC chain array with shape (n_steps, n_walkers, n_params).
+
+    Returns
+    -------
+    tau_values:
+        Array of integrated autocorrelation times, one per free parameter.
+        Returns np.inf for each parameter if computation fails.
+    """
     try:
-        # Calculate tau, tolerating chains that haven't fully reached 50x length yet
-        tau = emcee.autocorr.integrated_time(chains, tol=0)
-        return tau
-    except Exception as e:
-        return np.inf
+        # tol=0 prevents the function from raising an error when the chain
+        # is not yet long enough to satisfy the 50τ convergence criterion.
+        return emcee.autocorr.integrated_time(mcmc_chains, tol=0)
+    except Exception:
+        return np.full(mcmc_chains.shape[-1], np.inf)
 
-def extract_results(b, free_params):
-    """Extracts finalized optimized parameters from the bundle for reporting."""
-    results = {}
-    
-    # [EXPERT FIX] Explicitly specify context='component' to avoid ambiguity 
-    # with distributions, priors, or solver parameters.
-    T1 = b.get_value("teff", component="primary", context="component")
-    T2 = b.get_value("teff", component="secondary", context="component")
 
-    results["T1_K"]       = (T1,      0.0)
-    results["T2_K"]       = (T2,      np.nan)
-    results["T2_over_T1"] = (T2 / T1, np.nan)
-    
-    # incl and q are at the binary/orbit level, but we specify context='component' 
-    # as PHOEBE places orbit parameters in that hierarchy.
-    results["incl_deg"]   = (b.get_value("incl", component="binary", context="component"),  np.nan)
-    results["q"]          = (b.get_value("q", component="binary", context="component"),     np.nan)
+def compute_posterior_summary(
+    bundle: object,
+    solution: str = "best_solution",
+    burnin: int = 0,
+) -> dict[str, tuple[float, float, float]]:
+    """
+    Summarise the MCMC posterior for each fitted parameter as (median, −σ, +σ).
+
+    Uncertainties are taken as the 16th/50th/84th percentiles of the
+    post-burn-in, walker-flattened chain — the standard asymmetric 1σ credible
+    interval for emcee posteriors (Foreman-Mackey et al. 2013). This replaces
+    the earlier placeholder that reported NaN for every uncertainty, which left
+    the results tables without error bars.
+
+    Parameters
+    ----------
+    bundle:
+        Bundle holding the completed MCMC solution.
+    solution:
+        PHOEBE solution label (default "best_solution").
+    burnin:
+        Number of initial steps discarded from each walker before summarising.
+
+    Returns
+    -------
+    A dict keyed by a normalised PHOEBE qualifier (e.g. "teff@secondary",
+    "incl", "q", "fillout_factor", "requiv@primary") mapping to
+    (median, sigma_minus, sigma_plus). Empty if the chain is unavailable.
+    """
+    summary: dict[str, tuple[float, float, float]] = {}
+    try:
+        samples      = np.asarray(bundle.get_value("samples", solution=solution))
+        fitted_twigs = list(bundle.get_value("fitted_twigs", solution=solution))
+    except Exception:
+        return summary
+
+    # emcee stores chains in native order (n_steps, n_walkers, n_params) — time is
+    # axis 0. Discard the burn-in STEPS along axis 0, then flatten across the
+    # remaining steps and all walkers. (Slicing axis 1 here would wrongly discard
+    # walkers rather than early steps.)
+    if samples.ndim != 3:
+        return summary
+    # Orient so that axis 0 is steps even if a future PHOEBE version transposes.
+    if samples.shape[0] == MCMC_N_WALKERS and samples.shape[1] != MCMC_N_WALKERS:
+        samples = np.swapaxes(samples, 0, 1)
+    n_steps = samples.shape[0]
+    cut     = min(max(0, burnin), max(0, n_steps - 1))
+    flat    = samples[cut:, :, :].reshape(-1, samples.shape[2])
+
+    p16, p50, p84 = np.percentile(flat, [16, 50, 84], axis=0)
+    for i, twig in enumerate(fitted_twigs):
+        qualifier = twig.split("@")[0]
+        component = twig.split("@")[1] if "@" in twig else ""
+        # Retain the component tag only when it distinguishes the two stars,
+        # so the extractor can match e.g. requiv@primary vs requiv@secondary.
+        key = (f"{qualifier}@{component}"
+               if component in ("primary", "secondary") else qualifier)
+        summary[key] = (float(p50[i]), float(p50[i] - p16[i]), float(p84[i] - p50[i]))
+    return summary
+
+
+def extract_best_fit_parameters(
+    bundle: object,
+    free_params: dict[str, tuple],
+    posterior: dict[str, tuple[float, float, float]],
+) -> dict[str, tuple[float, float, float]]:
+    """
+    Combine adopted posterior-median point values with MCMC uncertainties.
+
+    Point values are read from the bundle (already set to the posterior median by
+    adopt_solution); the asymmetric ±σ come from `posterior`, the output of
+    compute_posterior_summary(). Parameters that were held fixed (T1, and q for
+    contact systems) carry zero / NaN uncertainty as appropriate.
+
+    Parameters
+    ----------
+    bundle:
+        Bundle after adopt_solution() has been called.
+    free_params:
+        The free parameter dictionary, used to detect contact vs. detached morphology.
+    posterior:
+        Per-qualifier (median, −σ, +σ) summary from compute_posterior_summary().
+
+    Returns
+    -------
+    A dictionary mapping descriptive parameter keys to (value, −σ, +σ) tuples.
+    """
+    def unc(*keys: str) -> tuple[float, float]:
+        """Return (−σ, +σ) for the first matching posterior key, else (NaN, NaN)."""
+        for k in keys:
+            if k in posterior:
+                return posterior[k][1], posterior[k][2]
+        return np.nan, np.nan
+
+    t1   = bundle.get_value("teff", component="primary",   context="component")
+    t2   = bundle.get_value("teff", component="secondary", context="component")
+    incl = bundle.get_value("incl", component="binary",    context="component")
+    q    = bundle.get_value("q",    component="binary",    context="component")
+
+    t2_m,   t2_p   = unc("teff@secondary")
+    incl_m, incl_p = unc("incl", "incl@binary")
+    q_m,    q_p    = unc("q", "q@binary")
+
+    # T1 is held fixed, so the T₂/T₁ ratio inherits the secondary's error scaled by 1/T1.
+    ratio = t2 / t1
+    if np.isfinite(t2_m):
+        ratio_m, ratio_p = t2_m / t1, t2_p / t1
+    else:
+        ratio_m, ratio_p = np.nan, np.nan
+
+    results: dict[str, tuple[float, float, float]] = {
+        "T1_K":       (t1, 0.0, 0.0),
+        "T2_K":       (t2, t2_m, t2_p),
+        "T2_over_T1": (ratio, ratio_m, ratio_p),
+        "incl_deg":   (incl, incl_m, incl_p),
+        "q":          (q, q_m, q_p),
+    }
 
     if "fillout_factor@contact_envelope" in free_params:
         try:
-            # fillout factor is unique to the contact envelope feature
-            results["fillout_factor"] = (b.get_value("fillout_factor", context="component"), np.nan)
+            f_val      = bundle.get_value("fillout_factor", context="component")
+            f_m, f_p   = unc("fillout_factor", "fillout_factor@contact_envelope")
+            results["fillout_factor"] = (f_val, f_m, f_p)
         except Exception:
-            results["fillout_factor"] = (np.nan, np.nan)
+            results["fillout_factor"] = (np.nan, np.nan, np.nan)
     else:
         try:
-            results["requiv_primary"]   = (b.get_value("requiv", component="primary", context="component"),   np.nan)
-            results["requiv_secondary"] = (b.get_value("requiv", component="secondary", context="component"), np.nan)
+            # Report FRACTIONAL radii r = requiv / sma. With single-band photometry
+            # the absolute scale (sma) is degenerate — the light curve constrains
+            # only the relative radii r = R/a, the inclination, and the temperature
+            # ratio; absolute radii and masses require spectroscopic radial
+            # velocities (Kallrath & Milone 1999; Prša & Zwitter 2005). sma is held
+            # fixed, so the requiv uncertainties scale by 1/sma into r.
+            sma      = bundle.get_value("sma", component="binary", context="component")
+            r1       = bundle.get_value("requiv", component="primary",   context="component")
+            r2       = bundle.get_value("requiv", component="secondary", context="component")
+            r1_m, r1_p = unc("requiv@primary")
+            r2_m, r2_p = unc("requiv@secondary")
+            scale = lambda x: x / sma if np.isfinite(x) else np.nan
+            results["r1_frac"] = (r1 / sma, scale(r1_m), scale(r1_p))
+            results["r2_frac"] = (r2 / sma, scale(r2_m), scale(r2_p))
         except Exception:
-            results["requiv_primary"]   = (np.nan, np.nan)
-            results["requiv_secondary"] = (np.nan, np.nan)
+            results["r1_frac"] = (np.nan, np.nan, np.nan)
+            results["r2_frac"] = (np.nan, np.nan, np.nan)
 
     return results
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 4: MAIN OPTIMIZATION LOOP
-# ─────────────────────────────────────────────────────────────────────────────
 
-targets = []
+def mpi_broadcast_int(value: int) -> int:
+    """Broadcast an int from rank 0 to all ranks (identity in serial mode).
+
+    Used so every MPI rank agrees on how many MCMC iterations are complete and
+    therefore executes the same number of collective run_solver() chunks — a
+    mismatch would deadlock the pool.
+    """
+    if mpi_n_procs > 1:
+        return mpi_comm.bcast(value, root=0)
+    return value
+
+
+def completed_iterations(bundle: object, solution: str = "best_solution") -> int:
+    """Return how many MCMC steps the saved chain already contains (0 if none).
+
+    PHOEBE stores the emcee chain in native order (n_steps, n_walkers, n_params),
+    so the step count is axis 0 — NOT axis 1 (which is the walker count, and which
+    an earlier version mistakenly returned, reporting 14/30 after 10 steps).
+    """
+    try:
+        samples = np.asarray(bundle.get_value("samples", solution=solution))
+        if samples.ndim != 3:
+            return 0
+        # Robust against transposition: the steps axis is the one that is not the
+        # walker count (axis 1 in emcee-native order).
+        if samples.shape[1] == MCMC_N_WALKERS:
+            return int(samples.shape[0])
+        if samples.shape[0] == MCMC_N_WALKERS:
+            return int(samples.shape[1])
+        return int(samples.shape[0])
+    except Exception:
+        return 0
+
+
+def derive_free_params_meta(
+    star_name: str,
+    variable_type: str,
+) -> tuple[dict, bool, int]:
+    """
+    Reconstruct the free-parameter set, morphology flag, and parameter count
+    without touching the bundle.
+
+    Used on the resume path, where the priors and solver already live inside the
+    loaded checkpoint and only the membership/count metadata is needed downstream
+    (degrees of freedom, contact-vs-detached result extraction).
+    """
+    is_contact = is_contact_morphology(variable_type)
+    free_params = (
+        FREE_PARAMS_CONTACT.copy() if is_contact else FREE_PARAMS_DETACHED.copy()
+    )
+    if star_name == "BD And":
+        free_params["l3_frac@lc01"] = (0.0, 0.20, "Third-light contamination fraction")
+    return free_params, is_contact, len(free_params)
+
+
+def prepare_bundle_for_mcmc(
+    star_name: str,
+    variable_type: str,
+    bundle_path: str,
+) -> Optional[tuple]:
+    """
+    Load a Script-04 bundle and apply all pre-MCMC configuration (physics,
+    sanitisation, limb darkening, priors, Nelder-Mead pre-wash, emcee solver).
+
+    Returns (bundle, free_params, is_contact_binary, n_free_params), or None if
+    the input bundle is missing. This is the "fresh start" path; on resume the
+    equivalent state is restored from the checkpoint instead.
+    """
+    if not os.path.exists(bundle_path):
+        master_print(f"  WARNING: {bundle_path} not found. Skipping.")
+        return None
+
+    bundle = phoebe.load(bundle_path)
+    master_print(f"  Bundle loaded: {bundle_path}")
+
+    # ── 5A: RADIATIVE PHYSICS ─────────────────────────────────────────────────
+    # Re-apply physics coefficients here in case the bundle was saved with
+    # default values or the temperature was adjusted since Script 04.
+    for component in ["primary", "secondary"]:
+        teff = bundle.get_value(f"teff@{component}")
+        if teff >= RADIATIVE_CONVECTIVE_BOUNDARY_K:
+            bundle.set_value(f"gravb_bol@{component}", 1.0)
+            bundle.set_value(f"irrad_frac_refl_bol@{component}", 1.0)
+            master_print(f"  [physics] {component}: radiative  β₁=1.0, A=1.0  ({teff:.0f} K)")
+        else:
+            bundle.set_value(f"gravb_bol@{component}", 0.32)
+            bundle.set_value(f"irrad_frac_refl_bol@{component}", 0.6)
+            master_print(f"  [physics] {component}: convective β₁=0.32, A=0.6  ({teff:.0f} K)")
+
+    # ── 5B: DATA SANITISATION ─────────────────────────────────────────────────
+    # Duplicate timestamps cause PHOEBE 2's interpolation to fail. Remove them
+    # by rebuilding the dataset with only the unique-time subset.
+    try:
+        obs_times  = bundle.get_value("times",  dataset="lc01", context="dataset")
+        obs_fluxes = bundle.get_value("fluxes", dataset="lc01", context="dataset")
+        obs_sigmas = bundle.get_value("sigmas", dataset="lc01", context="dataset")
+        passband   = bundle.get_value("passband",   dataset="lc01", context="dataset")
+        pblum_mode = bundle.get_value("pblum_mode", dataset="lc01")
+
+        unique_mask     = np.unique(obs_times, return_index=True)[1]
+        n_duplicates    = len(obs_times) - len(unique_mask)
+
+        bundle.remove_dataset("lc01")
+        bundle.add_dataset(
+            "lc",
+            times=obs_times[unique_mask],
+            fluxes=obs_fluxes[unique_mask],
+            sigmas=obs_sigmas[unique_mask],
+            passband=passband,
+            dataset="lc01",
+        )
+        # Detached binaries: 'dataset-scaled' silences the secondary's flux
+        # contribution (secondary eclipse and ellipsoidal variation disappear from
+        # the model). 'component-coupled' derives pblum@secondary from the physical
+        # T/R ratio relative to the primary, preserving the correct flux ratio.
+        pblum_mode_eff = (pblum_mode if is_contact_morphology(variable_type)
+                          else "component-coupled")
+        bundle.set_value("pblum_mode", dataset="lc01", value=pblum_mode_eff)
+        if pblum_mode_eff != pblum_mode:
+            master_print(f"  [pblum] Detached binary: pblum_mode "
+                         f"'{pblum_mode}' → '{pblum_mode_eff}'")
+        master_print(f"  [sanitise] Removed {n_duplicates} duplicate timestamps.")
+    except Exception as sanitise_error:
+        master_print(f"  [sanitise warning] {sanitise_error}")
+
+    # ── 5C: LIMB DARKENING ────────────────────────────────────────────────────
+    # A blackbody is not a uniform disk: the Eddington-Barbier relation
+    # predicts that limb-regions appear cooler due to shallower optical-depth
+    # sampling. u ≈ 0.6 is a standard linear LD coefficient for solar-type
+    # stars in the TESS bandpass and prevents the uniform-disk approximation
+    # from biasing the fitted inclination and radii.
+    bundle.set_value("ld_mode_bol@primary",   "manual")
+    bundle.set_value("ld_mode_bol@secondary", "manual")
+    for comp in ["primary", "secondary"]:
+        try:
+            bundle.set_value(f"ld_mode@{comp}@lc01",   "manual")
+            bundle.set_value(f"ld_func@{comp}@lc01",   "linear")
+            bundle.set_value(f"ld_coeffs@{comp}@lc01", [0.6])
+        except Exception as ld_error:
+            master_print(f"  [LD warning] {comp}: {ld_error}")
+
+    # ── 5D: FREE PARAMETERS & PRIORS ─────────────────────────────────────────
+    is_contact_binary = is_contact_morphology(variable_type)
+
+    if is_contact_binary:
+        try:
+            bundle.flip_constraint("fillout_factor", solve_for="pot")
+        except Exception:
+            pass  # constraint may already be inverted from Script 04
+
+    free_params = (
+        FREE_PARAMS_CONTACT.copy() if is_contact_binary
+        else FREE_PARAMS_DETACHED.copy()
+    )
+
+    # Apply a temperature prior anchored to T1 to prevent the secondary from
+    # wandering into physically implausible regions during burn-in.
+    t1_current = bundle.get_value("teff@primary", context="component")
+    if is_contact_binary:
+        # W-type W UMa systems can have T2 > T1; allow up to 25% above T1.
+        t2_lower, t2_upper = 0.80 * t1_current, 1.25 * t1_current
+    else:
+        t2_lower, t2_upper = 0.70 * t1_current, 1.10 * t1_current
+
+    # --- β₁ regime lock (fixes the frozen-gravity-darkening bug) -------------
+    # gravb_bol / irrad_frac_refl_bol are set once (5A) from the current
+    # secondary temperature and are NOT re-evaluated inside PHOEBE's emcee solver.
+    # If the T₂ prior straddled the 8000 K convective/radiative boundary, walkers
+    # crossing it would keep the stale coefficient — physically inconsistent.
+    # We therefore clamp the prior to the regime the secondary currently sits in,
+    # so the coefficient assigned in 5A is valid for the entire chain. The hard
+    # discontinuity at 8000 K (Lucy 1967 ↔ von Zeipel 1924) makes sampling across
+    # it ill-defined anyway; locking to one regime is the self-consistent choice.
+    t2_current = bundle.get_value("teff@secondary", context="component")
+    boundary   = RADIATIVE_CONVECTIVE_BOUNDARY_K
+    if t2_current >= boundary and t2_lower < boundary < t2_upper:
+        t2_lower    = boundary
+        regime_note = "locked ≥8000 K (radiative β₁=1.0)"
+    elif t2_current < boundary and t2_lower < boundary < t2_upper:
+        t2_upper    = boundary
+        regime_note = "locked <8000 K (convective β₁=0.32)"
+    else:
+        regime_note = "single regime — no clamp needed"
+
+    free_params["teff@secondary"] = (t2_lower, t2_upper, "Secondary Teff — thermally bounded prior")
+    master_print(f"  [prior] T₂ ∈ [{t2_lower:.0f}, {t2_upper:.0f}] K  ({regime_note})")
+
+    # --- Roche-lobe-scaled requiv priors (detached systems; UNITS FIX) -------
+    # CRITICAL: PHOEBE's requiv is in SOLAR RADII, not in units of the semi-major
+    # axis. The previous prior [0.1, 1.0] (and an Eggleton cap missing the × sma
+    # factor) forced R/a ≈ 0.02–0.19 at PHOEBE's default sma = 5.3 R⊙ — far too
+    # small to eclipse, producing a flat model (TZ Lyr modelled depth 0.001 vs data
+    # 0.59). We scale both bounds by sma so they bracket physical fractional radii:
+    # a small-radius floor up to 90% of the Eggleton (1983) Roche lobe (keeping the
+    # geometry detached and out of L1 overflow). With single-band photometry the
+    # absolute scale (sma) is degenerate, so sma is held fixed and these bounds
+    # effectively constrain the fractional radii r = requiv / sma.
+    if "requiv@primary" in free_params:
+        q_seed       = bundle.get_value("q@binary",   context="component")
+        sma          = bundle.get_value("sma@binary", context="component")  # R⊙
+        rl_primary   = eggleton_roche_radius(1.0 / q_seed)   # primary lobe fraction r_L/a
+        rl_secondary = eggleton_roche_radius(q_seed)          # secondary lobe fraction
+        for twig, rl in (("requiv@primary", rl_primary), ("requiv@secondary", rl_secondary)):
+            _, _, desc = free_params[twig]
+            cap_solrad = 0.9 * rl * sma     # 90% of the Roche lobe, in R⊙
+            lo_solrad  = 0.05 * sma         # fractional-radius floor r ≈ 0.05
+            free_params[twig] = (lo_solrad, cap_solrad, desc)
+            master_print(f"  [prior] {twig} ∈ [{lo_solrad:.3f}, {cap_solrad:.3f}] R⊙  "
+                         f"(R/a ≤ {0.9 * rl:.3f}; Eggleton q={q_seed:.3f}, sma={sma:.2f} R⊙)")
+
+        # r₂ > r₁ seed: a deep total primary eclipse requires the secondary to be
+        # larger than the primary. A symmetric seed consistently fell into the
+        # r₁-at-cap attractor (small secondary transiting giant primary → wrong basin).
+        r1_seed = 0.17 * sma
+        r2_seed = 0.24 * sma
+        bundle.set_value("requiv@primary",   r1_seed)
+        bundle.set_value("requiv@secondary", r2_seed)
+        master_print(f"  [seed] requiv@primary = {r1_seed:.3f} R⊙ (r/a = 0.17), "
+                     f"requiv@secondary = {r2_seed:.3f} R⊙ (r/a = 0.24)  "
+                     f"[r₂/r₁ = 1.41, total-eclipse NM seed]")
+
+    n_free_params = len(free_params)
+
+    master_print(f"\n  [5D] Configuring {n_free_params} free parameters and priors...")
+    prior_distributions = {}
+    init_distributions  = {}
+
+    for twig, (lo, hi, description) in free_params.items():
+        prior_distributions[twig] = phoebe.uniform(lo, hi)
+
+        current_val  = bundle.get_value(twig)
+        param_range  = hi - lo
+        # 2% Gaussian initialisation ball keeps walkers tightly clustered around
+        # the Nelder-Mead solution and prevents early Roche-lobe overflow.
+        init_sigma   = 0.02 * param_range
+        clipped_val  = np.clip(current_val, lo + init_sigma, hi - init_sigma)
+        init_distributions[twig] = phoebe.normal(clipped_val, init_sigma)
+        master_print(f"    {twig:<40}  [{lo:.2f}, {hi:.2f}]  — {description}")
+
+    bundle.add_distribution(prior_distributions, distribution="my_priors")
+    bundle.add_distribution(init_distributions,  distribution="my_init")
+
+    # Third-light optimisation for BD And — TESS's coarse pixel scale (~21"/px)
+    # makes contamination from nearby field stars a realistic systematic for this target.
+    if star_name == "BD And":
+        bundle.set_value("l3_mode", dataset="lc01", value="fraction")
+        free_params["l3_frac@lc01"] = (0.0, 0.20, "Third-light contamination fraction")
+        n_free_params = len(free_params)
+        master_print("  [physics] BD And: third-light fraction l3 enabled (0–20%).")
+
+    # Bug E fix: component-coupled pblum does not auto-scale model flux to the
+    # data. The bundle's pblum@primary was tuned for dataset-scaled; adding the
+    # secondary's physical luminosity on top makes the combined model ~10% too
+    # bright. NM compensates by collapsing r₂ → zero. One forward model at the
+    # seed point gives the exact factor needed to correct pblum@primary before NM.
+    if not is_contact_morphology(variable_type):
+        try:
+            bundle.run_compute(model="pblum_norm", overwrite=True)
+            model_f = bundle.get_value("fluxes", dataset="lc01", model="pblum_norm")
+            data_f  = bundle.get_value("fluxes", dataset="lc01", context="dataset")
+            scale   = float(np.mean(data_f) / np.mean(model_f))
+            pblum0  = bundle.get_value("pblum", component="primary",
+                                       dataset="lc01", context="dataset")
+            bundle.set_value("pblum", component="primary",
+                             dataset="lc01", value=pblum0 * scale)
+            master_print(f"  [pblum_norm] pblum@primary ×{scale:.4f}  "
+                         f"(model mean {np.mean(model_f):.4f} → "
+                         f"data mean {np.mean(data_f):.4f})")
+        except Exception as _pn_err:
+            master_print(f"  [pblum_norm warning] {_pn_err} — skipping.")
+
+    # ── 5E: STAGE 1 — NELDER-MEAD PRE-WASH ──────────────────────────────────
+    master_print(f"\n  [Stage 1] Nelder-Mead simplex pre-wash (max {NM_MAXITER} iterations)...")
+    try:
+        bundle.add_solver("optimizer.nelder_mead", solver="nm_solver", overwrite=True)
+        # The optimiser MUST be told which parameters to fit via `fit_parameters`;
+        # this was previously unset, so the pre-wash optimised nothing (and an
+        # earlier attempt to bound it via ParameterSet.set_limits raised and skipped
+        # NM entirely). Bound the simplex with the SAME uniform priors as the MCMC
+        # (the nelder_mead solver folds the prior into its merit function), so it
+        # stays inside the physical ranges — including the Eggleton requiv caps.
+        bundle.set_value("fit_parameters", solver="nm_solver",
+                         value=list(free_params.keys()))
+        bundle.set_value("priors", solver="nm_solver", value=["my_priors"])
+        bundle.set_value("maxiter", solver="nm_solver", value=NM_MAXITER)
+
+        bundle.run_solver("nm_solver", solution="nm_solution", overwrite=True)
+        bundle.adopt_solution("nm_solution", adopt_values=True)
+        master_print("  Nelder-Mead converged — adopted as MCMC starting point.")
+    except Exception as nm_error:
+        master_print(f"  [NM warning] Pre-wash failed: {nm_error}. Using initial guess.")
+
+    # ── 5F: ADD emcee SOLVER (execution happens in the chunked loop) ──────────
+    master_print(f"\n  [Stage 2] Configuring emcee MCMC "
+                 f"({MCMC_N_WALKERS} walkers × {MCMC_N_ITERATIONS} steps)...")
+    bundle.add_solver(
+        "sampler.emcee",
+        solver="mcmc_sampler",
+        init_from="my_init",
+        priors="my_priors",
+        nwalkers=MCMC_N_WALKERS,
+        niters=MCMC_N_ITERATIONS,
+        overwrite=True,
+    )
+
+    return bundle, free_params, is_contact_binary, n_free_params
+
+
+# =============================================================================
+# SECTION 4 — TARGET LIST
+# =============================================================================
+
+target_list: list[dict] = []
 try:
-    with open(INPUT_CATALOG, newline="") as f:
-        reader = csv.DictReader(f)
+    with open(INPUT_CATALOG, newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
         for row in reader:
-            targets.append({
+            target_list.append({
                 "name":   row["name"],
                 "type":   row["type"],
                 "period": float(row["period"]),
             })
 except FileNotFoundError:
-    mprint(f"ERROR: {INPUT_CATALOG} not found.")
-    exit()
+    master_print(f"ERROR: {INPUT_CATALOG} not found. Run Script 01 first.")
+    raise SystemExit(1)
 
-# Filter for the remaining production run
-targets = [t for t in targets if t["name"] in ["WZ And", "AB And", "BD And"]]
 
-for target in targets:
-    name  = target["name"]
-    ctype = target["type"]
-    safe  = name.replace(" ", "_")
+# =============================================================================
+# SECTION 5 — MAIN OPTIMISATION LOOP
+# =============================================================================
 
-    mprint("\n" + "=" * 70)
-    mprint(f"OPTIMIZATION: {name}  ({ctype})  |  Strategy: {SOLVER_STRATEGY.upper()}")
-    mprint("=" * 70)
+PARAM_DISPLAY_LABELS: dict[str, tuple[str, str]] = {
+    "T1_K":             ("Primary temperature T₁",    "K"),
+    "T2_K":             ("Secondary temperature T₂",  "K"),
+    "T2_over_T1":       ("Temperature ratio T₂/T₁",   "—"),
+    "incl_deg":         ("Orbital inclination i",      "°"),
+    "q":                ("Mass ratio q = m₂/m₁",      "—"),
+    "r1_frac":          ("Primary fractional radius r₁ = R₁/a",   "—"),
+    "r2_frac":          ("Secondary fractional radius r₂ = R₂/a", "—"),
+    "fillout_factor":   ("Contact fill-out factor f",  "—"),
+}
 
-    # Use relative path for WSL compatibility
-    bundle_file = f"bundle_{safe}.phoebe"
-    if not os.path.exists(bundle_file):
-        mprint(f"  WARNING: {bundle_file} not found. Skipping.")
+for target in target_list:
+    star_name     = target["name"]
+    variable_type = target["type"]
+    safe_name     = star_name.replace(" ", "_")
+
+    master_print("\n" + "=" * 70)
+    master_print(f"OPTIMISATION: {star_name}  ({variable_type})  |  Strategy: MCMC (emcee)")
+    master_print("=" * 70)
+
+    # ── TARGET PATHS, SKIP & RESUME DETECTION ────────────────────────────────
+    bundle_path     = f"bundle_{safe_name}.phoebe"
+    mcmc_checkpoint = f"bundle_{safe_name}_mcmc.phoebe"
+    results_path    = f"results_{safe_name}.csv"
+
+    # Idempotent re-runs: a completed target (results file present) is skipped, so
+    # an interrupted batch can simply be relaunched with the same command and will
+    # pick up where it stopped.
+    if os.path.exists(results_path):
+        master_print(f"  [skip] {results_path} already exists — target complete.")
         continue
 
-    b = phoebe.load(bundle_file)
-    mprint(f"  Bundle loaded: {bundle_file}")
-
-    # [IMPROVEMENT] Dynamic Radiative Switch (von Zeipel vs Lucy)
-    # Ensures the MCMC starts with physically consistent bolometric constants
-    for component in ['primary', 'secondary']:
-        teff = b.get_value(f'teff@{component}')
-        if teff >= 8000:
-            b.set_value(f'gravb_bol@{component}', 1.0)
-            b.set_value(f'irrad_frac_refl_bol@{component}', 1.0)
-            mprint(f"  [PHYSICS] {component.capitalize()} is Radiative ({teff:.0f}K). Setting β1=1.0, A=1.0")
-        else:
-            b.set_value(f'gravb_bol@{component}', 0.32)
-            b.set_value(f'irrad_frac_refl_bol@{component}', 0.6)
-            mprint(f"  [PHYSICS] {component.capitalize()} is Convective ({teff:.0f}K). Setting β1=0.32, A=0.6")
-
-    # ── HOTFIX 1: INTERPOLATION DEDUPLICATION ────────────────────────────────
-    try:
-        times  = b.get_value('times', dataset='lc01', context='dataset')
-        fluxes = b.get_value('fluxes', dataset='lc01', context='dataset')
-        sigmas = b.get_value('sigmas', dataset='lc01', context='dataset')
-        
-        # Capture critical parameters before removal
-        pb = b.get_value('passband', dataset='lc01', context='dataset')
-        pblum_mode = b.get_value('pblum_mode', dataset='lc01')
-
-        unique_times, unique_indices = np.unique(times, return_index=True)
-
-        b.remove_dataset('lc01')
-        b.add_dataset('lc', 
-                      times=times[unique_indices], 
-                      fluxes=fluxes[unique_indices], 
-                      sigmas=sigmas[unique_indices], 
-                      passband=pb, 
-                      dataset='lc01')
-        
-        # Restore critical configurations
-        b.set_value('pblum_mode', dataset='lc01', value=pblum_mode)
-        
-        removed = len(times) - len(unique_times)
-        mprint(f"  [FIX] Data Sanitization: Sorted times and removed {removed} duplicate points.")
-    except Exception as e:
-        mprint(f"  [FIX WARNING] Could not sanitize dataset: {e}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # ── HOTFIX 2: PHYSICAL BLACKBODY LIMB DARKENING ──────────────────────────
-    # [EXPERT FIX] A mathematically perfect blackbody is NOT a uniform disk. 
-    # The Eddington-Barbier relation dictates that stellar limbs appear cooler. 
-    # Forcing a 0.0 coefficient artificially darkens the center, biasing R and i.
-    # We apply u ≈ 0.6 as a standard solar-type proxy for the TESS passband.
-    b.set_value("ld_mode_bol@primary", "manual")
-    b.set_value("ld_mode_bol@secondary", "manual")
-    
-    for comp in ['primary', 'secondary']:
-        try:
-            b.set_value(f"ld_mode@{comp}@lc01", "manual")
-            b.set_value(f"ld_func@{comp}@lc01", "linear")
-            b.set_value(f"ld_coeffs@{comp}@lc01", [0.6]) # Physical TESS proxy
-        except Exception as e:
-            mprint(f"  [LD WARNING] Could not override coefficients for {comp}: {e}")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    is_contact = (ctype == "EW")
-
-    if is_contact:
-        try:
-            b.flip_constraint('fillout_factor', solve_for='pot')
-        except Exception:
-            pass # Constraint may already be flipped
-
-    free_params = FREE_PARAMETERS_CONTACT if is_contact else FREE_PARAMETERS_DETACHED
-    n_free      = len(free_params)
-
-    # ── 4A: APPLY LIMITS & PRIORS ────────────────────────────────────────────
-
-    mprint(f"\n  [4A] Parameter Bounds & Probabilistic Priors ({n_free} free parameters)...")
-
-    if is_contact:
-        # [EXPERT FIX] W-Type allowance. W UMa W-type systems have hotter secondaries.
-        T1_current = b.get_value("teff@primary", context="component")
-        T2_lo, T2_hi = (0.80 * T1_current), (1.25 * T1_current)
-        free_params = dict(free_params) 
-        free_params["teff@secondary"] = (T2_lo, T2_hi, "Secondary Teff (Thermal Floor Prior)")
-        mprint(f"  [HARDENING] Thermal floor enforced: T₂ ∈ [{T2_lo:.0f}, {T2_hi:.0f}] K")
-    else:
-        # For detached systems, also prevent secondary from being unphysically cold
-        T1_current = b.get_value("teff@primary", context="component")
-        T2_lo, T2_hi = (0.70 * T1_current), (1.10 * T1_current)
-        free_params = dict(free_params) 
-        free_params["teff@secondary"] = (T2_lo, T2_hi, "Secondary Teff (Thermal Floor Prior)")
-        mprint(f"  [HARDENING] Thermal floor enforced: T₂ ∈ [{T2_lo:.0f}, {T2_hi:.0f}] K")
-
-    if SOLVER_STRATEGY == "emcee":
-        prior_dict = {}
-        init_dict = {}
-        for twig, (lo, hi, desc) in free_params.items():
-            prior_dict[twig] = phoebe.uniform(lo, hi)
-            
-            # [HARDENING] Reduced Gaussian ball to 2% to prevent early Roche overflow
-            current_val = b.get_value(twig)
-            param_range = hi - lo
-            sigma = 0.02 * param_range 
-            
-            # Ensure the initialization ball is strictly bounded
-            init_val = np.clip(current_val, lo + sigma, hi - sigma)
-            init_dict[twig] = phoebe.normal(init_val, sigma)
-            
-            mprint(f"    Added Prior: {twig:<30} [{lo:.2f}, {hi:.2f}]")
-        
-        b.add_distribution(prior_dict, distribution="my_priors")
-        b.add_distribution(init_dict, distribution="my_init")
-    else:
-        for twig, (lo, hi, desc) in free_params.items():
-            b.get_parameter(twig).set_limits((lo, hi))
-            mprint(f"    Applied Hard Limit: {twig:<30} [{lo:.2f}, {hi:.2f}]")
-
-    # ── 4B: CONFIGURE SOLVER ──────────────────────────────────────────────────
-
-    mprint(f"\n  [4B] Configuring solver: {SOLVER_STRATEGY}...")
-
-    if SOLVER_STRATEGY == "emcee":
-        b.add_solver(
-            "sampler.emcee",
-            solver="mcmc_sampler",
-            init_from="my_init",
-            priors="my_priors",
-            nwalkers=MCMC_NWALKERS,
-            niters=MCMC_NITER,
-            overwrite=True
+    resuming = os.path.exists(mcmc_checkpoint)
+    if resuming:
+        # Resume path: the checkpoint already holds the configured bundle, priors,
+        # solver and the partial chain. Restore it and rebuild only the cheap
+        # morphology-derived metadata; the 5A–5E setup and Nelder-Mead pre-wash
+        # are skipped because that state is baked into the checkpoint.
+        bundle = phoebe.load(mcmc_checkpoint)
+        free_params, is_contact_binary, n_free_params = derive_free_params_meta(
+            star_name, variable_type,
         )
-        mprint(f"  MCMC Topology Map: {MCMC_NWALKERS} walkers, {MCMC_NITER} steps.")
+        already = completed_iterations(bundle, "best_solution")
+        master_print(f"  [resume] Loaded {mcmc_checkpoint} — {already}/{MCMC_N_ITERATIONS} "
+                     "iterations already complete.")
+    else:
+        prepared = prepare_bundle_for_mcmc(star_name, variable_type, bundle_path)
+        if prepared is None:
+            continue
+        bundle, free_params, is_contact_binary, n_free_params = prepared
 
-    # ── 4C: EXECUTION ─────────────────────────────────────────────────────────
+    # ── 5F: STAGE 2 — CHUNKED MCMC WITH CHECKPOINTING ────────────────────────
+    # Run the sampler in MCMC_CHECKPOINT_NITERS-sized chunks, saving the bundle
+    # (chains included) after each chunk. `continue_from` extends the same chain
+    # across chunks so a stopped run resumes mid-chain instead of restarting.
+    #
+    # IMPORTANT (PHOEBE continue_from quirk): a continued chunk re-uses the last
+    # sample as its starting state, so it appends only (niters − 1) NEW steps, not
+    # niters. The shortfall accumulates and, for the final 1-step chunk, a continued
+    # chunk would append 0 steps — an infinite loop. We therefore stop as soon as a
+    # chunk fails to advance the chain (treating it as effectively complete), rather
+    # than demanding an exact step count.
+    #
+    # `done` is broadcast from rank 0 so every MPI rank runs the same number of
+    # collective run_solver() chunks (a mismatch would deadlock the pool).
+    done = completed_iterations(bundle, "best_solution") if mpi_rank == 0 else 0
+    done = mpi_broadcast_int(done)
+    mcmc_failed = False
 
-    solver_label = "mcmc_sampler" if SOLVER_STRATEGY == "emcee" else "main_optimizer"
+    while done < MCMC_N_ITERATIONS:
+        prev_done = done
+        # +1 compensates for the continue_from overlap so a chunk lands on target.
+        remaining = MCMC_N_ITERATIONS - done
+        n_this    = min(MCMC_CHECKPOINT_NITERS, remaining + (0 if done == 0 else 1))
+        # context="solver" is REQUIRED: once a solution exists, the twigs
+        # "niters"/"continue_from" also match parameters copied into the solution,
+        # making a bare solver= filter ambiguous (ValueError: 2 results found).
+        bundle.set_value("continue_from", solver="mcmc_sampler", context="solver",
+                         value="None" if done == 0 else "best_solution")
+        bundle.set_value("niters", solver="mcmc_sampler", context="solver", value=n_this)
+        try:
+            master_print(f"  [MCMC] chunk → +{n_this} iters "
+                         f"(from {done}/{MCMC_N_ITERATIONS})...")
+            bundle.run_solver("mcmc_sampler", solution="best_solution", overwrite=True)
+        except Exception as mcmc_error:
+            master_print(f"  MCMC error: {mcmc_error}")
+            mcmc_failed = True
+            break
+
+        if mpi_rank == 0:
+            bundle.save(mcmc_checkpoint)
+        done = (completed_iterations(bundle, "best_solution")
+                if mpi_rank == 0 else done + n_this)
+        done = mpi_broadcast_int(done)
+        master_print(f"  [checkpoint] {done}/{MCMC_N_ITERATIONS} iters saved → {mcmc_checkpoint}")
+
+        if done <= prev_done:
+            # No forward progress (continue_from overlap at the tail): stop here and
+            # treat the chain as complete rather than spinning forever.
+            master_print(f"  [checkpoint] chain not advancing past {done}/"
+                         f"{MCMC_N_ITERATIONS}; treating as complete.")
+            break
+
+    if mcmc_failed and done == 0:
+        master_print("  No usable samples produced — skipping target.")
+        continue
+    master_print("  MCMC sampling complete.")
+
+    # ── 5G: AUTOCORRELATION CONVERGENCE DIAGNOSTICS ───────────────────────────
+    master_print("\n  [5G] Convergence diagnostics — Integrated Autocorrelation Time τ...")
+    try:
+        raw_chains = np.asarray(bundle.get_value("samples", solution="best_solution"))
+        # emcee.autocorr.integrated_time wants time on axis 0, which is exactly
+        # PHOEBE's native (n_steps, n_walkers, n_params) layout — so it is passed
+        # straight through. (An earlier np.swapaxes here put walkers on axis 0 and
+        # corrupted τ.) Guard only against a transposed layout.
+        if raw_chains.ndim == 3 and raw_chains.shape[0] == MCMC_N_WALKERS \
+                and raw_chains.shape[1] != MCMC_N_WALKERS:
+            raw_chains = np.swapaxes(raw_chains, 0, 1)
+        tau_values = assess_autocorrelation_convergence(raw_chains)
+
+        master_print(f"  {'Parameter':<40} {'τ (steps)':>12}  {'Status'}")
+        master_print("  " + "─" * 70)
+        for i, param_twig in enumerate(free_params.keys()):
+            tau_val = tau_values[i] if isinstance(tau_values, np.ndarray) else np.inf
+            status  = "✓ converged" if (MCMC_N_ITERATIONS > CONVERGENCE_MULTIPLIER * tau_val) else "⚠ under-converged"
+            master_print(f"  {param_twig:<40} {tau_val:>12.1f}  {status}")
+    except Exception as autocorr_error:
+        master_print(f"  Autocorrelation diagnostic failed: {autocorr_error}")
+
+    # ── 5H: ADOPT SOLUTION & FINAL COMPUTE ───────────────────────────────────
+    master_print("\n  [5H] Adopting posterior median into physical parameters...")
+    try:
+        bundle.adopt_solution(
+            "best_solution",
+            burnin=MCMC_BURN_IN_STEPS,
+            adopt_values=True,
+            adopt_distributions=True,
+        )
+    except Exception as adopt_error:
+        master_print(f"  Adoption error: {adopt_error}")
 
     try:
-        mprint(f"\n  [4C] Executing solver. PHOEBE MPI pool will accelerate run_compute...")
-        b.run_solver(solver_label, solution="best_solution", overwrite=True)
-        mprint("  Solver completed successfully.")
-    except Exception as e:
-        mprint(f"  Solver error: {e}")
+        # Wilson irradiation accounts for the large mutual radiative flux exchange
+        # inside the shared envelope of contact binaries, which significantly
+        # shapes the out-of-eclipse maxima. Horvat is used for detached systems.
+        irrad_method = "wilson" if is_contact_binary else "horvat"
+        bundle.run_compute(
+            model="solution_model", overwrite=True,
+            irrad_method=irrad_method, distortion_method="roche",
+        )
+    except Exception as compute_error:
+        master_print(f"  Final compute error: {compute_error}")
         continue
 
-    # ── 4D: AUTOCORRELATION CONVERGENCE DIAGNOSTICS ───────────────────────────
+    chi2, chi2_red, n_obs = compute_reduced_chi2(bundle, n_free_params)
+    master_print(f"\n  Final reduced χ² = {chi2_red:.4f}  "
+                 f"(N = {n_obs}, dof = {n_obs - n_free_params})")
 
-    if SOLVER_STRATEGY == "emcee":
-        mprint("\n  [4D] Checking Posterior Convergence (Autocorrelation Time τ)...")
-        try:
-            raw_chains = b.get_value("samples", solution="best_solution")
-            
-            # Reshape chains for emcee format: (nwalkers, nsteps, ndim)
-            if raw_chains.ndim != 3:
-                n_total  = raw_chains.shape[0]
-                n_steps_ = n_total // MCMC_NWALKERS
-                raw_chains = raw_chains.reshape(MCMC_NWALKERS, n_steps_, n_free)
-
-            # Swap axes to match emcee.autocorr expected format: (nsteps, nwalkers, ndim)
-            chains_swapped = np.swapaxes(raw_chains, 0, 1)
-            
-            taus = check_convergence(chains_swapped)
-            
-            mprint(f"  {'Parameter':<35} {'τ (steps)':>12}  {'Status (N > 50τ)'}")
-            mprint(f"  {'─'*70}")
-            for i, pname in enumerate(list(free_params.keys())):
-                tau_val = taus[i] if isinstance(taus, np.ndarray) else np.inf
-                status = "✓ Converged" if (MCMC_NITER > 50 * tau_val) else "⚠ Under-converged"
-                mprint(f"  {pname:<35} {tau_val:>12.1f}  {status}")
-        except Exception as e:
-            mprint(f"  Convergence diagnostic failed: {e}")
-
-    # ── 4E/F: ADOPTION & FINAL COMPUTATION ────────────────────────────────────
-
-    mprint("\n  [4E] Adopting best-fit posterior median into physical mesh...")
+    # ── 5I: GELMAN-RUBIN R̂ CONVERGENCE CHECK ─────────────────────────────────
+    master_print("\n  [5I] Gelman-Rubin R̂ convergence diagnostics:")
     try:
-        if SOLVER_STRATEGY == "emcee":
-            b.adopt_solution("best_solution", burnin=MCMC_BURNIN, adopt_values=True, adopt_distributions=True)
-        else:
-            b.adopt_solution("best_solution", adopt_values=True)
-    except Exception as e:
-        mprint(f"  Adoption error: {e}")
+        chains = np.asarray(bundle.get_value("samples", solution="best_solution"))
+        # The R̂ formula below treats param_chains as (n_walkers, n_steps) with the
+        # within-chain variance taken over steps (axis 1). PHOEBE stores the chain
+        # as emcee-native (n_steps, n_walkers, n_params), so swap the first two axes
+        # to (n_walkers, n_steps, n_params) before unpacking.
+        if chains.ndim == 3 and chains.shape[1] == MCMC_N_WALKERS:
+            chains = np.swapaxes(chains, 0, 1)
+        n_w, n_s, n_p = chains.shape
+        fitted_twigs  = bundle.get_value("fitted_twigs", solution="best_solution")
 
-    try:
-        # [EXPERT FIX] Enabled Wilson irradiation for EW systems. Contact binaries 
-        # exchange massive radiative energy which drastically alters out-of-eclipse flux.
-        irrad = "wilson" if is_contact else "horvat"
-        b.run_compute(model="solution_model", overwrite=True, irrad_method=irrad, distortion_method="roche")
-    except Exception as e:
-        mprint(f"  Final compute error: {e}")
-        continue
+        master_print(f"  {'Parameter':<40} {'R̂':>8}  {'Status'}")
+        master_print("  " + "─" * 60)
+        for i, param_name in enumerate(fitted_twigs):
+            param_chains  = chains[:, :, i]              # shape (n_walkers, n_steps)
+            within_var    = np.mean(np.var(param_chains, axis=1))  # W
+            between_var   = n_s * np.var(np.mean(param_chains, axis=1))  # B
+            # R̂ approaches 1.0 as the between-chain variance (B) → 0, i.e. all
+            # walkers have converged to sampling the same stationary distribution.
+            var_plus      = (1 - 1 / n_s) * within_var + (1 / n_s) * between_var
+            r_hat         = np.sqrt(var_plus / within_var)
+            status        = "CONVERGED" if r_hat < RHAT_CONVERGENCE_THRESHOLD else "UNCONVERGED"
+            master_print(f"  {param_name:<40} {r_hat:>8.4f}  {status}")
+    except Exception as rhat_error:
+        master_print(f"  Gelman-Rubin diagnostic failed: {rhat_error}")
 
-    chi2, chi2_red, n_obs = compute_chi2(b, free_params, dataset="lc01")
-    mprint(f"\n  Final Reduced χ² = {chi2_red:.4f}  (N = {n_obs}, Degrees of Freedom = {n_obs - n_free})")
+    # ── 5J: RESULT EXTRACTION ─────────────────────────────────────────────────
+    # Summarise the post-burn-in chain first, then attach ±σ to the adopted medians.
+    posterior = compute_posterior_summary(bundle, "best_solution", MCMC_BURN_IN_STEPS)
+    results   = extract_best_fit_parameters(bundle, free_params, posterior)
 
-    # [IMPROVEMENT] MCMC Convergence Diagnostics (Gelman-Rubin R-hat)
-    try:
-        # We estimate R-hat by splitting the chain in half
-        # and calculating the variance ratio
-        chains = b.get_value('samples', solution='best_solution')
-        n_walkers, n_steps, n_params = chains.shape
-        
-        mprint("\n  [CONVERGENCE] Gelman-Rubin Diagnostics (R-hat):")
-        fitted_params = b.get_value('fitted_twigs', solution='best_solution')
-        
-        for i, param in enumerate(fitted_params):
-            param_chain = chains[:, :, i]
-            # Variance between walkers vs variance within walkers
-            W = np.mean(np.var(param_chain, axis=1))
-            B = n_steps * np.var(np.mean(param_chain, axis=1))
-            var_plus = (1 - 1/n_steps) * W + (1/n_steps) * B
-            r_hat = np.sqrt(var_plus / W)
-            status = "CONVERGED" if r_hat < 1.1 else "UNCONVERGED"
-            mprint(f"    {param:35s} : R-hat = {r_hat:.4f} [{status}]")
-    except Exception as e:
-        mprint(f"  Gelman-Rubin diagnostic error: {e}")
+    master_print("\n  ─── FINAL PARAMETER POSTERIOR ──────────────────────────────")
+    for key, (value, sig_minus, sig_plus) in results.items():
+        if np.isfinite(value):
+            label, unit = PARAM_DISPLAY_LABELS.get(key, (key, ""))
+            if np.isfinite(sig_minus) and np.isfinite(sig_plus):
+                master_print(f"  {label:<35} {value:>10.4f}  (−{sig_minus:.4f} / +{sig_plus:.4f})  {unit}")
+            else:
+                master_print(f"  {label:<35} {value:>10.4f}  {unit}")
 
-    # ── 4G/H: MPI MASTER DATA EXPORT & PLOTTING ───────────────────────────────
-
-    results = extract_results(b, free_params)
-
-    PARAM_LABELS = {
-        "T1_K":             ("Primary temperature T₁",   "K"),
-        "T2_K":             ("Secondary temperature T₂", "K"),
-        "T2_over_T1":       ("Temperature ratio T₂/T₁",  "—"),
-        "incl_deg":         ("Orbital inclination i",     "°"),
-        "q":                ("Mass ratio q = m₂/m₁",     "—"),
-        "requiv_primary":   ("Primary Radius R₁",         "—"),
-        "requiv_secondary": ("Secondary Radius R₂",       "—"),
-        "fillout_factor":   ("Contact fillout factor f",  "—"),
-    }
-
-    mprint("\n  ─── FINAL PARAMETER POSTERIOR ─────────────────────────────")
-    for key, (val, err) in results.items():
-        if np.isfinite(val):
-            label, unit = PARAM_LABELS.get(key, (key, ""))
-            mprint(f"  {label:<30} {val:>10.4f}  {unit}")
-
-    # Ensure ONLY the Master Node writes to the disk to prevent file corruption
-    if rank == 0:
-        result_file = f"results_{safe}.csv"
-        with open(result_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Parameter", "Symbol", "Value", "Unit"])
-            for key, (val, err) in results.items():
-                label, unit = PARAM_LABELS.get(key, (key, ""))
-                writer.writerow([label, key, val, unit])
-            writer.writerow(["Reduced chi-squared", "chi2_red", chi2_red, "—"])
-            writer.writerow(["Solver strategy", "solver", SOLVER_STRATEGY, "—"])
+    # ── 5K: FILE I/O (RANK 0 ONLY) ────────────────────────────────────────────
+    # MPI worker ranks must not write files; simultaneous writes would corrupt
+    # the output. All I/O is gated on rank 0.
+    if mpi_rank == 0:
+        with open(results_path, "w", newline="", encoding="utf-8") as results_file:
+            writer = csv.writer(results_file)
+            writer.writerow(["Parameter", "Symbol", "Value", "Sigma_minus", "Sigma_plus", "Unit"])
+            for key, (value, sig_minus, sig_plus) in results.items():
+                label, unit = PARAM_DISPLAY_LABELS.get(key, (key, ""))
+                writer.writerow([label, key, value, sig_minus, sig_plus, unit])
+            writer.writerow(["Reduced chi-squared", "chi2_red", chi2_red, "", "", "—"])
+        master_print(f"\n  Results saved: {results_path}")
 
         try:
-            obs_flux  = b.get_value("fluxes", dataset="lc01", context="dataset")
-            obs_times = b.get_value("times",  dataset="lc01", context="dataset")
-            obs_sigma = b.get_value("sigmas", dataset="lc01", context="dataset")
-            syn_flux  = b.get_value("fluxes", dataset="lc01", model="solution_model")
-            syn_times = b.get_value("times",  dataset="lc01", model="solution_model")
+            obs_flux  = bundle.get_value("fluxes", dataset="lc01", context="dataset")
+            obs_times = bundle.get_value("times",  dataset="lc01", context="dataset")
+            obs_sigma = bundle.get_value("sigmas", dataset="lc01", context="dataset")
+            syn_flux  = bundle.get_value("fluxes", dataset="lc01", model="solution_model")
+            syn_times = bundle.get_value("times",  dataset="lc01", model="solution_model")
 
-            # Normalization removed here to ensure plot matches solver output
-            P_final  = b.get_value("period@binary")
-            T0_final = b.get_value("t0_supconj@binary")
+            period_final  = bundle.get_value("period@binary")
+            t0_final      = bundle.get_value("t0_supconj@binary")
+            obs_phase     = ((obs_times - t0_final) / period_final + 0.5) % 1.0 - 0.5
+            syn_phase     = ((syn_times - t0_final) / period_final + 0.5) % 1.0 - 0.5
+            sort_idx      = np.argsort(syn_phase)
+            residuals     = obs_flux - np.interp(
+                obs_phase, syn_phase[sort_idx], syn_flux[sort_idx],
+            )
 
-            obs_phase = ((obs_times - T0_final) / P_final + 0.5) % 1.0 - 0.5
-            syn_phase = ((syn_times - T0_final) / P_final + 0.5) % 1.0 - 0.5
-            sort_idx  = np.argsort(syn_phase)
+            fig, (ax_lc, ax_res) = plt.subplots(
+                2, 1, figsize=(10, 7), gridspec_kw={"height_ratios": [3, 1]},
+            )
+            fig.suptitle(
+                f"{star_name} — MCMC Optimised Fit  (χ²_red = {chi2_red:.2f})",
+                fontsize=14, fontweight="bold",
+            )
 
-            residuals = obs_flux - np.interp(obs_phase, syn_phase[sort_idx], syn_flux[sort_idx])
+            ax_lc.errorbar(obs_phase, obs_flux, yerr=obs_sigma, fmt="k.", ms=6,
+                           alpha=0.5, label="TESS Observations")
+            ax_lc.plot(syn_phase[sort_idx], syn_flux[sort_idx], "r-", lw=2.5,
+                       label="Optimised Model")
+            t2_val = results.get("T2_K", (np.nan, np.nan, np.nan))[0]
+            param_annotation = (
+                f"T₁ = {results['T1_K'][0]:.0f} K  |  "
+                f"T₂ = {t2_val:.0f} K  |  "
+                f"i = {results['incl_deg'][0]:.1f}°"
+            )
+            ax_lc.text(0.02, 0.04, param_annotation, transform=ax_lc.transAxes,
+                       fontsize=10,
+                       bbox=dict(boxstyle="round,pad=0.4", fc="lightyellow", alpha=0.9))
+            ax_lc.set_ylabel("Normalised Flux")
+            ax_lc.legend(loc="upper right")
+            ax_lc.grid(alpha=0.3)
 
-            fig, axes = plt.subplots(2, 1, figsize=(10, 7), gridspec_kw={"height_ratios": [3, 1]})
-            fig.suptitle(f"{name} — MCMC Optimized Fit (χ²_red = {chi2_red:.2f})", fontsize=14, fontweight='bold')
-
-            axes[0].errorbar(obs_phase, obs_flux, yerr=obs_sigma, fmt="k.", ms=6, alpha=0.5, label="TESS Observations")
-            axes[0].plot(syn_phase[sort_idx], syn_flux[sort_idx], "r-", lw=2.5, label=f"Optimized Model")
-            
-            param_text = f"T₁ = {results['T1_K'][0]:.0f} K  |  T₂ = {results.get('T2_K', (np.nan,))[0]:.0f} K  |  i = {results['incl_deg'][0]:.1f}°"
-            axes[0].text(0.02, 0.04, param_text, transform=axes[0].transAxes, fontsize=10, bbox=dict(boxstyle="round,pad=0.4", fc="lightyellow", alpha=0.9))
-                         
-            axes[0].set_ylabel("Normalized Flux")
-            axes[0].legend(loc="upper right")
-            axes[0].grid(alpha=0.3)
-
-            axes[1].plot(obs_phase, residuals, ".", ms=5, color="steelblue", alpha=0.7)
-            axes[1].axhline(0.0, color="r", lw=1.5, ls="--")
-            axes[1].set_xlabel("Orbital Phase φ")
-            axes[1].set_ylabel("Residuals")
-            axes[1].grid(alpha=0.3)
+            ax_res.plot(obs_phase, residuals, ".", ms=5, color="steelblue", alpha=0.7)
+            ax_res.axhline(0.0, color="r", lw=1.5, ls="--")
+            ax_res.set_xlabel("Orbital Phase φ")
+            ax_res.set_ylabel("Residuals")
+            ax_res.grid(alpha=0.3)
 
             plt.tight_layout()
-            plt.savefig(os.path.join(PLOT_DIR, f"phoebe_final_{safe}.png"), dpi=150, bbox_inches="tight")
+            plot_path = os.path.join(PLOT_OUTPUT_DIR, f"phoebe_final_{safe_name}.png")
+            plt.savefig(plot_path, dpi=150, bbox_inches="tight")
             plt.close()
-            
-            b.save(f"bundle_{safe}_final.phoebe")
-        except Exception as e:
-            mprint(f"  Could not generate final plot/bundle: {e}")
 
-mprint("\n" + "=" * 70)
-mprint("SCRIPT 05 COMPLETE — Statistical optimization finished.")
-mprint("=" * 70)
+            final_bundle_path = f"bundle_{safe_name}_final.phoebe"
+            bundle.save(final_bundle_path)
+            master_print(f"  Final bundle saved: {final_bundle_path}")
+            master_print(f"  Final plot saved:   {plot_path}")
+
+            # Target finished — drop the mid-run checkpoint so a future relaunch
+            # is recognised as complete (via results_<star>.csv) rather than resumed.
+            if os.path.exists(mcmc_checkpoint):
+                os.remove(mcmc_checkpoint)
+
+        except Exception as output_error:
+            master_print(f"  Could not generate final plot / bundle: {output_error}")
+
+master_print("\n" + "=" * 70)
+master_print("SCRIPT 05 COMPLETE — Statistical optimisation finished for all targets.")
+master_print("=" * 70)

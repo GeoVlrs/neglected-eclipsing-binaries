@@ -3,17 +3,26 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Data products (Large files)
+# Data products: large or private (bundles + FITS light curves)
 *.phoebe
 *.fits
+
+# CSVs: ignore by default, allow only the small publishable tables
 *.csv
 !tominima_*.csv
-!results_*.csv
+!neglected_targets*.csv
+!triage_*.csv
 
-# Logs
+# Per-target MCMC results stay PRIVATE (unpublished thesis data)
+results_*.csv
+
+# Logs & notes: publish curated docs only
 *.txt
 !Expansion_Notes.txt
-!README.md
+!docs/*.txt
+
+# Running internal log stays PRIVATE
+Pipeline_Log.txt
 
 # Environments
 env/

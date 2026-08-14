@@ -1,0 +1,91 @@
+================================================================================
+TECHNICAL NOTES: PIPELINE EXPANSION & ASTROPHYSICAL SCALING
+================================================================================
+Topic: Scaling the autonomous modeling framework to the full Kreiner (2004) database.
+Date: May 2026
+
+The current pipeline is a high-precision instrument optimized for short-period
+(P < 1d) eclipsing binaries. To achieve "Universal Application" across the 
+2,000+ systems in the Kreiner database, four critical areas of development 
+must be addressed.
+
+--------------------------------------------------------------------------------
+1. MORPHOLOGICAL ADAPTABILITY (EW vs. EB Regimes)
+--------------------------------------------------------------------------------
+CURRENT STATE:
+The pipeline uses a "double-ended" logic. For 'EW' (contact) systems, it solves 
+for the Fillout Factor (f). For 'EB' (detached) systems, it solves for 
+independent fractional radii (R1, R2).
+
+EXPANSION REQUIREMENT:
+The most difficult systems in the database are 'Semi-Detached' (SD). In these, 
+one star fills its Roche Lobe while the other does not. 
+- Fix: The pipeline should implement a "Roche Lobe Audit" at the end of Script 04. 
+  If a star's R_equiv is within 1% of its R_Lobe, the script should 
+  automatically re-initialize as a Semi-Detached morphology to avoid the 
+  "Mesh Overflow" errors seen in early runs.
+
+--------------------------------------------------------------------------------
+2. TIDAL CIRCULARIZATION & ECCENTRICITY (e)
+--------------------------------------------------------------------------------
+CURRENT STATE:
+Assumption of e = 0.0 (Circular orbit).
+
+ASTROPHYSICAL CONTEXT:
+Short-period binaries (P < 1d) are subject to intense tidal forces that 
+circularize their orbits over millions of years. This justifies the e=0 
+assumption for the current test sample.
+
+EXPANSION REQUIREMENT:
+For systems with P > 2.0 days, eccentricity becomes a significant factor. 
+- Impact: A non-zero 'e' changes the shape and timing of the secondary eclipse. 
+- Fix: Add 'ecc' (eccentricity) and 'omega' (argument of periastron) to the 
+  MCMC free parameters. This increases the dimensionality of the problem 
+  from 5D to 7D, requiring ~4,000 iterations for convergence.
+
+--------------------------------------------------------------------------------
+3. TEMPERATURE ANCHORING & GAIA DR3 INTEGRATION
+--------------------------------------------------------------------------------
+CURRENT STATE:
+Primary temperature (T1) is anchored via a static lookup dictionary 
+(SPECTRAL_TYPE_TEFF) based on the GCVS/VSX classification.
+
+LIMITATION:
+Catalog spectral types (e.g., "A5") are often based on ground-based surveys from 
+decades ago and may have uncertainties of ±500K.
+
+EXPANSION REQUIREMENT:
+Integrated Gaia DR3 API calls.
+- Fix: Use the 'astroquery.gaia' module to pull the G-band magnitude and 
+  BP-RP color index. This allows the pipeline to derive a "Broadband 
+  Photometric Temperature" for T1 that is significantly more accurate than 
+  simple catalog lookups.
+
+--------------------------------------------------------------------------------
+4. THIRD-LIGHT CONTAMINATION (l3) & TESS PIXEL SCALE
+--------------------------------------------------------------------------------
+CURRENT STATE:
+Assumption of l3 = 0.0 (Zero contamination).
+
+LIMITATION:
+TESS has a massive pixel scale (~21 arcsec/pixel). In crowded star fields 
+(especially near the Galactic Plane), light from background stars frequently 
+leaks into the binary's aperture.
+
+ASTROPHYSICAL IMPACT:
+Third-light "dilutes" the light curve, making eclipses appear shallower. 
+This forces the MCMC to find a solution with a smaller radius or lower 
+inclination than is physically true (Systematic Bias).
+
+EXPANSION REQUIREMENT:
+- Fix: Implement 'l3_mode=fraction' in Script 05. The optimizer should 
+  attempt to solve for 'l3' as a free parameter, bounded by the TESS 
+  CROWDSAP metric provided in the SPOC header files.
+
+================================================================================
+SUMMARY FOR THESIS DOCUMENTATION
+================----------------------------------------------------------------
+These considerations demonstrate the transition from a "Specific Case" study to 
+a "Generalized Framework." Documenting these points proves the scalability of 
+the computational methodology and acknowledges the inherent physical 
+complexity of the stellar population within the Kreiner database.
