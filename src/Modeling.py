@@ -92,6 +92,14 @@ RADIATIVE_CONVECTIVE_BOUNDARY_K: float = 8_000.0
 # PHOEBE 2. 150 bins balances ingress/egress resolution against compute cost.
 PHASE_BIN_COUNT: int = 150
 
+# Systematic photometric error floor (in normalised flux), added in quadrature to
+# each bin's statistical error. The standard-error-of-the-mean (std/√N) collapses
+# to ~0.001 for clean, well-sampled bins, which drives the reduced χ² of an
+# otherwise-good fit to 100+ — because real systematics (starspots, the O'Connell
+# effect, imperfect model physics) sit at the ~0.3–1% level, not the formal
+# statistical level. This floor keeps the per-bin σ physically meaningful.
+SYS_ERROR_FLOOR: float = 0.003
+
 # Triangular mesh resolution per stellar surface. 2000 triangles provides
 # flux precision of ~10⁻⁴ while remaining stable for distorted contact geometries.
 MESH_TRIANGLE_COUNT: int = 2000
@@ -516,12 +524,12 @@ def bin_phase_curve(
         Median flux within each non-empty bin.
     bin_flux_err:
         Standard error of the median within each non-empty bin.
-        Falls back to 0.002 for single-point or zero-variance bins.
+        Combined in quadrature with SYS_ERROR_FLOOR; never below that floor.
     """
     bin_edges   = np.linspace(-0.5, 0.5, n_bins + 1)
     bin_centres = 0.5 * (bin_edges[1:] + bin_edges[:-1])
     bin_flux    = np.full(n_bins, np.nan)
-    bin_err     = np.full(n_bins, 0.002)
+    bin_err     = np.full(n_bins, SYS_ERROR_FLOOR)
 
     for i in range(n_bins):
         mask = (phase >= bin_edges[i]) & (phase < bin_edges[i + 1])
@@ -530,7 +538,9 @@ def bin_phase_curve(
             n_in_bin    = int(np.sum(mask))
             if n_in_bin > 1:
                 se = np.nanstd(flux[mask]) / np.sqrt(n_in_bin)
-                bin_err[i] = se if (se > 0 and np.isfinite(se)) else 0.002
+                se = se if (se > 0 and np.isfinite(se)) else 0.0
+                # Statistical error and the systematic floor added in quadrature.
+                bin_err[i] = float(np.hypot(se, SYS_ERROR_FLOOR))
 
     valid       = np.isfinite(bin_flux)
     return bin_centres[valid], bin_flux[valid], bin_err[valid]

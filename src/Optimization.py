@@ -129,7 +129,7 @@ INPUT_CATALOG: str = sys.argv[1] if len(sys.argv) > 1 else "neglected_targets.cs
 # Under mpirun, export the vars and forward them: `export MCMC_NITERS=45; ...;
 #   mpirun -x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN -x NM_MAXITER ...`.
 MCMC_N_WALKERS: int = int(os.environ.get("MCMC_NWALKERS", 14))
-MCMC_N_ITERATIONS: int = int(os.environ.get("MCMC_NITERS", 2850))   # total steps per walker
+MCMC_N_ITERATIONS: int = int(os.environ.get("MCMC_NITERS", 2850))   # fixed-mode target / fallback
 MCMC_BURN_IN_STEPS: int = int(os.environ.get("MCMC_BURNIN", 350))   # steps discarded before posterior
 
 # Nelder-Mead pre-wash iteration cap (Stage 1). Lower it for trial runs.
@@ -146,6 +146,21 @@ CONVERGENCE_MULTIPLIER: int = 50
 
 # Gelman-Rubin R̂ threshold below which a parameter is considered converged.
 RHAT_CONVERGENCE_THRESHOLD: float = 1.1
+
+# --- Adaptive convergence gate (v1) -----------------------------------------
+# Instead of a fixed step budget, the sampler runs in MCMC_CHECKPOINT_NITERS-sized
+# chunks between a floor and a ceiling and stops as soon as EVERY sampled parameter
+# satisfies both the 50τ autocorrelation criterion (Sokal 1997; Goodman & Weare
+# 2010; Foreman-Mackey et al. 2013) and R̂ < 1.1 (Gelman & Rubin 1992; Brooks &
+# Gelman 1998). The floor keeps the τ/R̂ estimates stable before the first test;
+# the ceiling bounds the worst case (multimodal / prior-railed fill-out, which no
+# number of steps resolves). Setting MCMC_NITERS explicitly forces the legacy
+# fixed-length run (MIN = MAX = MCMC_NITERS) for trials and reproductions.
+MCMC_FIXED_MODE: bool = "MCMC_NITERS" in os.environ
+MCMC_MIN_NITERS: int = (MCMC_N_ITERATIONS if MCMC_FIXED_MODE
+                        else int(os.environ.get("MCMC_MIN_NITERS", 1500)))
+MCMC_MAX_NITERS: int = (MCMC_N_ITERATIONS if MCMC_FIXED_MODE
+                        else int(os.environ.get("MCMC_MAX_NITERS", 6000)))
 
 
 # =============================================================================
@@ -286,6 +301,63 @@ def assess_autocorrelation_convergence(mcmc_chains: np.ndarray) -> np.ndarray:
         return emcee.autocorr.integrated_time(mcmc_chains, tol=0)
     except Exception:
         return np.full(mcmc_chains.shape[-1], np.inf)
+
+
+def gelman_rubin_rhat(mcmc_chains: np.ndarray) -> np.ndarray:
+    """
+    Gelman-Rubin potential scale reduction factor R̂ per parameter (Gelman &
+    Rubin 1992; Brooks & Gelman 1998). R̂ → 1 as the between-walker variance
+    vanishes, i.e. all walkers sample the same stationary distribution.
+
+    Accepts emcee-native (n_steps, n_walkers, n_params) or the swapped
+    (n_walkers, n_steps, n_params); returns np.inf per parameter on failure.
+    """
+    try:
+        chains = np.asarray(mcmc_chains)
+        if chains.ndim == 3 and chains.shape[1] == MCMC_N_WALKERS:
+            chains = np.swapaxes(chains, 0, 1)          # -> (n_walkers, n_steps, n_params)
+        n_w, n_s, n_p = chains.shape
+        rhats = np.full(n_p, np.inf)
+        for i in range(n_p):
+            pc      = chains[:, :, i]                    # (n_walkers, n_steps)
+            within  = np.mean(np.var(pc, axis=1))        # W
+            between = n_s * np.var(np.mean(pc, axis=1))  # B
+            if within > 0:
+                var_plus = (1 - 1 / n_s) * within + (1 / n_s) * between
+                rhats[i] = np.sqrt(var_plus / within)
+        return rhats
+    except Exception:
+        return np.full(np.asarray(mcmc_chains).shape[-1], np.inf)
+
+
+def chains_meet_convergence(bundle: object, done: int,
+                            solution: str = "best_solution") -> bool:
+    """
+    Stop condition for the adaptive gate: True only when EVERY sampled parameter
+    simultaneously clears both standard convergence tests —
+      • chain length  done > CONVERGENCE_MULTIPLIER × τ   (Sokal 1997), and
+      • R̂ < RHAT_CONVERGENCE_THRESHOLD                    (Gelman & Rubin 1992).
+    A non-finite τ or R̂ (too-short or degenerate chain) counts as NOT converged,
+    so the run continues toward the ceiling rather than stopping on a bad estimate.
+    Because R̂ stays above threshold for a multimodal parameter, a multimodal
+    fill-out can never trip a false "converged" — it runs to the ceiling instead.
+    """
+    try:
+        chains = np.asarray(bundle.get_value("samples", solution=solution))
+    except Exception:
+        return False
+    # τ estimator wants time on axis 0 (emcee-native); guard a transposed layout.
+    tau_chains = chains
+    if tau_chains.ndim == 3 and tau_chains.shape[0] == MCMC_N_WALKERS \
+            and tau_chains.shape[1] != MCMC_N_WALKERS:
+        tau_chains = np.swapaxes(tau_chains, 0, 1)
+    tau  = np.atleast_1d(assess_autocorrelation_convergence(tau_chains))
+    rhat = np.atleast_1d(gelman_rubin_rhat(chains))
+    if not (np.all(np.isfinite(tau)) and np.all(np.isfinite(rhat))):
+        return False
+    tau_ok  = bool(np.all(done > CONVERGENCE_MULTIPLIER * tau))
+    rhat_ok = bool(np.all(rhat < RHAT_CONVERGENCE_THRESHOLD))
+    return tau_ok and rhat_ok
 
 
 def compute_posterior_summary(
@@ -436,16 +508,10 @@ def extract_best_fit_parameters(
     return results
 
 
-def mpi_broadcast_int(value: int) -> int:
-    """Broadcast an int from rank 0 to all ranks (identity in serial mode).
-
-    Used so every MPI rank agrees on how many MCMC iterations are complete and
-    therefore executes the same number of collective run_solver() chunks — a
-    mismatch would deadlock the pool.
-    """
-    if mpi_n_procs > 1:
-        return mpi_comm.bcast(value, root=0)
-    return value
+# NOTE: there is deliberately NO user-level MPI broadcast helper here. Under
+# PHOEBE's MPI model only rank 0 executes this script (rank>0 are held in PHOEBE's
+# worker loop from import), so any user comm.bcast() collides with that loop and
+# crashes the workers. All MPI coordination is handled internally by run_solver.
 
 
 def completed_iterations(bundle: object, solution: str = "best_solution") -> int:
@@ -729,8 +795,10 @@ def prepare_bundle_for_mcmc(
         master_print(f"  [NM warning] Pre-wash failed: {nm_error}. Using initial guess.")
 
     # ── 5F: ADD emcee SOLVER (execution happens in the chunked loop) ──────────
+    _mcmc_budget = (f"{MCMC_N_ITERATIONS} steps" if MCMC_FIXED_MODE
+                    else f"{MCMC_MIN_NITERS}–{MCMC_MAX_NITERS} steps, adaptive")
     master_print(f"\n  [Stage 2] Configuring emcee MCMC "
-                 f"({MCMC_N_WALKERS} walkers × {MCMC_N_ITERATIONS} steps)...")
+                 f"({MCMC_N_WALKERS} walkers × {_mcmc_budget})...")
     bundle.add_solver(
         "sampler.emcee",
         solver="mcmc_sampler",
@@ -810,7 +878,7 @@ for target in target_list:
             star_name, variable_type,
         )
         already = completed_iterations(bundle, "best_solution")
-        master_print(f"  [resume] Loaded {mcmc_checkpoint} — {already}/{MCMC_N_ITERATIONS} "
+        master_print(f"  [resume] Loaded {mcmc_checkpoint} — {already}/{MCMC_MAX_NITERS} "
                      "iterations already complete.")
     else:
         prepared = prepare_bundle_for_mcmc(star_name, variable_type, bundle_path)
@@ -830,17 +898,29 @@ for target in target_list:
     # chunk fails to advance the chain (treating it as effectively complete), rather
     # than demanding an exact step count.
     #
-    # `done` is broadcast from rank 0 so every MPI rank runs the same number of
-    # collective run_solver() chunks (a mismatch would deadlock the pool).
-    done = completed_iterations(bundle, "best_solution") if mpi_rank == 0 else 0
-    done = mpi_broadcast_int(done)
+    # `done` is a rank-0-LOCAL counter. Under PHOEBE's MPI model only rank 0 runs
+    # this script; rank>0 processes are held in PHOEBE's own worker loop from import
+    # time, waiting for command-dict broadcasts. A user-level mpi_comm.bcast() here
+    # is therefore FATAL: the workers receive the bare int as their next "packet"
+    # and crash on packet.get() ("'int' object has no attribute 'get'"). run_solver
+    # coordinates the workers internally, so no user collective call is needed.
+    done = completed_iterations(bundle, "best_solution")
     mcmc_failed = False
+    converged_early = False
 
-    while done < MCMC_N_ITERATIONS:
+    # Adaptive convergence gate (v1): run chunks up to the ceiling MCMC_MAX_NITERS,
+    # but stop as soon as every sampled parameter clears both the 50τ and R̂<1.1
+    # tests once past the floor MCMC_MIN_NITERS. In fixed mode MIN=MAX=MCMC_NITERS,
+    # so this reduces exactly to the former fixed-length behaviour.
+    while done < MCMC_MAX_NITERS:
         prev_done = done
-        # +1 compensates for the continue_from overlap so a chunk lands on target.
-        remaining = MCMC_N_ITERATIONS - done
-        n_this    = min(MCMC_CHECKPOINT_NITERS, remaining + (0 if done == 0 else 1))
+        # +1 compensates for the continue_from overlap (a resumed chunk re-uses the
+        # last sample, yielding n−1 net new steps). Adding it to BOTH the cadence cap
+        # and `remaining` makes every intermediate chunk land on a round 250-net
+        # boundary, not 249 (Entry 24 checkpoint off-by-one fix).
+        remaining = MCMC_MAX_NITERS - done
+        n_this    = min(MCMC_CHECKPOINT_NITERS + (0 if done == 0 else 1),
+                        remaining              + (0 if done == 0 else 1))
         # context="solver" is REQUIRED: once a solution exists, the twigs
         # "niters"/"continue_from" also match parameters copied into the solution,
         # making a bare solver= filter ambiguous (ValueError: 2 results found).
@@ -849,31 +929,44 @@ for target in target_list:
         bundle.set_value("niters", solver="mcmc_sampler", context="solver", value=n_this)
         try:
             master_print(f"  [MCMC] chunk → +{n_this} iters "
-                         f"(from {done}/{MCMC_N_ITERATIONS})...")
+                         f"(from {done}/{MCMC_MAX_NITERS})...")
             bundle.run_solver("mcmc_sampler", solution="best_solution", overwrite=True)
         except Exception as mcmc_error:
             master_print(f"  MCMC error: {mcmc_error}")
             mcmc_failed = True
             break
 
-        if mpi_rank == 0:
-            bundle.save(mcmc_checkpoint)
-        done = (completed_iterations(bundle, "best_solution")
-                if mpi_rank == 0 else done + n_this)
-        done = mpi_broadcast_int(done)
-        master_print(f"  [checkpoint] {done}/{MCMC_N_ITERATIONS} iters saved → {mcmc_checkpoint}")
+        bundle.save(mcmc_checkpoint)
+        done = completed_iterations(bundle, "best_solution")
+        master_print(f"  [checkpoint] {done}/{MCMC_MAX_NITERS} iters saved → {mcmc_checkpoint}")
 
         if done <= prev_done:
             # No forward progress (continue_from overlap at the tail): stop here and
             # treat the chain as complete rather than spinning forever.
             master_print(f"  [checkpoint] chain not advancing past {done}/"
-                         f"{MCMC_N_ITERATIONS}; treating as complete.")
+                         f"{MCMC_MAX_NITERS}; treating as complete.")
+            break
+
+        # Convergence gate: never test before the floor; stop the moment every
+        # sampled parameter is genuinely converged. Multimodal / prior-railed
+        # parameters keep R̂ above threshold and simply run to the ceiling.
+        if done >= MCMC_MIN_NITERS and chains_meet_convergence(bundle, done):
+            master_print(f"  [converge] all sampled parameters meet "
+                         f"{CONVERGENCE_MULTIPLIER}τ & R̂<{RHAT_CONVERGENCE_THRESHOLD} "
+                         f"at {done} steps — stopping early.")
+            converged_early = True
             break
 
     if mcmc_failed and done == 0:
         master_print("  No usable samples produced — skipping target.")
         continue
-    master_print("  MCMC sampling complete.")
+    if converged_early:
+        master_print(f"  MCMC sampling complete (converged at {done} steps).")
+    elif not MCMC_FIXED_MODE and done >= MCMC_MAX_NITERS:
+        master_print(f"  MCMC sampling complete (reached ceiling {MCMC_MAX_NITERS} "
+                     "without full convergence — see diagnostics below).")
+    else:
+        master_print("  MCMC sampling complete.")
 
     # ── 5G: AUTOCORRELATION CONVERGENCE DIAGNOSTICS ───────────────────────────
     master_print("\n  [5G] Convergence diagnostics — Integrated Autocorrelation Time τ...")
@@ -892,7 +985,7 @@ for target in target_list:
         master_print("  " + "─" * 70)
         for i, param_twig in enumerate(free_params.keys()):
             tau_val = tau_values[i] if isinstance(tau_values, np.ndarray) else np.inf
-            status  = "✓ converged" if (MCMC_N_ITERATIONS > CONVERGENCE_MULTIPLIER * tau_val) else "⚠ under-converged"
+            status  = "✓ converged" if (done > CONVERGENCE_MULTIPLIER * tau_val) else "⚠ under-converged"
             master_print(f"  {param_twig:<40} {tau_val:>12.1f}  {status}")
     except Exception as autocorr_error:
         master_print(f"  Autocorrelation diagnostic failed: {autocorr_error}")
@@ -929,27 +1022,17 @@ for target in target_list:
     # ── 5I: GELMAN-RUBIN R̂ CONVERGENCE CHECK ─────────────────────────────────
     master_print("\n  [5I] Gelman-Rubin R̂ convergence diagnostics:")
     try:
-        chains = np.asarray(bundle.get_value("samples", solution="best_solution"))
-        # The R̂ formula below treats param_chains as (n_walkers, n_steps) with the
-        # within-chain variance taken over steps (axis 1). PHOEBE stores the chain
-        # as emcee-native (n_steps, n_walkers, n_params), so swap the first two axes
-        # to (n_walkers, n_steps, n_params) before unpacking.
-        if chains.ndim == 3 and chains.shape[1] == MCMC_N_WALKERS:
-            chains = np.swapaxes(chains, 0, 1)
-        n_w, n_s, n_p = chains.shape
-        fitted_twigs  = bundle.get_value("fitted_twigs", solution="best_solution")
+        # R̂ from the shared helper (the same one the convergence gate uses), so the
+        # post-hoc report and the stop criterion can never diverge.
+        raw_chains   = np.asarray(bundle.get_value("samples", solution="best_solution"))
+        fitted_twigs = bundle.get_value("fitted_twigs", solution="best_solution")
+        r_hats       = gelman_rubin_rhat(raw_chains)
 
         master_print(f"  {'Parameter':<40} {'R̂':>8}  {'Status'}")
         master_print("  " + "─" * 60)
         for i, param_name in enumerate(fitted_twigs):
-            param_chains  = chains[:, :, i]              # shape (n_walkers, n_steps)
-            within_var    = np.mean(np.var(param_chains, axis=1))  # W
-            between_var   = n_s * np.var(np.mean(param_chains, axis=1))  # B
-            # R̂ approaches 1.0 as the between-chain variance (B) → 0, i.e. all
-            # walkers have converged to sampling the same stationary distribution.
-            var_plus      = (1 - 1 / n_s) * within_var + (1 / n_s) * between_var
-            r_hat         = np.sqrt(var_plus / within_var)
-            status        = "CONVERGED" if r_hat < RHAT_CONVERGENCE_THRESHOLD else "UNCONVERGED"
+            r_hat  = float(r_hats[i]) if i < len(r_hats) else float("inf")
+            status = "CONVERGED" if r_hat < RHAT_CONVERGENCE_THRESHOLD else "UNCONVERGED"
             master_print(f"  {param_name:<40} {r_hat:>8.4f}  {status}")
     except Exception as rhat_error:
         master_print(f"  Gelman-Rubin diagnostic failed: {rhat_error}")
@@ -973,12 +1056,22 @@ for target in target_list:
     # the output. All I/O is gated on rank 0.
     if mpi_rank == 0:
         with open(results_path, "w", newline="", encoding="utf-8") as results_file:
+            # Rescale the posterior uncertainties so the reduced χ² is effectively 1.
+            # When the formal photometric errors underestimate unmodelled systematics
+            # (starspots, the O'Connell effect), the raw posterior widths are
+            # unrealistically tight; multiplying them by sqrt(χ²_red) is the standard
+            # correction (Kallrath & Milone 2009). Only inflates (never shrinks).
+            err_scale = (max(1.0, float(np.sqrt(chi2_red)))
+                         if np.isfinite(chi2_red) else 1.0)
             writer = csv.writer(results_file)
             writer.writerow(["Parameter", "Symbol", "Value", "Sigma_minus", "Sigma_plus", "Unit"])
             for key, (value, sig_minus, sig_plus) in results.items():
                 label, unit = PARAM_DISPLAY_LABELS.get(key, (key, ""))
-                writer.writerow([label, key, value, sig_minus, sig_plus, unit])
+                sm = sig_minus * err_scale if np.isfinite(sig_minus) else sig_minus
+                sp = sig_plus  * err_scale if np.isfinite(sig_plus)  else sig_plus
+                writer.writerow([label, key, value, sm, sp, unit])
             writer.writerow(["Reduced chi-squared", "chi2_red", chi2_red, "", "", "—"])
+            writer.writerow(["Error scale (sqrt reduced chi2)", "err_scale", err_scale, "", "", "—"])
         master_print(f"\n  Results saved: {results_path}")
 
         try:

@@ -19,7 +19,8 @@ Layout assumption:
     <CODE>/tess-binary-modeling-pipeline/tools/sync_from_working_tree.py   (this file)
     <CODE>/01TargetSelection.py ... 04Modeling.py, GenerateThesisTables.py
     <CODE>/Audits/*.py, Notes/*.txt, Targets/neglected_targets*.csv
-    <CODE>/02,03,04 Data/05Optimization.py   (canonical Optimization source)
+    <CODE>/02,03,04 Data/05Optimization.py    (canonical Optimization source)
+    <CODE>/02,03,04 Data/06Visualization.py   (canonical Visualization source)
 """
 from __future__ import annotations
 
@@ -38,7 +39,12 @@ SCRIPTS: list[tuple[Path, Path]] = [
     (CODE / "04Modeling.py",           REPO / "src" / "Modeling.py"),
     # Canonical Optimization lives in the data folder (kept ahead during 05 debugging).
     (DATA / "05Optimization.py",       REPO / "src" / "Optimization.py"),
+    # Visualization reads the bundles in the data folder and lives beside them.
+    (DATA / "06Visualization.py",      REPO / "src" / "Visualization.py"),
     (CODE / "GenerateThesisTables.py", REPO / "src" / "GenerateThesisTables.py"),
+    # Standalone illustration utility, not a numbered pipeline stage.
+    (DATA / "SchematicRocheGeometry.py",
+     REPO / "src" / "SchematicRocheGeometry.py"),
 ]
 
 # (source_dir, glob_pattern, destination_dir)

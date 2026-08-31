@@ -4,15 +4,16 @@ An automated, high-precision Python pipeline for the acquisition, reduction, tim
 
 ## 🔭 Pipeline Architecture
 
-Five sequential stages take raw spacecraft data to physical stellar parameters. Each stage is a standalone script under `src/` and accepts an optional target-catalogue argument so a single batch can be processed in isolation.
+Six sequential stages take raw spacecraft data to physical stellar parameters and rendered geometry. Each stage is a standalone script under `src/` and accepts an optional target-catalogue argument so a single batch can be processed in isolation.
 
 1. **Target Selection (`TargetSelection.py`):** Queries the Kreiner (2004) database and cross-references VSX/GCVS to identify short-period (P < 1 d), long-neglected EW/EB candidates with TESS coverage. Outputs `neglected_targets.csv`.
 2. **Data Acquisition (`DataAcquisition.py`):** Retrieves mission-standard PDCSAP light curves (SPOC → TESS-SPOC → QLP fallback, keyed on TIC ID to avoid name-resolution collisions), applies hard bitmasking and 4σ outlier rejection, and validates products by baseline/sector before use (rejecting corrupt partial-FFI stubs). Can stitch multiple sectors when coverage is thin.
 3. **O–C Analysis (`OCAnalysis.py`):** Extracts precise barycentric times of minimum via the Kwee–van Woerden algorithm and refines the linear ephemeris against the ~20-year Kreiner baseline. A fold-quality self-check rejects a refined period that folds worse than the catalogue period.
 4. **Stellar Modeling (`Modeling.py`):** Builds PHOEBE 2 forward-model bundles with blackbody atmospheres, the contact "double-flip" constraint hierarchy, dynamic gravity darkening (von Zeipel 1924 / Lucy 1967 across the 8000 K boundary), and Gaia DR3 temperature anchoring for the fixed primary.
 5. **Posterior Optimization (`Optimization.py`):** Solves the inverse problem with a Nelder–Mead pre-wash followed by the `emcee` affine-invariant MCMC sampler, MPI-parallelised over walkers. Chains are checkpointed and resumable, and posteriors are reported with asymmetric 1σ uncertainties.
+6. **Mesh Visualization (`Visualization.py`):** Renders the PHOEBE 2 surface mesh with Mayavi, colour-mapped by per-element effective temperature. Converged systems additionally get an animated GIF spanning one orbital cycle at the refined period, and a contact-sheet montage of the converged sample. Outputs are compared against bundle modification times, so re-running after a batch renders only what changed.
 
-`GenerateThesisTables.py` renders a LaTeX results table from the per-target output.
+`GenerateThesisTables.py` renders a LaTeX results table from the per-target output. `SchematicRocheGeometry.py` draws generic detached and contact Roche geometries from synthetic parameters, for use as a didactic illustration rather than a result.
 
 ## 📊 Scientific Context
 
@@ -21,7 +22,7 @@ The project targets "neglected" binaries whose historical ground-based timings h
 ## 🗂️ Repository Layout
 
 ```
-src/        pipeline stages 01–05 + the table generator
+src/        pipeline stages 01–06 + the table generator and schematic utility
 audits/     standalone diagnostic scripts (light-curve, O–C, modeling, phase-offset)
 docs/       methodology notes and expansion plans
 data/       tominima tables and the sample definition (data/targets/)
@@ -34,6 +35,12 @@ Large data products (PHOEBE bundles, FITS light curves) and the private running 
 
 ```bash
 pip install phoebe emcee lightkurve numpy scipy matplotlib astropy astroquery mpi4py
+```
+
+Stage 06 additionally needs the rendering stack (it renders offscreen, so no display is required):
+
+```bash
+pip install mayavi vtk pyqt5 pillow
 ```
 
 ## 🚀 Execution
@@ -57,6 +64,14 @@ Run-size knobs are environment-overridable for fast smoke tests (defaults are pr
 ```bash
 MCMC_NITERS=45 MCMC_CHECKPOINT=15 MCMC_BURNIN=10 NM_MAXITER=20 python3 src/Optimization.py trial.csv
 ```
+
+Stage 06 is safe to re-run after every batch — it renders only stars whose bundles are newer than their images, and skips the rest:
+
+```bash
+python src/Visualization.py Targets/neglected_targets_batch1.csv
+```
+
+Pass `FORCE_RERENDER=1` to rebuild every image regardless of modification time.
 
 ## 📄 License
 
