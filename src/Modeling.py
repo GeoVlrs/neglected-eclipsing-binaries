@@ -282,6 +282,21 @@ GAIA_TEFF_OVERRIDE_K: dict[str, float] = {
 # SECTION 3 — HELPER FUNCTIONS
 # =============================================================================
 
+# Per-star morphology override, consulted by resolve_morphology() BEFORE the GCVS
+# classifier. Use it to force a star BUILT as detached when the contact model is
+# geometrically wrong for it (Script 05's assess_contact_validity flags
+# RECONSIDER_DETACHED, or the production log shows "requiv too close to requiv_min /
+# use detached model"). Mirrors GAIA_TEFF_OVERRIDE_K. MUST stay byte-identical to the
+# same dict in Script 05, or a bundle would be built under one morphology and optimised
+# under another. Value: "detached" or "contact". Workflow: add here (both scripts) →
+# re-run Script 04 (rebuilds a detached bundle) → clear results_<star>.csv → re-run 05.
+MORPHOLOGY_OVERRIDE: dict[str, str] = {
+    # "FI Boo": "detached",  # DETECTOR FALSE POSITIVE — light curve is clearly EW/contact
+    #                        # (continuous variation + O'Connell); kept CONTACT. See log.
+    # "Y Sex":  "detached",  # pending: run not finished / not yet verified
+}
+
+
 def is_contact_morphology(gcvs_type: str) -> bool:
     """
     Decide whether a GCVS variability type denotes a contact (overcontact) binary.
@@ -304,6 +319,20 @@ def is_contact_morphology(gcvs_type: str) -> bool:
     """
     base = gcvs_type.strip().upper().replace(":", "").split("/")[0]
     return base == "EW"
+
+
+def resolve_morphology(star_name: str, gcvs_type: str) -> bool:
+    """
+    Decide contact (True) vs detached (False) for a star, honouring MORPHOLOGY_OVERRIDE
+    first and falling back to the pure GCVS classifier is_contact_morphology(). This is
+    the single entry point the pipeline should call; is_contact_morphology stays a pure,
+    star-agnostic classifier. MUST behave identically in Scripts 04 and 05 (same override
+    table) so a bundle is built and optimised under the same morphology.
+    """
+    override = MORPHOLOGY_OVERRIDE.get(star_name)
+    if override is not None:
+        return override.strip().lower() == "contact"
+    return is_contact_morphology(gcvs_type)
 
 
 def estimate_contact_spectral_type(period_days: float) -> str:
@@ -358,7 +387,7 @@ def resolve_initial_params(
     if star_name in TARGET_INITIAL_PARAMS:
         return TARGET_INITIAL_PARAMS[star_name]
 
-    if is_contact_morphology(gcvs_type):
+    if resolve_morphology(star_name, gcvs_type):
         params = dict(DEFAULT_CONTACT_PARAMS)
         params["spectral_type"] = estimate_contact_spectral_type(period_days)
         return params
@@ -630,7 +659,7 @@ for target in target_list:
     # by half a period to recover the primary. For CONTACT binaries (EW/KW) the
     # two eclipses are similarly shaped so argmin reliably finds the deeper
     # (= primary) eclipse regardless of how large the offset is.
-    if abs(primary_phase_offset) > 0.4 and not is_contact_morphology(variable_type):
+    if abs(primary_phase_offset) > 0.4 and not resolve_morphology(star_name, variable_type):
         primary_phase_offset -= np.sign(primary_phase_offset) * 0.5
         t0_tess = t0_model + primary_phase_offset * period_model
         print(f"  (EB |offset|>0.4 → half-period flip → {primary_phase_offset:+.6f} cycles)")
@@ -662,7 +691,7 @@ for target in target_list:
     print(f"  T1 = {t1_kelvin:.0f} K  ({t1_source})")
 
     # ── 5D: PHOEBE 2 BUNDLE INSTANTIATION ────────────────────────────────────
-    is_contact_binary = is_contact_morphology(variable_type)
+    is_contact_binary = resolve_morphology(star_name, variable_type)
     print(f"\n  [5D] Building bundle  (contact_binary={is_contact_binary})...")
     bundle = phoebe.default_binary(contact_binary=is_contact_binary)
 

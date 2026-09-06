@@ -162,6 +162,17 @@ MCMC_MIN_NITERS: int = (MCMC_N_ITERATIONS if MCMC_FIXED_MODE
 MCMC_MAX_NITERS: int = (MCMC_N_ITERATIONS if MCMC_FIXED_MODE
                         else int(os.environ.get("MCMC_MAX_NITERS", 6000)))
 
+# Lower bound on the contact fill-out factor f. The overcontact neck pinches toward the
+# L1 point as f → 0, where PHOEBE's mesh destabilises (walkers proposing low/negative f
+# gave "fillout_factor not within limits" + "Projections failing / Mesh failed",
+# lnprob=-inf). A positive floor keeps walkers in valid contact space. Value pinned by a
+# self-consistent forward-model probe at the production mesh resolution (ntriangles=2000):
+# f ≤ 0.02 FAILS, f = 0.03 is stable. (ntriangles=5000 would lower the stable floor to
+# 0.02 but costs ~6–7× per model — not worth it for MCMC.) 0.03 stays below the lowest
+# genuine observed fill-out (TZ Boo f=0.039), so no real W UMa system is truncated.
+# Empirical, hence overridable.
+FILLOUT_FLOOR: float = float(os.environ.get("FILLOUT_FLOOR", 0.03))
+
 
 # =============================================================================
 # SECTION 2 — FREE PARAMETER DEFINITIONS WITH PRIOR BOUNDS
@@ -177,12 +188,16 @@ MCMC_MAX_NITERS: int = (MCMC_N_ITERATIONS if MCMC_FIXED_MODE
 
 FREE_PARAMS_CONTACT: dict[str, tuple[float, float, str]] = {
     "teff@secondary":                   (3000, 10000, "Secondary effective temperature (K)"),
-    "incl@binary":                      (50.0,  90.0, "Orbital inclination (degrees)"),
-    "fillout_factor@contact_envelope":  (0.0,   0.50, "Contact fill-out factor f"),
-    # fillout upper limit tightened 0.70 -> 0.50: extreme overcontact geometries were
-    # failing the PHOEBE mesh ("Mesh failed / Projections are failing", lnprob=-inf)
-    # during the trial. 0.50 covers essentially all W UMa systems while keeping the
-    # walkers out of the mesh-collapse regime.
+    "incl@binary":                      (40.0,  90.0, "Orbital inclination (degrees)"),
+    # incl floor lowered 50 -> 40: FI Boo (shallow eclipses) railed exactly at 50°, and
+    # contact systems can still eclipse at moderate inclinations. Widening only helps
+    # low-i systems; every other completed star sits at i >= 54°, so none are affected.
+    "fillout_factor@contact_envelope":  (FILLOUT_FLOOR, 0.50, "Contact fill-out factor f"),
+    # Bounds tightened at BOTH ends to keep walkers out of the mesh-collapse regime
+    # (extreme overcontact and the f→0 neck pinch both gave "Mesh failed / Projections
+    # failing", lnprob=-inf). Upper 0.70 -> 0.50 covers essentially all W UMa systems;
+    # lower 0.0 -> FILLOUT_FLOOR (0.03, mesh-probe-verified at ntriangles=2000) stops the
+    # low-/negative-f proposals that failed the mesh (see FILLOUT_FLOOR).
 }
 
 FREE_PARAMS_DETACHED: dict[str, tuple[float, float, str]] = {
@@ -201,6 +216,22 @@ FREE_PARAMS_DETACHED: dict[str, tuple[float, float, str]] = {
 # SECTION 3 — HELPER FUNCTIONS
 # =============================================================================
 
+# Per-star morphology override, consulted by resolve_morphology() BEFORE the GCVS
+# classifier. Use it to force a star modelled as detached when the contact model is
+# geometrically wrong for it (assess_contact_validity flags RECONSIDER_DETACHED, or the
+# batch-3 production log shows "requiv too close to requiv_min / use detached model").
+# Mirrors GAIA_TEFF_OVERRIDE_K in Script 04. MUST stay byte-identical between Scripts 04
+# and 05 (same requirement that binds is_contact_morphology), or a bundle would be built
+# under one morphology and optimised under another. Value: "detached" or "contact".
+# Workflow for a flagged star: add it here (both scripts) → re-run Script 04 (rebuilds a
+# detached bundle) → clear its results_<star>.csv → re-run Script 05.
+MORPHOLOGY_OVERRIDE: dict[str, str] = {
+    # "FI Boo": "detached",  # DETECTOR FALSE POSITIVE — light curve is clearly EW/contact
+    #                        # (continuous variation + O'Connell); kept CONTACT. See log.
+    # "Y Sex":  "detached",  # pending: run not finished / not yet verified
+}
+
+
 def is_contact_morphology(gcvs_type: str) -> bool:
     """
     Decide whether a GCVS variability type denotes a contact (overcontact) binary.
@@ -214,6 +245,53 @@ def is_contact_morphology(gcvs_type: str) -> bool:
     """
     base = gcvs_type.strip().upper().replace(":", "").split("/")[0]
     return base == "EW"
+
+
+def resolve_morphology(star_name: str, gcvs_type: str) -> bool:
+    """
+    Decide contact (True) vs detached (False) for a star, honouring MORPHOLOGY_OVERRIDE
+    first and falling back to the pure GCVS classifier is_contact_morphology(). This is
+    the single entry point the pipeline should call; is_contact_morphology stays a pure,
+    star-agnostic classifier. MUST behave identically in Scripts 04 and 05 (same override
+    table) so a bundle is built and optimised under the same morphology.
+    """
+    override = MORPHOLOGY_OVERRIDE.get(star_name)
+    if override is not None:
+        return override.strip().lower() == "contact"
+    return is_contact_morphology(gcvs_type)
+
+
+def assess_contact_validity(bundle: object) -> str:
+    """
+    Flag whether a CONTACT fit's ADOPTED-MEDIAN geometry is actually a valid contact
+    configuration. Returns "RECONSIDER_DETACHED" or "CONTACT_OK". Only FLAGS for human
+    review (via MORPHOLOGY_OVERRIDE); never switches the model.
+
+    SINGLE, SPECIFIC signal — PHOEBE run_checks on the adopted posterior-median geometry.
+    If it reports the requiv-near-critical / "use detached/semidetached model" condition,
+    the fitted contact geometry is genuinely invalid → RECONSIDER_DETACHED. Else CONTACT_OK.
+
+    Fill-out railing and high χ² were tried (v2) and REMOVED. A low-fill-out,
+    mesh-resolution-limited, O'Connell-inflated CONTACT star produces the same posterior
+    signature (fill-out walling, poor χ²) as a detached-wanting one, so those heuristics
+    FALSE-POSITIVE on valid contact systems — verified on FI Boo, which is unambiguously
+    EW by its light curve yet tripped the v2 wall heuristic. Posterior statistics cannot
+    separate the two; only the folded light-curve SHAPE can (continuous EW variation +
+    O'Connell ⇒ contact; flat out-of-eclipse ⇒ detached). So the reliable trigger is an
+    outright-invalid median geometry, and every flag is a prompt for a human to eyeball
+    the light curve before deciding — never an assertion that the star IS detached.
+    """
+    try:
+        report  = bundle.run_checks()
+        passed  = getattr(report, "passed", None)
+        text    = str(report).lower()
+        flagged = (("requiv" in text and ("critical" in text or "requiv_min" in text))
+                   or "use detached" in text or "semidetached" in text)
+        if (passed is False) or flagged:
+            return "RECONSIDER_DETACHED"
+    except Exception:
+        pass  # unusable check → no clear signal; stay conservative (CONTACT_OK)
+    return "CONTACT_OK"
 
 
 def eggleton_roche_radius(q: float) -> float:
@@ -548,7 +626,7 @@ def derive_free_params_meta(
     loaded checkpoint and only the membership/count metadata is needed downstream
     (degrees of freedom, contact-vs-detached result extraction).
     """
-    is_contact = is_contact_morphology(variable_type)
+    is_contact = resolve_morphology(star_name, variable_type)
     free_params = (
         FREE_PARAMS_CONTACT.copy() if is_contact else FREE_PARAMS_DETACHED.copy()
     )
@@ -617,7 +695,7 @@ def prepare_bundle_for_mcmc(
         # contribution (secondary eclipse and ellipsoidal variation disappear from
         # the model). 'component-coupled' derives pblum@secondary from the physical
         # T/R ratio relative to the primary, preserving the correct flux ratio.
-        pblum_mode_eff = (pblum_mode if is_contact_morphology(variable_type)
+        pblum_mode_eff = (pblum_mode if resolve_morphology(star_name, variable_type)
                           else "component-coupled")
         bundle.set_value("pblum_mode", dataset="lc01", value=pblum_mode_eff)
         if pblum_mode_eff != pblum_mode:
@@ -644,7 +722,7 @@ def prepare_bundle_for_mcmc(
             master_print(f"  [LD warning] {comp}: {ld_error}")
 
     # ── 5D: FREE PARAMETERS & PRIORS ─────────────────────────────────────────
-    is_contact_binary = is_contact_morphology(variable_type)
+    is_contact_binary = resolve_morphology(star_name, variable_type)
 
     if is_contact_binary:
         try:
@@ -757,7 +835,7 @@ def prepare_bundle_for_mcmc(
     # secondary's physical luminosity on top makes the combined model ~10% too
     # bright. NM compensates by collapsing r₂ → zero. One forward model at the
     # seed point gives the exact factor needed to correct pblum@primary before NM.
-    if not is_contact_morphology(variable_type):
+    if not resolve_morphology(star_name, variable_type):
         try:
             bundle.run_compute(model="pblum_norm", overwrite=True)
             model_f = bundle.get_value("fluxes", dataset="lc01", model="pblum_norm")
@@ -1042,6 +1120,34 @@ for target in target_list:
     posterior = compute_posterior_summary(bundle, "best_solution", MCMC_BURN_IN_STEPS)
     results   = extract_best_fit_parameters(bundle, free_params, posterior)
 
+    # ── 5J-b: MORPHOLOGY PROVENANCE + CONTACT-MODEL VALIDITY FLAG ─────────────
+    # morphology_source records WHY the model was contact/detached (GCVS label vs a
+    # MORPHOLOGY_OVERRIDE). For contact stars, assess_contact_validity flags whether
+    # the fit actually wants to be detached — a heads-up for human review, never an
+    # automatic switch. (Runs on rank 0 only, like the rest of this post-run block.)
+    if star_name in MORPHOLOGY_OVERRIDE:
+        morphology_source = "OVERRIDE_" + MORPHOLOGY_OVERRIDE[star_name].strip().upper()
+    else:
+        morphology_source = "GCVS"
+    if is_contact_binary:
+        morphology_flag = assess_contact_validity(bundle)
+        if morphology_flag == "RECONSIDER_DETACHED":
+            master_print("\n  " + "!" * 72)
+            master_print(f"  [morphology] {star_name}: adopted contact geometry FAILS "
+                         "run_checks (requiv near critical).")
+            master_print("  VERIFY against the folded light curve FIRST — a genuine EW curve "
+                         "(continuous")
+            master_print("  variation / O'Connell) stays CONTACT; only a detached-shaped curve "
+                         "(flat")
+            master_print("  out-of-eclipse) warrants the switch. The detector cannot tell these "
+                         "apart.")
+            master_print(f"  If detached: add \"{star_name}\": \"detached\" to MORPHOLOGY_OVERRIDE "
+                         "(04 AND 05),")
+            master_print(f"  re-run Script 04, clear {results_path}, re-run Script 05.")
+            master_print("  " + "!" * 72)
+    else:
+        morphology_flag = "DETACHED_MODEL"
+
     master_print("\n  ─── FINAL PARAMETER POSTERIOR ──────────────────────────────")
     for key, (value, sig_minus, sig_plus) in results.items():
         if np.isfinite(value):
@@ -1072,6 +1178,8 @@ for target in target_list:
                 writer.writerow([label, key, value, sm, sp, unit])
             writer.writerow(["Reduced chi-squared", "chi2_red", chi2_red, "", "", "—"])
             writer.writerow(["Error scale (sqrt reduced chi2)", "err_scale", err_scale, "", "", "—"])
+            writer.writerow(["Morphology flag", "morphology_flag", morphology_flag, "", "", "—"])
+            writer.writerow(["Morphology source", "morphology_source", morphology_source, "", "", "—"])
         master_print(f"\n  Results saved: {results_path}")
 
         try:
