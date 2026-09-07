@@ -35,6 +35,7 @@ Dependencies:
 import csv
 import math
 import os
+import paths
 import sys
 from typing import Optional
 
@@ -68,7 +69,7 @@ def read_results_file(star_name: str) -> Optional[dict[str, tuple[float, float, 
     A symbol → (value, −σ, +σ) mapping, or None if the file does not exist.
     """
     safe_name    = star_name.replace(" ", "_")
-    results_path = f"results_{safe_name}.csv"
+    results_path = os.path.join(paths.RESULTS_DIR, f"results_{safe_name}.csv")
 
     if not os.path.exists(results_path):
         return None

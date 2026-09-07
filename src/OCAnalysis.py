@@ -63,8 +63,8 @@ from astroquery.vizier import Vizier
 
 warnings.filterwarnings("ignore")
 
-PLOT_OUTPUT_DIR: str = "plots"
-os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
+import paths
+paths.ensure_dirs()
 
 # TESS mission time offset: BTJD + offset = BJD.
 # Historical ephemerides (Kreiner 2004) are in HJD; the BJD–HJD difference
@@ -457,7 +457,7 @@ for target in target_list:
     print(f"O–C ANALYSIS: {star_name}")
     print("=" * 70)
 
-    lc_fits_path = f"lc_{safe_name}_clean.fits"
+    lc_fits_path = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_clean.fits")
     if not os.path.exists(lc_fits_path):
         print(f"  WARNING: {lc_fits_path} not found. Skipping.")
         continue
@@ -585,7 +585,7 @@ for target in target_list:
               f"Kreiner {depth_kreiner:.3f} — refined period retained.")
 
     # ── 6E: WRITE OUTPUT FILES ────────────────────────────────────────────────
-    ephem_path = f"ephem_{safe_name}.txt"
+    ephem_path = os.path.join(paths.TIMING_DIR, f"ephem_{safe_name}.txt")
     with open(ephem_path, "w") as ephem_file:
         ephem_file.write(f"# Refined linear ephemeris for {star_name}\n")
         ephem_file.write("# T_min (BJD) = T0_new + P_new * E\n")
@@ -600,7 +600,7 @@ for target in target_list:
         ephem_file.write(f"PERIOD_REVERTED = {period_reverted}  "
                          "# True if the refined period was rejected (folded worse than Kreiner)\n")
 
-    tominima_path = f"tominima_{safe_name}.csv"
+    tominima_path = os.path.join(paths.TIMING_DIR, f"tominima_{safe_name}.csv")
     with open(tominima_path, "w", newline="") as tominima_file:
         writer = csv.writer(tominima_file)
         writer.writerow(["Star", "T_min_BJD", "T_min_err_days", "Epoch_E", "OC_days"])
@@ -697,7 +697,7 @@ for target in target_list:
     axes[2].legend(loc="upper right")
 
     plt.tight_layout()
-    plot_path = os.path.join(PLOT_OUTPUT_DIR, f"oc_{safe_name}.png")
+    plot_path = os.path.join(paths.PLOT_OC_DIR, f"oc_{safe_name}.png")
     plt.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"  O–C diagram saved: {plot_path}")

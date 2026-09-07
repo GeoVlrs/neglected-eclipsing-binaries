@@ -70,8 +70,8 @@ warnings.filterwarnings("ignore", module="astropy")
 # must be shifted by this offset to obtain standard BJD timestamps.
 TESS_BTJD_TO_BJD_OFFSET: float = 2_457_000.0
 
-PLOT_OUTPUT_DIR: str = "plots"
-os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
+import paths
+paths.ensure_dirs()
 
 # Product-validity thresholds (Flag 1 remediation). TESS sectors are numbered in
 # the low hundreds; a product tagged with a sector far above this is a metadata
@@ -296,8 +296,8 @@ for target in target_list:
     folded_lc = clean_lc.fold(period=orbital_period)
 
     # ── 4D: EXPORT SCIENCE PRODUCTS ───────────────────────────────────────────
-    clean_fits_path  = f"lc_{safe_name}_clean.fits"
-    folded_fits_path = f"lc_{safe_name}_folded.fits"
+    clean_fits_path  = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_clean.fits")
+    folded_fits_path = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_folded.fits")
     clean_lc.to_fits(clean_fits_path,   overwrite=True)
     folded_lc.to_fits(folded_fits_path, overwrite=True)
     print(f"  Exported: {clean_fits_path}, {folded_fits_path}")
@@ -306,7 +306,7 @@ for target in target_list:
     # without reloading the full light curve.
     cadence_days    = float(np.nanmedian(np.diff(clean_lc.time.value)))
     cadence_seconds = cadence_days * 86_400.0
-    with open(f"cadence_{safe_name}.txt", "w") as cadence_file:
+    with open(os.path.join(paths.LIGHTCURVE_DIR, f"cadence_{safe_name}.txt"), "w") as cadence_file:
         cadence_file.write(f"{cadence_seconds}\n")
 
     # ── 4E: THREE-PANEL DIAGNOSTIC PLOT ───────────────────────────────────────
@@ -389,7 +389,7 @@ for target in target_list:
     axes[2].set_xlim(-0.5, 0.5)
 
     plt.tight_layout()
-    plot_path = os.path.join(PLOT_OUTPUT_DIR, f"lc_{safe_name}_raw_vs_clean.png")
+    plot_path = os.path.join(paths.PLOT_LC_DIR, f"lc_{safe_name}_raw_vs_clean.png")
     plt.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"  Diagnostic plot saved: {plot_path}")

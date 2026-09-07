@@ -105,8 +105,8 @@ if mpi_rank == 0:
 warnings.filterwarnings("ignore")
 phoebe.logger(clevel="WARNING")
 
-PLOT_OUTPUT_DIR: str = "plots"
-os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
+import paths
+paths.ensure_dirs()
 
 # Temperature boundary for von Zeipel vs. Lucy bolometric coefficients.
 RADIATIVE_CONVECTIVE_BOUNDARY_K: float = 8_000.0
@@ -934,9 +934,9 @@ for target in target_list:
     master_print("=" * 70)
 
     # ── TARGET PATHS, SKIP & RESUME DETECTION ────────────────────────────────
-    bundle_path     = f"bundle_{safe_name}.phoebe"
-    mcmc_checkpoint = f"bundle_{safe_name}_mcmc.phoebe"
-    results_path    = f"results_{safe_name}.csv"
+    bundle_path     = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}.phoebe")
+    mcmc_checkpoint = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}_mcmc.phoebe")
+    results_path    = os.path.join(paths.RESULTS_DIR, f"results_{safe_name}.csv")
 
     # Idempotent re-runs: a completed target (results file present) is skipped, so
     # an interrupted batch can simply be relaunched with the same command and will
@@ -1230,11 +1230,11 @@ for target in target_list:
             ax_res.grid(alpha=0.3)
 
             plt.tight_layout()
-            plot_path = os.path.join(PLOT_OUTPUT_DIR, f"phoebe_final_{safe_name}.png")
+            plot_path = os.path.join(paths.PLOT_FINAL_DIR, f"phoebe_final_{safe_name}.png")
             plt.savefig(plot_path, dpi=150, bbox_inches="tight")
             plt.close()
 
-            final_bundle_path = f"bundle_{safe_name}_final.phoebe"
+            final_bundle_path = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}_final.phoebe")
             bundle.save(final_bundle_path)
             master_print(f"  Final bundle saved: {final_bundle_path}")
             master_print(f"  Final plot saved:   {plot_path}")

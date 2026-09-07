@@ -79,8 +79,8 @@ import lightkurve as lk
 warnings.filterwarnings("ignore")
 phoebe.logger(clevel="WARNING")
 
-PLOT_OUTPUT_DIR: str = "plots"
-os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
+import paths
+paths.ensure_dirs()
 
 TESS_BTJD_TO_BJD_OFFSET: float = 2_457_000.0
 
@@ -474,7 +474,7 @@ def load_refined_ephemeris(safe_star_name: str) -> dict[str, float]:
         {"T0_new": 2459001.3, "P_new": 0.40162, ...}
     An empty dict is returned if the file does not exist.
     """
-    ephem_path = f"ephem_{safe_star_name}.txt"
+    ephem_path = os.path.join(paths.TIMING_DIR, f"ephem_{safe_star_name}.txt")
     params: dict[str, float] = {}
     if not os.path.exists(ephem_path):
         return params
@@ -613,7 +613,7 @@ for target in target_list:
     print("=" * 70)
 
     # ── 5A: LOAD LIGHT CURVE & COMPUTE PHASE ──────────────────────────────────
-    lc_fits_path = f"lc_{safe_name}_clean.fits"
+    lc_fits_path = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_clean.fits")
     if not os.path.exists(lc_fits_path):
         print(f"  WARNING: {lc_fits_path} not found. Skipping.")
         continue
@@ -813,7 +813,7 @@ for target in target_list:
         ax_res.grid(alpha=0.3)
 
         plt.tight_layout()
-        plot_path = os.path.join(PLOT_OUTPUT_DIR, f"phoebe_init_{safe_name}.png")
+        plot_path = os.path.join(paths.PLOT_INIT_DIR, f"phoebe_init_{safe_name}.png")
         plt.savefig(plot_path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"  Initial model plot saved: {plot_path}")
@@ -822,7 +822,7 @@ for target in target_list:
         print(f"  Could not generate diagnostic plot: {plot_error}")
 
     # ── 5M: SAVE BUNDLE ───────────────────────────────────────────────────────
-    bundle_path = f"bundle_{safe_name}.phoebe"
+    bundle_path = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}.phoebe")
     bundle.save(bundle_path)
     print(f"\n  Bundle saved: {bundle_path}")
     print(f"    System type  : {'Contact (EW)' if is_contact_binary else 'Detached/SD (EB)'}")

@@ -46,8 +46,8 @@ import phoebe
 warnings.filterwarnings("ignore")
 phoebe.logger(clevel="WARNING")
 
-PLOT_OUTPUT_DIR: str = "plots"
-os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
+import paths
+paths.ensure_dirs()
 
 MESH_TRIANGLE_COUNT: int = 2000   # matches the pipeline's own constant (Script 04)
 FIGURE_SIZE = (1000, 800)
@@ -95,7 +95,7 @@ def render_schematic(contact: bool, out_name: str, title: str) -> str:
     title_obj = mlab.title(title, figure=fig, size=0.4, height=0.92)
     title_obj.property.color = (0, 0, 0)
 
-    out_path = os.path.join(PLOT_OUTPUT_DIR, out_name)
+    out_path = os.path.join(paths.PLOT_THESIS_DIR, out_name)
     mlab.savefig(out_path, figure=fig)
     mlab.close(fig)
     del bundle

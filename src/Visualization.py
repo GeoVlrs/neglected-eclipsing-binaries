@@ -105,13 +105,13 @@ phoebe.logger(clevel="WARNING")
 # SECTION 1 — CONFIGURATION
 # =============================================================================
 
-PLOT_OUTPUT_DIR: str = "plots"
-os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
+import paths
+paths.ensure_dirs()
 
 # Curated figures for the thesis text live here. This script writes only the
 # generated contact sheet into it; per-star renders are promoted by hand.
 # Resolved relative to this script's working directory (Code/02,03,04 Data/).
-THESIS_FIGURES_DIR: str = os.path.join("..", "..", "Text", "Figures")
+THESIS_FIGURES_DIR: str = paths.THESIS_FIGURES_DIR
 
 # Frame count for one orbital cycle. Thirty-six frames at 70 ms gives a ~2.5 s
 # loop, smooth enough at figure scale without inflating render time or GIF size.
@@ -173,8 +173,8 @@ def resolve_bundle_state(safe_name: str) -> dict:
     Script 04. A mid-MCMC checkpoint (bundle_<star>_mcmc.phoebe) is transient
     state that Script 05 deletes on completion, and is never rendered.
     """
-    final_path = f"bundle_{safe_name}_final.phoebe"
-    init_path  = f"bundle_{safe_name}.phoebe"
+    final_path = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}_final.phoebe")
+    init_path  = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}.phoebe")
     if os.path.exists(final_path):
         return {"tier": "final", "bundle_path": final_path}
     if os.path.exists(init_path):
@@ -345,7 +345,7 @@ def render_static_png(bundle_path: str, safe_name: str, star_name: str,
     """
     Render a single-phase still for one star and return the path written.
     """
-    out_path = os.path.join(PLOT_OUTPUT_DIR, f"mesh_{tier}_{safe_name}.png")
+    out_path = os.path.join(paths.PLOT_MESH_DIR, f"mesh_{tier}_{safe_name}.png")
     label    = "preliminary" if tier == "init" else "final"
 
     # Script 04 computes its seed model without irradiation; Script 05 enables
@@ -378,7 +378,7 @@ def render_orbital_gif(bundle_path: str, safe_name: str, star_name: str,
     written. The camera is fixed after the first frame so that only the system
     rotates, and the colour scale is fixed across the whole sequence.
     """
-    out_path     = os.path.join(PLOT_OUTPUT_DIR, f"mesh_final_{safe_name}.gif")
+    out_path     = os.path.join(paths.PLOT_MESH_DIR, f"mesh_final_{safe_name}.gif")
     irrad_method = "wilson" if is_contact_binary else "horvat"
     frame_paths: list[str] = []
 
@@ -405,7 +405,7 @@ def render_orbital_gif(bundle_path: str, safe_name: str, star_name: str,
                     mlab.view(*fixed_view, figure=figure)
 
                 frame_path = os.path.join(
-                    PLOT_OUTPUT_DIR, f"_tmp_mesh_{safe_name}_{index:03d}.png")
+                    paths.PLOT_MESH_DIR, f"_tmp_mesh_{safe_name}_{index:03d}.png")
                 mlab.savefig(frame_path, figure=figure)
                 frame_paths.append(frame_path)
         finally:
@@ -444,7 +444,7 @@ def find_converged_stars() -> list[str]:
     """
     return [
         fname[len("bundle_"):-len("_final.phoebe")]
-        for fname in os.listdir(".")
+        for fname in os.listdir(paths.BUNDLE_DIR)
         if fname.startswith("bundle_") and fname.endswith("_final.phoebe")
     ]
 
@@ -471,7 +471,7 @@ def make_gallery_montage(star_names: list[str]) -> str:
         font = ImageFont.load_default()
 
     for index, safe_name in enumerate(sorted(star_names)):
-        still_path = os.path.join(PLOT_OUTPUT_DIR, f"mesh_final_{safe_name}.png")
+        still_path = os.path.join(paths.PLOT_MESH_DIR, f"mesh_final_{safe_name}.png")
         if not os.path.exists(still_path):
             continue
         with Image.open(still_path) as raw:
@@ -484,7 +484,7 @@ def make_gallery_montage(star_names: list[str]) -> str:
                    row * tile_height + thumb_height + 4),
                   safe_name.replace("_", " "), fill="black", font=font)
 
-    out_path = os.path.join(PLOT_OUTPUT_DIR, "appendix_mesh_gallery.png")
+    out_path = os.path.join(paths.PLOT_THESIS_DIR, "appendix_mesh_gallery.png")
     sheet.save(out_path)
 
     try:
@@ -555,7 +555,7 @@ for target in target_list:
     bundle_path = state["bundle_path"]
 
     try:
-        still_path   = os.path.join(PLOT_OUTPUT_DIR, f"mesh_{tier}_{safe_name}.png")
+        still_path   = os.path.join(paths.PLOT_MESH_DIR, f"mesh_{tier}_{safe_name}.png")
         still_figure = figure_hires if tier == "final" else figure_lores
 
         if outputs_stale(still_path, bundle_path):
@@ -571,12 +571,12 @@ for target in target_list:
             # A star promoted from seed to converged leaves a preliminary
             # render that the final one supersedes. Script 05 discards its
             # checkpoint on convergence for the same reason.
-            superseded = os.path.join(PLOT_OUTPUT_DIR, f"mesh_init_{safe_name}.png")
+            superseded = os.path.join(paths.PLOT_MESH_DIR, f"mesh_init_{safe_name}.png")
             if os.path.exists(superseded):
                 os.remove(superseded)
                 print(f"  [clean] removed superseded {superseded}")
 
-            gif_path = os.path.join(PLOT_OUTPUT_DIR, f"mesh_final_{safe_name}.gif")
+            gif_path = os.path.join(paths.PLOT_MESH_DIR, f"mesh_final_{safe_name}.gif")
             if outputs_stale(gif_path, bundle_path):
                 print(f"  [render] {gif_path}  ({N_FRAMES} frames, one orbital cycle)")
                 render_orbital_gif(bundle_path, safe_name, star_name,

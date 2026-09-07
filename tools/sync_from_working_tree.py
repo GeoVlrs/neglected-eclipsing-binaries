@@ -15,12 +15,12 @@ Run it from anywhere; all paths are resolved relative to this file:
 
     python tools/sync_from_working_tree.py
 
-Layout assumption:
+Layout assumption (post-2026-09 reorg — every script lives once in Code/):
     <CODE>/tess-binary-modeling-pipeline/tools/sync_from_working_tree.py   (this file)
-    <CODE>/01TargetSelection.py ... 04Modeling.py, GenerateThesisTables.py
+    <CODE>/paths.py, 01TargetSelection.py ... 06Visualization.py,
+           GenerateThesisTables.py, SchematicRocheGeometry.py
     <CODE>/Audits/*.py, Notes/*.txt, Targets/neglected_targets*.csv
-    <CODE>/02,03,04 Data/05Optimization.py    (canonical Optimization source)
-    <CODE>/02,03,04 Data/06Visualization.py   (canonical Visualization source)
+    <CODE>/data/  (products, typed; never published)
 """
 from __future__ import annotations
 
@@ -29,22 +29,22 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent   # tess-binary-modeling-pipeline/
 CODE = REPO.parent                               # Code/
-DATA = CODE / "02,03,04 Data"                    # products folder; only 05 is sourced from here
+# After the 2026-09 folder reorg, every script (and the shared paths.py) lives once in
+# Code/; products moved to Code/data/<type>/ and are never published (guards below).
 
-# Numbered working scripts -> unnumbered published names under src/.
+# Working scripts -> published names under src/. Numbered stages drop their number;
+# paths.py keeps its name (every stage does `import paths`).
 SCRIPTS: list[tuple[Path, Path]] = [
+    (CODE / "paths.py",                REPO / "src" / "paths.py"),
     (CODE / "01TargetSelection.py",    REPO / "src" / "TargetSelection.py"),
     (CODE / "02DataAcquisition.py",    REPO / "src" / "DataAcquisition.py"),
     (CODE / "03OCAnalysis.py",         REPO / "src" / "OCAnalysis.py"),
     (CODE / "04Modeling.py",           REPO / "src" / "Modeling.py"),
-    # Canonical Optimization lives in the data folder (kept ahead during 05 debugging).
-    (DATA / "05Optimization.py",       REPO / "src" / "Optimization.py"),
-    # Visualization reads the bundles in the data folder and lives beside them.
-    (DATA / "06Visualization.py",      REPO / "src" / "Visualization.py"),
+    (CODE / "05Optimization.py",       REPO / "src" / "Optimization.py"),
+    (CODE / "06Visualization.py",      REPO / "src" / "Visualization.py"),
     (CODE / "GenerateThesisTables.py", REPO / "src" / "GenerateThesisTables.py"),
     # Standalone illustration utility, not a numbered pipeline stage.
-    (DATA / "SchematicRocheGeometry.py",
-     REPO / "src" / "SchematicRocheGeometry.py"),
+    (CODE / "SchematicRocheGeometry.py", REPO / "src" / "SchematicRocheGeometry.py"),
 ]
 
 # (source_dir, glob_pattern, destination_dir)
