@@ -2,7 +2,7 @@
 
 An automated, high-precision Python pipeline for the acquisition, reduction, time-series analysis, and thermodynamic modeling of neglected eclipsing binary systems using space-based photometry from the NASA TESS mission.
 
-## 🔭 Pipeline Architecture
+## Pipeline Architecture
 
 Six sequential stages take raw spacecraft data to physical stellar parameters and rendered geometry. Each stage is a standalone script under `src/` and accepts an optional target-catalogue argument so a single batch can be processed in isolation.
 
@@ -15,11 +15,11 @@ Six sequential stages take raw spacecraft data to physical stellar parameters an
 
 `GenerateThesisTables.py` renders a LaTeX results table from the per-target output. `SchematicRocheGeometry.py` draws generic detached and contact Roche geometries from synthetic parameters, for use as a didactic illustration rather than a result.
 
-## 📊 Scientific Context
+## Scientific Context
 
 The project targets "neglected" binaries whose historical ground-based timings have drifted from modern predictions. With single-band photometry the light curve constrains the **fractional** radii (r = R/a), inclination, temperature ratio, and — for contact/total-eclipse systems — a photometric mass ratio; absolute masses and radii require spectroscopic follow-up.
 
-## 🗂️ Repository Layout
+## Repository Layout
 
 ```
 src/        pipeline stages 01–06 + the table generator and schematic utility
@@ -31,7 +31,7 @@ tools/      sync_from_working_tree.py — publish-mirror updater
 
 Large data products (PHOEBE bundles, FITS light curves) and the private running log are intentionally not tracked here (see `.gitignore`).
 
-## 🛠️ Installation
+## Installation
 
 ```bash
 pip install phoebe emcee lightkurve numpy scipy matplotlib astropy astroquery mpi4py
@@ -43,7 +43,7 @@ Stage 06 additionally needs the rendering stack (it renders offscreen, so no dis
 pip install mayavi vtk pyqt5 pillow
 ```
 
-## 🚀 Execution
+## Execution
 
 Run a stage against one batch (all stages take the same optional catalogue argument):
 
@@ -72,7 +72,3 @@ python src/Visualization.py Targets/neglected_targets_batch1.csv
 ```
 
 Pass `FORCE_RERENDER=1` to rebuild every image regardless of modification time.
-
-## 📄 License
-
-Distributed under the MIT License. See `LICENSE` for more information.

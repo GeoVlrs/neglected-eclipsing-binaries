@@ -95,13 +95,13 @@ def audit_oc_outputs(star_name: str, data_dir: str = ".") -> None:
 
     print()
     if n_eclipses < 5:
-        print("  ⚠ FLAG: Fewer than 5 eclipses detected. "
+        print("  FLAG: Fewer than 5 eclipses detected. "
               "Ephemeris may be poorly constrained.")
     if rms_oc_min > 5.0:
-        print("  ⚠ FLAG: O–C residual RMS exceeds 5 minutes. "
+        print("  FLAG: O–C residual RMS exceeds 5 minutes. "
               "Check for period instability or excessive photometric scatter.")
     if n_eclipses >= 5 and rms_oc_min <= 5.0:
-        print("  ✓ O–C quality checks passed.")
+        print("  O–C quality checks passed.")
 
 
 if __name__ == "__main__":

@@ -99,16 +99,16 @@ def audit_light_curve_fits(fits_path: str) -> None:
         # ── 5. Sanity-check flags ─────────────────────────────────────────────
         print()
         if amplitude < 0.01:
-            print("  ⚠ FLAG: Very low amplitude (<1%). Expected 5–40% for EW/EB systems. "
+            print("  FLAG: Very low amplitude (<1%). Expected 5–40% for EW/EB systems. "
                   "Check that the correct target was downloaded.")
         if rms_noise > 0.02:
-            print("  ⚠ FLAG: High RMS scatter (>2%). The PDCSAP detrending may be "
+            print("  FLAG: High RMS scatter (>2%). The PDCSAP detrending may be "
                   "insufficient; consider inspecting the SAP vs PDCSAP comparison plot.")
         if gap_ratio > 100:
-            print(f"  ⚠ FLAG: Large gap detected ({gap_ratio:.0f}× cadence). "
+            print(f"  FLAG: Large gap detected ({gap_ratio:.0f}× cadence). "
                   "This may split the light curve into disjoint segments.")
         if amplitude >= 0.01 and rms_noise <= 0.02 and gap_ratio <= 100:
-            print("  ✓ All quality checks passed.")
+            print("  All quality checks passed.")
 
 
 if __name__ == "__main__":

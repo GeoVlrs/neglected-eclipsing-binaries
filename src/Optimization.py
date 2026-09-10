@@ -1063,7 +1063,7 @@ for target in target_list:
         master_print("  " + "─" * 70)
         for i, param_twig in enumerate(free_params.keys()):
             tau_val = tau_values[i] if isinstance(tau_values, np.ndarray) else np.inf
-            status  = "✓ converged" if (done > CONVERGENCE_MULTIPLIER * tau_val) else "⚠ under-converged"
+            status  = "converged" if (done > CONVERGENCE_MULTIPLIER * tau_val) else "under-converged"
             master_print(f"  {param_twig:<40} {tau_val:>12.1f}  {status}")
     except Exception as autocorr_error:
         master_print(f"  Autocorrelation diagnostic failed: {autocorr_error}")

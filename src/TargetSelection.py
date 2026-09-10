@@ -340,7 +340,7 @@ for candidate in candidates:
             "No Target Pixel Files found in the MAST archive. "
             "Script 02 cannot proceed without TESS data."
         )
-        print(f"    ✗ {rejection_note}")
+        print(f"    {rejection_note}")
         rejected_targets.append({
             "name":             name,
             "period_days":      period,
@@ -350,7 +350,7 @@ for candidate in candidates:
         time.sleep(0.5)
         continue
 
-    print(f"    ✓ Criterion (b) — TESS sectors: {', '.join(observed_sectors)}")
+    print(f"    PASSED: Criterion (b) — TESS sectors: {', '.join(observed_sectors)}")
 
     # ── CRITERION (a): NEGLECTED STATUS ──────────────────────────────────────
     vsx_data = query_vsx(name)
@@ -362,7 +362,7 @@ for candidate in candidates:
             f"REJECTED — Criterion (a) neglected status: {neglect_reason} "
             f"Only systems unupdated for ≥{MIN_YEARS_SINCE_LAST_EPOCH} yr qualify."
         )
-        print(f"    ✗ {rejection_note}")
+        print(f"    {rejection_note}")
         rejected_targets.append({
             "name":             name,
             "period_days":      period,
@@ -372,7 +372,7 @@ for candidate in candidates:
         time.sleep(1.0)
         continue
 
-    print("    ✓ Criterion (a) — system qualifies as neglected.")
+    print("    PASSED: Criterion (a) — system qualifies as neglected.")
 
     # ── CRITERION (c): GCVS MORPHOLOGICAL TYPE ────────────────────────────────
     gcvs_row = query_gcvs(name)
@@ -383,7 +383,7 @@ for candidate in candidates:
             "No GCVS entry within 5 arcseconds. "
             "Cannot confirm EW/EB classification; excluded conservatively."
         )
-        print(f"    ✗ {rejection_note}")
+        print(f"    {rejection_note}")
         rejected_targets.append({
             "name":             name,
             "period_days":      period,
@@ -408,7 +408,7 @@ for candidate in candidates:
             f"REJECTED — Criterion (c) morphological type: "
             f"GCVS reports '{gcvs_type}', not in accepted list {ACCEPTED_VARIABLE_TYPES}."
         )
-        print(f"    ✗ {rejection_note}")
+        print(f"    {rejection_note}")
         rejected_targets.append({
             "name":             name,
             "period_days":      period,
@@ -418,7 +418,7 @@ for candidate in candidates:
         time.sleep(1.0)
         continue
 
-    print(f"    ✓ Criterion (c) — GCVS type '{gcvs_type}' accepted.")
+    print(f"    PASSED: Criterion (c) — GCVS type '{gcvs_type}' accepted.")
 
     # ── ALL CRITERIA PASSED ───────────────────────────────────────────────────
     selected_targets.append({
@@ -427,7 +427,7 @@ for candidate in candidates:
         "period":  period,
         "sectors": ";".join(observed_sectors),
     })
-    print(f"    ✔✔ SELECTED: {name}")
+    print(f"    SELECTED: {name}")
     time.sleep(1.0)
 
 
