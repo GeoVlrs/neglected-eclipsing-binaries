@@ -23,7 +23,8 @@ The project targets "neglected" binaries whose historical ground-based timings h
 
 ```
 src/        pipeline stages 01–06 + the table generator and schematic utility
-audits/     standalone diagnostic scripts (light-curve, O–C, modeling, phase-offset)
+audits/     standalone diagnostic scripts (light-curve, O–C, modeling, phase-offset,
+            per-walker MCMC chain health)
 docs/       methodology notes and expansion plans
 data/       tominima tables and the sample definition (data/targets/)
 tools/      sync_from_working_tree.py — publish-mirror updater

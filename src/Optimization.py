@@ -139,7 +139,7 @@ NM_MAXITER: int = int(os.environ.get("NM_MAXITER", 200))
 # bundle (chains included) to disk after each chunk. This lets a long run be
 # stopped — even hard-killed — and resumed mid-chain from the last checkpoint,
 # which is essential for sharing a home desktop with the optimisation.
-MCMC_CHECKPOINT_NITERS: int = int(os.environ.get("MCMC_CHECKPOINT", 250))
+MCMC_CHECKPOINT_NITERS: int = int(os.environ.get("MCMC_CHECKPOINT", 100))
 
 # Convergence criterion: chain must be longer than this multiple of τ.
 CONVERGENCE_MULTIPLIER: int = 50
@@ -417,8 +417,15 @@ def chains_meet_convergence(bundle: object, done: int,
       • R̂ < RHAT_CONVERGENCE_THRESHOLD                    (Gelman & Rubin 1992).
     A non-finite τ or R̂ (too-short or degenerate chain) counts as NOT converged,
     so the run continues toward the ceiling rather than stopping on a bad estimate.
-    Because R̂ stays above threshold for a multimodal parameter, a multimodal
-    fill-out can never trip a false "converged" — it runs to the ceiling instead.
+
+    R̂ is evaluated on the POST-BURN-IN chain, matching the samples the posterior
+    is actually drawn from. Evaluating it on the untrimmed chain — as this gate
+    did through batch 4 — inflates the within-chain variance W with burn-in
+    scatter, and since R̂ = √(V̂/W) that biases the test toward declaring
+    convergence. The effect is negligible on a well-mixed star (ratio 1.00-1.01)
+    but large on a poorly-mixed one: GQ Cnc's inclination reads R̂ = 1.41
+    untrimmed and 2.04 trimmed. See Audits/audit_mcmc_chains.py, which reports
+    both variants per star, and Pipeline_Log Entry 47.
     """
     try:
         chains = np.asarray(bundle.get_value("samples", solution=solution))
@@ -430,7 +437,9 @@ def chains_meet_convergence(bundle: object, done: int,
             and tau_chains.shape[1] != MCMC_N_WALKERS:
         tau_chains = np.swapaxes(tau_chains, 0, 1)
     tau  = np.atleast_1d(assess_autocorrelation_convergence(tau_chains))
-    rhat = np.atleast_1d(gelman_rubin_rhat(chains))
+    # tau_chains is steps-first, so the burn-in slice is unambiguous here.
+    trim = min(MCMC_BURN_IN_STEPS, max(0, tau_chains.shape[0] - 2))
+    rhat = np.atleast_1d(gelman_rubin_rhat(tau_chains[trim:]))
     if not (np.all(np.isfinite(tau)) and np.all(np.isfinite(rhat))):
         return False
     tau_ok  = bool(np.all(done > CONVERGENCE_MULTIPLIER * tau))
@@ -1104,14 +1113,29 @@ for target in target_list:
         # post-hoc report and the stop criterion can never diverge.
         raw_chains   = np.asarray(bundle.get_value("samples", solution="best_solution"))
         fitted_twigs = bundle.get_value("fitted_twigs", solution="best_solution")
-        r_hats       = gelman_rubin_rhat(raw_chains)
 
-        master_print(f"  {'Parameter':<40} {'R̂':>8}  {'Status'}")
-        master_print("  " + "─" * 60)
+        # Orient steps-first so the burn-in slice below is unambiguous.
+        oriented = raw_chains
+        if oriented.ndim == 3 and oriented.shape[0] == MCMC_N_WALKERS \
+                and oriented.shape[1] != MCMC_N_WALKERS:
+            oriented = np.swapaxes(oriented, 0, 1)
+        trim = min(MCMC_BURN_IN_STEPS, max(0, oriented.shape[0] - 2))
+
+        # Both variants are reported: R̂_full is what this pipeline printed through
+        # batch 4 (keeping older run logs comparable), R̂_trim is the honest figure
+        # the gate now decides on. See Pipeline_Log Entry 47.
+        r_hats_full = gelman_rubin_rhat(oriented)
+        r_hats      = gelman_rubin_rhat(oriented[trim:])
+
+        master_print(f"  {'Parameter':<40} {'R̂_full':>8} {'R̂_trim':>8}  {'Status'}")
+        master_print("  " + "─" * 70)
         for i, param_name in enumerate(fitted_twigs):
             r_hat  = float(r_hats[i]) if i < len(r_hats) else float("inf")
+            r_full = float(r_hats_full[i]) if i < len(r_hats_full) else float("inf")
             status = "CONVERGED" if r_hat < RHAT_CONVERGENCE_THRESHOLD else "UNCONVERGED"
-            master_print(f"  {param_name:<40} {r_hat:>8.4f}  {status}")
+            if r_full < RHAT_CONVERGENCE_THRESHOLD <= r_hat:
+                status += "  (burn-in masked)"
+            master_print(f"  {param_name:<40} {r_full:>8.4f} {r_hat:>8.4f}  {status}")
     except Exception as rhat_error:
         master_print(f"  Gelman-Rubin diagnostic failed: {rhat_error}")
 

@@ -110,7 +110,7 @@ paths.ensure_dirs()
 
 # Curated figures for the thesis text live here. This script writes only the
 # generated contact sheet into it; per-star renders are promoted by hand.
-# Resolved relative to this script's working directory (Code/02,03,04 Data/).
+# Path defined in paths.py; resolved relative to the run directory (Code/).
 THESIS_FIGURES_DIR: str = paths.THESIS_FIGURES_DIR
 
 # Frame count for one orbital cycle. Thirty-six frames at 70 ms gives a ~2.5 s

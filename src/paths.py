@@ -15,7 +15,7 @@ to Code/.
         timing/       tominima_*.csv, ephem_*.txt                            (03)
         bundles/      bundle_*.phoebe (+ _mcmc transient, _final)            (04/05)
         results/      results_*.csv                                          (05)
-        plots/  lightcurves/ oc/ models_init/ models_final/ mesh/ thesis/
+        plots/  lightcurves/ oc/ models_init/ models_final/ mesh/ thesis/ mcmc_diag/
       Runs/  Audits/  Notes/
 """
 import os
@@ -40,6 +40,7 @@ PLOT_INIT_DIR   = os.path.join(PLOT_DIR, "models_init")    # phoebe_init_*.png  
 PLOT_FINAL_DIR  = os.path.join(PLOT_DIR, "models_final")   # phoebe_final_*.png          (05)
 PLOT_MESH_DIR   = os.path.join(PLOT_DIR, "mesh")           # mesh_*_*.png + .gif         (06)
 PLOT_THESIS_DIR = os.path.join(PLOT_DIR, "thesis")         # gallery + roche schematics  (06)
+PLOT_MCMC_DIR   = os.path.join(PLOT_DIR, "mcmc_diag")      # mcmc_chains_*.png           (audit)
 
 # --- Hand-curated thesis figure drop (lives in the thesis text tree) --------
 THESIS_FIGURES_DIR = os.path.join("..", "Text", "Figures")  # from Code/ (was ../../ from the old data folder)
@@ -47,6 +48,7 @@ THESIS_FIGURES_DIR = os.path.join("..", "Text", "Figures")  # from Code/ (was ..
 _ALL_DIRS = (
     LIGHTCURVE_DIR, TIMING_DIR, BUNDLE_DIR, RESULTS_DIR,
     PLOT_LC_DIR, PLOT_OC_DIR, PLOT_INIT_DIR, PLOT_FINAL_DIR, PLOT_MESH_DIR, PLOT_THESIS_DIR,
+    PLOT_MCMC_DIR,
 )
 
 
