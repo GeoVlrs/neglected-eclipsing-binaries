@@ -16,7 +16,7 @@ Run it from anywhere; all paths are resolved relative to this file:
     python tools/sync_from_working_tree.py
 
 Layout assumption (post-2026-09 reorg — every script lives once in Code/):
-    <CODE>/tess-binary-modeling-pipeline/tools/sync_from_working_tree.py   (this file)
+    <CODE>/neglected-eclipsing-binaries/tools/sync_from_working_tree.py   (this file)
     <CODE>/paths.py, 01TargetSelection.py ... 06Visualization.py,
            GenerateThesisTables.py, SchematicRocheGeometry.py
     <CODE>/Audits/*.py, Notes/*.txt, Targets/neglected_targets*.csv
@@ -27,7 +27,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent   # tess-binary-modeling-pipeline/
+REPO = Path(__file__).resolve().parent.parent   # neglected-eclipsing-binaries/
 CODE = REPO.parent                               # Code/
 # After the 2026-09 folder reorg, every script (and the shared paths.py) lives once in
 # Code/; products moved to Code/data/<type>/ and are never published (guards below).
