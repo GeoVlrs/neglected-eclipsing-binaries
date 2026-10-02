@@ -108,6 +108,12 @@ phoebe.logger(clevel="WARNING")
 import paths
 paths.ensure_dirs()
 
+# Run timing / statistics → Runs/run_stats/ (summary printed and saved at exit,
+# one CSV row per star). See runstats.py.
+import runstats
+run_tracker = runstats.RunTracker("06Visualization", catalogue=sys.argv[1:],
+                                  columns=["tier", "rendered", "already_current"])
+
 # Curated figures for the thesis text live here. This script writes only the
 # generated contact sheet into it; per-star renders are promoted by hand.
 # Path defined in paths.py; resolved relative to the run directory (Code/).
@@ -540,6 +546,8 @@ for target in target_list:
     variable_type     = target["type"]
     safe_name         = star_name.replace(" ", "_")
     is_contact_binary = is_contact_morphology(variable_type)
+    run_tracker.star_start(star_name)
+    _rendered_before, _skipped_before = n_rendered, n_skipped
 
     print("\n" + "=" * 70)
     print(f"MESH VISUALISATION: {star_name}  (type: {variable_type})")
@@ -549,6 +557,7 @@ for target in target_list:
     if state["tier"] is None:
         print(f"  WARNING: no bundle found for {safe_name}. Skipping.")
         n_missing += 1
+        run_tracker.star_end(star_name, "skipped", reason="no bundle found")
         continue
 
     tier        = state["tier"]
@@ -590,7 +599,13 @@ for target in target_list:
         # A malformed or partially-written bundle must not abandon the rest of
         # the batch, matching the per-target tolerance of Scripts 02-05.
         print(f"  WARNING: rendering failed for {star_name}: {error}. Skipping.")
+        run_tracker.star_end(star_name, "failed", reason=f"rendering failed: {error}",
+                             tier=tier)
         continue
+
+    run_tracker.star_end(star_name, "done", tier=tier,
+                         rendered=n_rendered - _rendered_before,
+                         already_current=n_skipped - _skipped_before)
 
 
 # ── Appendix contact sheet ────────────────────────────────────────────────────

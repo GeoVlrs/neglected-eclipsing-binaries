@@ -83,6 +83,13 @@ def audit_light_curve_fits(fits_path: str) -> None:
 
 
 if __name__ == "__main__":
+    # Run timing → Runs/run_stats/run_summary.txt (written at exit). Inside the
+    # __main__ guard so that importing this module never starts a tracker.
+    import sys as _rs_sys, os as _rs_os
+    _rs_sys.path.insert(0, _rs_os.path.dirname(_rs_os.path.dirname(_rs_os.path.abspath(__file__))))
+    import runstats
+    _run_tracker = runstats.RunTracker("audit_lc_benchmark", catalogue=_rs_sys.argv[1:],
+                                       per_star=False)
     benchmark_stars = ["SW_Lac", "YY_Eri"]
     for star_safe_name in benchmark_stars:
         audit_light_curve_fits(f"lc_{star_safe_name}_clean.fits")

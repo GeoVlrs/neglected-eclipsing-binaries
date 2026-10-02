@@ -75,5 +75,12 @@ def audit_oc_outputs(star_name: str, data_dir: str = ".") -> None:
 
 
 if __name__ == "__main__":
+    # Run timing → Runs/run_stats/run_summary.txt (written at exit). Inside the
+    # __main__ guard so that importing this module never starts a tracker.
+    import sys as _rs_sys, os as _rs_os
+    _rs_sys.path.insert(0, _rs_os.path.dirname(_rs_os.path.dirname(_rs_os.path.abspath(__file__))))
+    import runstats
+    _run_tracker = runstats.RunTracker("audit_oc_benchmark", catalogue=_rs_sys.argv[1:],
+                                       per_star=False)
     for star in ["SW Lac", "YY Eri"]:
         audit_oc_outputs(star)

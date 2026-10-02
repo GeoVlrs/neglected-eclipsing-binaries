@@ -40,6 +40,7 @@ References:
 
 # ── Standard library ──────────────────────────────────────────────────────────
 import csv
+import sys
 import time
 import warnings
 from datetime import datetime, timezone
@@ -53,6 +54,12 @@ from astroquery.vizier import Vizier
 # Suppress non-critical deprecation warnings from astroquery and astropy
 # so that progress messages remain readable during long catalogue queries.
 warnings.filterwarnings("ignore")
+
+# Run timing / statistics → Runs/run_stats/ (summary printed and saved at exit,
+# one CSV row per star). See runstats.py.
+import runstats
+run_tracker = runstats.RunTracker("01TargetSelection", catalogue=sys.argv[1:],
+                                  columns=["gcvs_type", "sectors"])
 
 
 # =============================================================================
@@ -330,6 +337,7 @@ for candidate in candidates:
     name   = candidate["name"]
     period = candidate["period"]
     print(f"\n  Evaluating: {name}  (P = {period:.4f} d)")
+    run_tracker.star_start(name)
 
     # ── CRITERION (b): TESS COVERAGE ─────────────────────────────────────────
     tess_result, observed_sectors = check_tess_coverage(name)
@@ -348,6 +356,8 @@ for candidate in candidates:
             "rejection_reason": rejection_note,
         })
         time.sleep(0.5)
+        run_tracker.star_end(name, "rejected",
+                             reason=rejected_targets[-1]["rejection_stage"])
         continue
 
     print(f"    PASSED: Criterion (b) — TESS sectors: {', '.join(observed_sectors)}")
@@ -370,6 +380,8 @@ for candidate in candidates:
             "rejection_reason": rejection_note,
         })
         time.sleep(1.0)
+        run_tracker.star_end(name, "rejected",
+                             reason=rejected_targets[-1]["rejection_stage"])
         continue
 
     print("    PASSED: Criterion (a) — system qualifies as neglected.")
@@ -391,6 +403,8 @@ for candidate in candidates:
             "rejection_reason": rejection_note,
         })
         time.sleep(1.0)
+        run_tracker.star_end(name, "rejected",
+                             reason=rejected_targets[-1]["rejection_stage"])
         continue
 
     gcvs_type = (
@@ -416,6 +430,8 @@ for candidate in candidates:
             "rejection_reason": rejection_note,
         })
         time.sleep(1.0)
+        run_tracker.star_end(name, "rejected",
+                             reason=rejected_targets[-1]["rejection_stage"])
         continue
 
     print(f"    PASSED: Criterion (c) — GCVS type '{gcvs_type}' accepted.")
@@ -428,6 +444,8 @@ for candidate in candidates:
         "sectors": ";".join(observed_sectors),
     })
     print(f"    SELECTED: {name}")
+    run_tracker.star_end(name, "done", reason="selected", gcvs_type=gcvs_type,
+                         sectors=";".join(observed_sectors))
     time.sleep(1.0)
 
 

@@ -38,7 +38,8 @@ Outputs:
     Diagnostic summary table printed to stdout.
 
 Usage:
-    python audit_bundle_phase_alignment.py <catalog.csv> [<catalog2.csv> ...]
+    Run from Code/ (bundles are located via paths.BUNDLE_DIR):
+    python Audits/audit_bundle_phase_alignment.py <catalog.csv> [<catalog2.csv> ...]
 
 Dependencies:
     pip install phoebe numpy
@@ -46,10 +47,15 @@ Dependencies:
 """
 
 import csv
+import os
 import sys
 
 import numpy as np
 import phoebe
+
+# Audits/ sits one level below Code/, where paths.py lives.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import paths                                              # noqa: E402
 
 WINDOW_HALF_WIDTH = 0.03      # phase units either side of each target phase
 NEAR_EQUAL_REL_TOL = 0.15     # |depth0 - depth5| / max(depth0, depth5) below this -> "near-equal"
@@ -64,9 +70,12 @@ def _window_mean(phase: np.ndarray, flux: np.ndarray, sigma: np.ndarray, target:
     return float(np.mean(flux[mask])), float(np.median(sigma[mask]))
 
 
-def audit_bundle_phase_alignment(star_name: str, data_dir: str = ".") -> dict:
+def audit_bundle_phase_alignment(star_name: str, data_dir: str | None = None) -> dict:
+    # Defaults to paths.BUNDLE_DIR rather than "." — the Entry 39 reorg moved
+    # bundles into data/bundles/, so the old default found nothing from Code/.
+    data_dir = data_dir if data_dir is not None else paths.BUNDLE_DIR
     safe_name = star_name.replace(" ", "_")
-    bundle_path = f"{data_dir}/bundle_{safe_name}.phoebe"
+    bundle_path = os.path.join(data_dir, f"bundle_{safe_name}.phoebe")
 
     result = {"star": star_name, "verdict": "ERROR", "detail": ""}
     try:
@@ -134,6 +143,13 @@ def audit_bundle_phase_alignment(star_name: str, data_dir: str = ".") -> dict:
 
 
 if __name__ == "__main__":
+    # Run timing → Runs/run_stats/run_summary.txt (written at exit). Inside the
+    # __main__ guard so that importing this module never starts a tracker.
+    import sys as _rs_sys, os as _rs_os
+    _rs_sys.path.insert(0, _rs_os.path.dirname(_rs_os.path.dirname(_rs_os.path.abspath(__file__))))
+    import runstats
+    _run_tracker = runstats.RunTracker("audit_bundle_phase_alignment", catalogue=_rs_sys.argv[1:],
+                                       per_star=False)
     phoebe.logger(clevel="ERROR")  # suppress PHOEBE's verbose logging during the audit
 
     if len(sys.argv) < 2:

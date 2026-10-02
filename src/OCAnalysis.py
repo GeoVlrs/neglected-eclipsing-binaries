@@ -66,6 +66,12 @@ warnings.filterwarnings("ignore")
 import paths
 paths.ensure_dirs()
 
+# Run timing / statistics → Runs/run_stats/ (summary printed and saved at exit,
+# one CSV row per star). See runstats.py.
+import runstats
+run_tracker = runstats.RunTracker("03OCAnalysis", catalogue=sys.argv[1:],
+                                  columns=["n_minima", "n_toms", "period_refined", "period_err"])
+
 # TESS mission time offset: BTJD + offset = BJD.
 # Historical ephemerides (Kreiner 2004) are in HJD; the BJD–HJD difference
 # is <4 s for solar-system targets and is absorbed into T0_new during the fit.
@@ -452,6 +458,7 @@ for target in target_list:
     star_name      = target["name"]
     orbital_period = target["period"]
     safe_name      = star_name.replace(" ", "_")
+    run_tracker.star_start(star_name)
 
     print("\n" + "=" * 70)
     print(f"O–C ANALYSIS: {star_name}")
@@ -460,6 +467,7 @@ for target in target_list:
     lc_fits_path = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_clean.fits")
     if not os.path.exists(lc_fits_path):
         print(f"  WARNING: {lc_fits_path} not found. Skipping.")
+        run_tracker.star_end(star_name, "skipped", reason="clean light curve not found")
         continue
 
     lc        = lk.read(lc_fits_path)
@@ -493,6 +501,7 @@ for target in target_list:
 
     if len(candidate_min_indices) == 0:
         print("  ERROR: No minima detected. Check light curve quality.")
+        run_tracker.star_end(star_name, "failed", reason="no minima detected")
         continue
 
     # ── 6B: PRECISE ToM EXTRACTION ────────────────────────────────────────────
@@ -527,6 +536,8 @@ for target in target_list:
 
     if not accepted_toms:
         print("  ERROR: No ToM measurements passed the quality filter. Skipping.")
+        run_tracker.star_end(star_name, "failed", reason="no ToM passed quality filter",
+                             n_minima=len(candidate_min_indices))
         continue
 
     t_obs_array = np.array([t for t, _ in accepted_toms])
@@ -701,6 +712,9 @@ for target in target_list:
     plt.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"  O–C diagram saved: {plot_path}")
+    run_tracker.star_end(star_name, "done", n_minima=len(candidate_min_indices),
+                         n_toms=len(accepted_toms), period_refined=period_new,
+                         period_err=period_err)
 
 print("\n" + "=" * 70)
 print("SCRIPT 03 COMPLETE — O–C analyses done for all targets.")

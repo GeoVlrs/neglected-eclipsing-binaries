@@ -94,6 +94,13 @@ def bin_phase_curve(
 # Main audit loop
 # ---------------------------------------------------------------------------
 
+# Run timing → Runs/run_stats/run_summary.txt (written at exit).
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import runstats  # noqa: E402
+_run_tracker = runstats.RunTracker("audit_phase_offset", catalogue=sys.argv[1:],
+                                   per_star=False)
+
 lc_files = sorted(glob.glob("lc_*_clean.fits"))
 if not lc_files:
     raise SystemExit(

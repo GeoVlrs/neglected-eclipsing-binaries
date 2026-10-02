@@ -221,37 +221,32 @@ def _read_chi2_red(star_name: str, results_dir: str) -> float | None:
     return None
 
 
-def audit_mcmc_chains(star_name: str,
-                      bundle_dir: str | None = None,
-                      results_dir: str | None = None,
-                      burn: int = MCMC_BURN_IN_STEPS) -> dict:
+def audit_chain_arrays(star_name: str,
+                       chains,
+                       lnprob,
+                       twigs,
+                       burn: int = MCMC_BURN_IN_STEPS,
+                       chi2_red: float | None = None) -> dict:
     """
-    Audit one star's chain. Returns a verdict dict; never raises on bad input.
+    Audit chains already held in memory. Returns a verdict dict; never raises.
+
+    This is the array-level entry point, split out so 05Optimization.py can score
+    a chain it has just sampled without re-loading the bundle from disk (the final
+    bundle does not exist yet at that point in the run). `audit_mcmc_chains()` is
+    the on-disk wrapper around it.
 
     `verdicts` is a LIST — the signatures are not mutually exclusive (RW Dor is
     both DEAD_WALKER and ACCEPTANCE_COLLAPSE). Uppercase entries denote a real
     problem, lowercase ones are informational, per the Audits/ convention.
-    """
-    bundle_dir = bundle_dir if bundle_dir is not None else paths.BUNDLE_DIR
-    results_dir = results_dir if results_dir is not None else paths.RESULTS_DIR
-    safe_name = star_name.replace(" ", "_")
-    bundle_path = os.path.join(bundle_dir, f"bundle_{safe_name}_final.phoebe")
 
+    chi2_red is passed in rather than read from results_<star>.csv, because the
+    caller may not have written that file yet.
+    """
     result: dict = {"star": star_name, "verdicts": ["ERROR"], "detail": "", "params": {}}
 
-    if not os.path.exists(bundle_path):
-        result["verdicts"] = ["missing — Script 05 not run"]
-        result["detail"] = f"no {os.path.basename(bundle_path)}"
-        return result
-
-    try:
-        bundle = phoebe.load(bundle_path)
-        chains = np.asarray(bundle.get_value("samples", solution="best_solution"), dtype=float)
-        lnprob = np.asarray(bundle.get_value("lnprobabilities", solution="best_solution"), dtype=float)
-        twigs = [str(t) for t in bundle.get_value("fitted_twigs", solution="best_solution")]
-    except Exception as exc:
-        result["detail"] = f"could not read chain: {exc}"
-        return result
+    chains = np.asarray(chains, dtype=float)
+    lnprob = np.asarray(lnprob, dtype=float)
+    twigs = [str(t) for t in twigs]
 
     if chains.ndim != 3:
         result["detail"] = f"unexpected samples shape {chains.shape}"
@@ -369,7 +364,7 @@ def audit_mcmc_chains(star_name: str,
         n_steps=n_steps,
         n_walkers=n_walkers,
         burn_in=burn,
-        chi2_red=_read_chi2_red(star_name, results_dir),
+        chi2_red=chi2_red,
         median_accept=median_accept,
         min_accept=min_accept,
         worst_frozen_frac=max(m["frozen_frac"] for m in walkers),
@@ -382,6 +377,40 @@ def audit_mcmc_chains(star_name: str,
         _lnprob=lnprob,
     )
     return result
+
+
+def audit_mcmc_chains(star_name: str,
+                      bundle_dir: str | None = None,
+                      results_dir: str | None = None,
+                      burn: int = MCMC_BURN_IN_STEPS) -> dict:
+    """
+    Audit one star's saved chain. Thin on-disk wrapper around
+    `audit_chain_arrays()`: loads `bundle_<star>_final.phoebe`, pulls the chain
+    out of it, and joins chi2_red from `results_<star>.csv`. Never raises.
+    """
+    bundle_dir = bundle_dir if bundle_dir is not None else paths.BUNDLE_DIR
+    results_dir = results_dir if results_dir is not None else paths.RESULTS_DIR
+    safe_name = star_name.replace(" ", "_")
+    bundle_path = os.path.join(bundle_dir, f"bundle_{safe_name}_final.phoebe")
+
+    result: dict = {"star": star_name, "verdicts": ["ERROR"], "detail": "", "params": {}}
+
+    if not os.path.exists(bundle_path):
+        result["verdicts"] = ["missing — Script 05 not run"]
+        result["detail"] = f"no {os.path.basename(bundle_path)}"
+        return result
+
+    try:
+        bundle = phoebe.load(bundle_path)
+        chains = np.asarray(bundle.get_value("samples", solution="best_solution"), dtype=float)
+        lnprob = np.asarray(bundle.get_value("lnprobabilities", solution="best_solution"), dtype=float)
+        twigs = [str(t) for t in bundle.get_value("fitted_twigs", solution="best_solution")]
+    except Exception as exc:
+        result["detail"] = f"could not read chain: {exc}"
+        return result
+
+    return audit_chain_arrays(star_name, chains, lnprob, twigs, burn=burn,
+                              chi2_red=_read_chi2_red(star_name, results_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +534,13 @@ def write_walker_csv(results: list[dict], path: str = WALKER_CSV) -> None:
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # Run timing → Runs/run_stats/run_summary.txt (written at exit). Inside the
+    # __main__ guard so that importing this module never starts a tracker.
+    import sys as _rs_sys, os as _rs_os
+    _rs_sys.path.insert(0, _rs_os.path.dirname(_rs_os.path.dirname(_rs_os.path.abspath(__file__))))
+    import runstats
+    _run_tracker = runstats.RunTracker("audit_mcmc_chains", catalogue=_rs_sys.argv[1:],
+                                       per_star=False)
     parser = argparse.ArgumentParser(
         description="Audit per-walker MCMC chain health for Script 05 solutions.")
     parser.add_argument("catalogs", nargs="+",

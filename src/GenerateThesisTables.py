@@ -178,6 +178,13 @@ def render_latex_results_table(target_names: list[str]) -> None:
 
 
 if __name__ == "__main__":
+    # Run timing → Runs/run_stats/run_summary.txt (written at exit). Inside the
+    # __main__ guard so that importing this module never starts a tracker.
+    import sys as _rs_sys, os as _rs_os
+    _rs_sys.path.insert(0, _rs_os.path.dirname(_rs_os.path.abspath(__file__)))
+    import runstats
+    _run_tracker = runstats.RunTracker("GenerateThesisTables", catalogue=_rs_sys.argv[1:],
+                                       per_star=False)
     catalog        = sys.argv[1] if len(sys.argv) > 1 else None
     thesis_targets = load_target_names(catalog)
     render_latex_results_table(thesis_targets)

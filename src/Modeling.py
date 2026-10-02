@@ -82,6 +82,12 @@ phoebe.logger(clevel="WARNING")
 import paths
 paths.ensure_dirs()
 
+# Run timing / statistics → Runs/run_stats/ (summary printed and saved at exit,
+# one CSV row per star). See runstats.py.
+import runstats
+run_tracker = runstats.RunTracker("04Modeling", catalogue=sys.argv[1:],
+                                  columns=["morphology", "teff1_K", "teff2_init_K", "incl_init", "q_init"])
+
 TESS_BTJD_TO_BJD_OFFSET: float = 2_457_000.0
 
 # Temperature boundary between convective (Lucy 1967) and radiative
@@ -607,6 +613,7 @@ for target in target_list:
     variable_type  = target["type"]
     orbital_period = target["period"]
     safe_name      = star_name.replace(" ", "_")
+    run_tracker.star_start(star_name)
 
     print("\n" + "=" * 70)
     print(f"PHOEBE 2 MODELING: {star_name}  (type: {variable_type})")
@@ -616,6 +623,7 @@ for target in target_list:
     lc_fits_path = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_clean.fits")
     if not os.path.exists(lc_fits_path):
         print(f"  WARNING: {lc_fits_path} not found. Skipping.")
+        run_tracker.star_end(star_name, "skipped", reason="clean light curve not found")
         continue
 
     lc = lk.read(lc_fits_path)
@@ -774,6 +782,8 @@ for target in target_list:
         print("  Forward model computed successfully.")
     except Exception as compute_error:
         print(f"  Forward model error: {compute_error}")
+        run_tracker.star_end(star_name, "failed",
+                             reason=f"forward model error: {compute_error}")
         continue
 
     # ── 5L: DIAGNOSTIC PLOT ───────────────────────────────────────────────────
@@ -830,6 +840,14 @@ for target in target_list:
     print(f"    T2 (initial) = {bundle.get_value('teff@secondary'):.0f} K")
     print(f"    i  (initial) = {bundle.get_value('incl@binary'):.2f}°")
     print(f"    q  (initial) = {bundle.get_value('q@binary'):.3f}")
+    run_tracker.star_end(
+        star_name, "done",
+        morphology="contact" if is_contact_binary else "detached",
+        teff1_K=bundle.get_value('teff@primary'),
+        teff2_init_K=bundle.get_value('teff@secondary'),
+        incl_init=bundle.get_value('incl@binary'),
+        q_init=bundle.get_value('q@binary'),
+    )
 
 print("\n" + "=" * 70)
 print("SCRIPT 04 COMPLETE — All PHOEBE 2 bundles constructed and saved.")

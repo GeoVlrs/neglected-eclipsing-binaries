@@ -73,6 +73,12 @@ TESS_BTJD_TO_BJD_OFFSET: float = 2_457_000.0
 import paths
 paths.ensure_dirs()
 
+# Run timing / statistics → Runs/run_stats/ (summary printed and saved at exit,
+# one CSV row per star). See runstats.py.
+import runstats
+run_tracker = runstats.RunTracker("02DataAcquisition", catalogue=sys.argv[1:],
+                                  columns=["sector", "n_points", "cadence_s"])
+
 # Product-validity thresholds (Flag 1 remediation). TESS sectors are numbered in
 # the low hundreds; a product tagged with a sector far above this is a metadata
 # artifact (the "Sector 1751" extended-mission stub seen in several FFI products),
@@ -265,6 +271,7 @@ for target in target_list:
     orbital_period = target["period"]
     tic_id         = target.get("tic", "")
     safe_name      = star_name.replace(" ", "_")
+    run_tracker.star_start(star_name)
 
     print("\n" + "=" * 70)
     print(f"PROCESSING: {star_name}  (type: {variable_type}, P = {orbital_period:.5f} d)")
@@ -279,6 +286,7 @@ for target in target_list:
 
     if clean_lc is None:
         print(f"  ERROR: No light curves found for {star_name}. Skipping.")
+        run_tracker.star_end(star_name, "failed", reason="no light curves found")
         continue
 
     active_sector = clean_lc.sector
@@ -393,6 +401,8 @@ for target in target_list:
     plt.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"  Diagnostic plot saved: {plot_path}")
+    run_tracker.star_end(star_name, "done", sector=active_sector,
+                         n_points=len(clean_lc), cadence_s=cadence_seconds)
 
 print("\n" + "=" * 70)
 print("SCRIPT 02 COMPLETE — All light curves acquired and exported.")

@@ -36,6 +36,8 @@ CODE = REPO.parent                               # Code/
 # paths.py keeps its name (every stage does `import paths`).
 SCRIPTS: list[tuple[Path, Path]] = [
     (CODE / "paths.py",                REPO / "src" / "paths.py"),
+    # Run timing / provenance / statistics; every stage and audit does `import runstats`.
+    (CODE / "runstats.py",             REPO / "src" / "runstats.py"),
     (CODE / "01TargetSelection.py",    REPO / "src" / "TargetSelection.py"),
     (CODE / "02DataAcquisition.py",    REPO / "src" / "DataAcquisition.py"),
     (CODE / "03OCAnalysis.py",         REPO / "src" / "OCAnalysis.py"),

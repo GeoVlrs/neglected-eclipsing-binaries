@@ -108,6 +108,43 @@ phoebe.logger(clevel="WARNING")
 import paths
 paths.ensure_dirs()
 
+# Run timing / statistics (Runs/run_stats/). Created AFTER `import phoebe`: worker ranks
+# are held inside that import, so only rank 0 ever reaches this line; `enabled` guards it
+# anyway. Columns are declared up front so every row of the CSV lines up.
+import statistics
+import time
+import runstats
+run_tracker = runstats.RunTracker(
+    "05Optimization", catalogue=sys.argv[1:], enabled=(mpi_rank == 0),
+    columns=["setup_seconds", "nm_seconds", "resumed_from", "steps_this_session",
+             "final_steps", "n_chunks", "mcmc_seconds", "s_per_iter", "chunk_first_s",
+             "chunk_min_s", "chunk_max_s", "chunk_last_s", "stop_reason", "chi2_red",
+             "err_scale", "median_accept", "min_accept", "failed_models", "failed_frac",
+             "failed_top_reason", "verdicts", "morphology_flag"],
+    # One row per checkpoint chunk (5F) → Runs/run_stats/05Optimization_chunks.csv.
+    chunk_columns=["step_from", "step_to", "steps", "chunk_seconds", "s_per_iter",
+                   "accept_mean", "accept_min", "failed_new", "failed_cum",
+                   "failed_frac_chunk", "failed_top", "eta_star_s", "eta_batch_s"],
+    # Settings are module constants defined further down; provenance is recorded
+    # just before the star loop (run_tracker.record_provenance).
+    record_provenance=False,
+)
+# Set by prepare_bundle_for_mcmc (5E) so the per-star row can report the NM duration.
+last_nm_seconds: float = float("nan")
+
+# Per-walker chain diagnostics (Section 5I-b). Audits/ has no __init__.py, so it
+# is imported by path rather than as a package. Safe to import here: its
+# matplotlib.use("Agg") is a no-op (already set above, before phoebe), and its
+# `import phoebe` hits the module cache, so no MPI re-detection. Never import in
+# the other direction — this script has no __main__ guard and would re-run.
+# Degrades to no diagnostics rather than aborting a batch if it cannot be loaded.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Audits"))
+try:
+    import audit_mcmc_chains as chain_audit
+except Exception as chain_audit_error:      # pragma: no cover — defensive
+    chain_audit = None
+    master_print(f"[5I-b] chain diagnostics unavailable: {chain_audit_error}")
+
 # Temperature boundary for von Zeipel vs. Lucy bolometric coefficients.
 RADIATIVE_CONVECTIVE_BOUNDARY_K: float = 8_000.0
 
@@ -172,6 +209,18 @@ MCMC_MAX_NITERS: int = (MCMC_N_ITERATIONS if MCMC_FIXED_MODE
 # genuine observed fill-out (TZ Boo f=0.039), so no real W UMa system is truncated.
 # Empirical, hence overridable.
 FILLOUT_FLOOR: float = float(os.environ.get("FILLOUT_FLOOR", 0.03))
+
+# Upper bound on a DETACHED component's radius, as a fraction of its Eggleton
+# (1983) Roche lobe. Was 0.9 on the assumption that approaching the lobe would
+# destabilise the mesh. A probe at production resolution (Pipeline_Log Entry 71)
+# showed otherwise: the model computes cleanly at exactly 1.00 x the lobe, and
+# only an OVERFLOWING configuration (1.02) fails — and it fails on PHOEBE's own
+# geometry check, not on the mesh. PHOEBE therefore enforces the physical limit
+# itself, so the prior does not need to and 0.9 only excluded real geometry.
+# This matters because four remaining targets (RZ Dra, V1034 Cyg, GW Gem,
+# V404 Lyr) are classified semi-detached, where a component FILLS its lobe by
+# definition — unreachable under any cap below 1.0.
+ROCHE_LOBE_CAP: float = float(os.environ.get("ROCHE_LOBE_CAP", 1.0))
 
 
 # =============================================================================
@@ -623,6 +672,17 @@ def completed_iterations(bundle: object, solution: str = "best_solution") -> int
         return 0
 
 
+def read_failed_models(bundle: object, solution: str = "best_solution") -> tuple:
+    """(count, most common message) of proposals whose forward model failed
+    (lnprob = −inf), from PHOEBE's `failed_samples`. PHOEBE carries that dict across
+    continue_from, so the count is cumulative over the whole chain. ("", "unavailable:
+    …") if it cannot be read — this feeds run statistics only and must never raise."""
+    try:
+        return runstats.count_failed(bundle.get_value("failed_samples", solution=solution))
+    except Exception as failed_error:
+        return "", f"unavailable: {failed_error}"[:120]
+
+
 def derive_free_params_meta(
     star_name: str,
     variable_type: str,
@@ -782,8 +842,15 @@ def prepare_bundle_for_mcmc(
     # factor) forced R/a ≈ 0.02–0.19 at PHOEBE's default sma = 5.3 R⊙ — far too
     # small to eclipse, producing a flat model (TZ Lyr modelled depth 0.001 vs data
     # 0.59). We scale both bounds by sma so they bracket physical fractional radii:
-    # a small-radius floor up to 90% of the Eggleton (1983) Roche lobe (keeping the
-    # geometry detached and out of L1 overflow). With single-band photometry the
+    # a small-radius floor up to ROCHE_LOBE_CAP x the Eggleton (1983) Roche lobe.
+    # KNOWN LIMITATION: the lobe is evaluated at the SEED q, but q is a free
+    # parameter, so the effective cap drifts as q samples — it is a larger
+    # fraction of the true lobe at low q and a smaller one at high q. Measured on
+    # the ZZ Det scratch star: intended 0.9, actually 0.943 of the true lobe at
+    # the fitted q (Entry 71). Raising the cap to 1.0 shrinks that drift's
+    # consequences, since an over-permissive bound is caught by PHOEBE's own
+    # overflow check while an over-tight one silently truncates the posterior.
+    # With single-band photometry the
     # absolute scale (sma) is degenerate, so sma is held fixed and these bounds
     # effectively constrain the fractional radii r = requiv / sma.
     if "requiv@primary" in free_params:
@@ -793,11 +860,16 @@ def prepare_bundle_for_mcmc(
         rl_secondary = eggleton_roche_radius(q_seed)          # secondary lobe fraction
         for twig, rl in (("requiv@primary", rl_primary), ("requiv@secondary", rl_secondary)):
             _, _, desc = free_params[twig]
-            cap_solrad = 0.9 * rl * sma     # 90% of the Roche lobe, in R⊙
+            # NOTE: `sma` cancels out of the effective constraint — both bounds
+            # carry a factor of sma and the physical quantity is r = requiv/sma,
+            # so r is bounded by [0.05, ROCHE_LOBE_CAP * rl] whatever sma is.
+            # A wrong fixed sma does NOT mis-scale this prior.
+            cap_solrad = ROCHE_LOBE_CAP * rl * sma
             lo_solrad  = 0.05 * sma         # fractional-radius floor r ≈ 0.05
             free_params[twig] = (lo_solrad, cap_solrad, desc)
             master_print(f"  [prior] {twig} ∈ [{lo_solrad:.3f}, {cap_solrad:.3f}] R⊙  "
-                         f"(R/a ≤ {0.9 * rl:.3f}; Eggleton q={q_seed:.3f}, sma={sma:.2f} R⊙)")
+                         f"(R/a ≤ {ROCHE_LOBE_CAP * rl:.3f} = {ROCHE_LOBE_CAP:.2f}×lobe at the "
+                         f"SEED q={q_seed:.3f}; sma={sma:.2f} R⊙)")
 
         # r₂ > r₁ seed: a deep total primary eclipse requires the secondary to be
         # larger than the primary. A symmetric seed consistently fell into the
@@ -810,34 +882,31 @@ def prepare_bundle_for_mcmc(
                      f"requiv@secondary = {r2_seed:.3f} R⊙ (r/a = 0.24)  "
                      f"[r₂/r₁ = 1.41, total-eclipse NM seed]")
 
-    n_free_params = len(free_params)
-
-    master_print(f"\n  [5D] Configuring {n_free_params} free parameters and priors...")
-    prior_distributions = {}
-    init_distributions  = {}
-
-    for twig, (lo, hi, description) in free_params.items():
-        prior_distributions[twig] = phoebe.uniform(lo, hi)
-
-        current_val  = bundle.get_value(twig)
-        param_range  = hi - lo
-        # 2% Gaussian initialisation ball keeps walkers tightly clustered around
-        # the Nelder-Mead solution and prevents early Roche-lobe overflow.
-        init_sigma   = 0.02 * param_range
-        clipped_val  = np.clip(current_val, lo + init_sigma, hi - init_sigma)
-        init_distributions[twig] = phoebe.normal(clipped_val, init_sigma)
-        master_print(f"    {twig:<40}  [{lo:.2f}, {hi:.2f}]  — {description}")
-
-    bundle.add_distribution(prior_distributions, distribution="my_priors")
-    bundle.add_distribution(init_distributions,  distribution="my_init")
-
     # Third-light optimisation for BD And — TESS's coarse pixel scale (~21"/px)
-    # makes contamination from nearby field stars a realistic systematic for this target.
+    # makes contamination from nearby field stars a realistic systematic for this
+    # target. This MUST precede the prior loop below: a twig added to free_params
+    # afterwards gets no entry in `my_priors`, and (since the 5D-b split) would
+    # land in `my_init` with no prior to bound it. BD And has no bundle yet, so
+    # this has never actually run.
     if star_name == "BD And":
         bundle.set_value("l3_mode", dataset="lc01", value="fraction")
         free_params["l3_frac@lc01"] = (0.0, 0.20, "Third-light contamination fraction")
-        n_free_params = len(free_params)
         master_print("  [physics] BD And: third-light fraction l3 enabled (0–20%).")
+
+    n_free_params = len(free_params)
+
+    master_print(f"\n  [5D] Configuring {n_free_params} free parameters and priors...")
+    # ONLY the priors are built here. The emcee initialisation ball ("my_init")
+    # is built AFTER the Nelder-Mead pre-wash in 5E — see the block there for why
+    # the order matters. Nelder-Mead needs "my_priors" to bound its simplex, so
+    # the prior half must stay ahead of it.
+    prior_distributions = {}
+
+    for twig, (lo, hi, description) in free_params.items():
+        prior_distributions[twig] = phoebe.uniform(lo, hi)
+        master_print(f"    {twig:<40}  [{lo:.2f}, {hi:.2f}]  — {description}")
+
+    bundle.add_distribution(prior_distributions, distribution="my_priors")
 
     # Bug E fix: component-coupled pblum does not auto-scale model flux to the
     # data. The bundle's pblum@primary was tuned for dataset-scaled; adding the
@@ -875,11 +944,52 @@ def prepare_bundle_for_mcmc(
         bundle.set_value("priors", solver="nm_solver", value=["my_priors"])
         bundle.set_value("maxiter", solver="nm_solver", value=NM_MAXITER)
 
+        global last_nm_seconds
+        _nm_t0 = time.time()
         bundle.run_solver("nm_solver", solution="nm_solution", overwrite=True)
+        last_nm_seconds = time.time() - _nm_t0
         bundle.adopt_solution("nm_solution", adopt_values=True)
         master_print("  Nelder-Mead converged — adopted as MCMC starting point.")
     except Exception as nm_error:
         master_print(f"  [NM warning] Pre-wash failed: {nm_error}. Using initial guess.")
+
+    # ── 5D-b: emcee INITIALISATION BALL (must follow the 5E adoption) ────────
+    # This block reads `bundle.get_value(twig)`, so it MUST run AFTER
+    # adopt_solution("nm_solution") above. It used to live in 5D, i.e. BEFORE the
+    # pre-wash — which meant the ball was centred on Script 04's seed values and
+    # Nelder-Mead's result was computed, stored in the bundle, and then silently
+    # discarded by the sampler (`init_from="my_init"` below). Every contact star
+    # therefore entered the MCMC at the identical point i = 82.0°, f = 0.15,
+    # q = 0.5, regardless of what NM had found; walkers spent the whole burn-in
+    # travelling back to the NM solution, and stars whose acceptance had collapsed
+    # never got there at all. See Pipeline_Log Entry 57.
+    #
+    # Deliberately OUTSIDE the try/except above: if NM raised, the bundle still
+    # holds the Script 04 seed and this degrades to the old behaviour rather than
+    # failing the star.
+    master_print("\n  [5D-b] emcee initialisation ball (centred on the adopted solution):")
+    init_distributions = {}
+    for twig, (lo, hi, description) in free_params.items():
+        # context= is REQUIRED here and was not needed in the old 5D placement:
+        # `my_priors` now exists by this point, so a bare twig like
+        # "teff@secondary" matches both the component parameter and its prior
+        # distribution, and PHOEBE raises "2 results found". Both contexts are
+        # listed because BD And's l3_frac@lc01 lives in the dataset context while
+        # every other free parameter lives in the component context.
+        current_val  = bundle.get_value(twig, context=["component", "dataset"])
+        param_range  = hi - lo
+        # 2% Gaussian ball: tight enough to keep walkers out of Roche-lobe
+        # overflow, wide enough to give emcee's stretch move something to work with.
+        init_sigma   = 0.02 * param_range
+        clipped_val  = float(np.clip(current_val, lo + init_sigma, hi - init_sigma))
+        init_distributions[twig] = phoebe.normal(clipped_val, init_sigma)
+        # Printed per parameter because the absence of exactly this line is what
+        # let the ordering bug survive 29 stars unnoticed.
+        clip_note = "" if np.isclose(clipped_val, current_val) else \
+                    f"  [CLIPPED from {current_val:.4f} — solution railed at a bound]"
+        master_print(f"    {twig:<40}  N({clipped_val:.4f}, {init_sigma:.4f}){clip_note}")
+
+    bundle.add_distribution(init_distributions, distribution="my_init")
 
     # ── 5F: ADD emcee SOLVER (execution happens in the chunked loop) ──────────
     _mcmc_budget = (f"{MCMC_N_ITERATIONS} steps" if MCMC_FIXED_MODE
@@ -933,10 +1043,44 @@ PARAM_DISPLAY_LABELS: dict[str, tuple[str, str]] = {
     "fillout_factor":   ("Contact fill-out factor f",  "—"),
 }
 
-for target in target_list:
+# Provenance row in Runs/run_stats/runs.csv: code fingerprint (this script, the chain
+# audit whose verdicts the rows report, runstats, paths) and every setting that shapes
+# the fit. Recorded here rather than at tracker creation because these constants are
+# defined after it.
+run_tracker.record_provenance(
+    settings={
+        "mpi_n_procs": mpi_n_procs, "MCMC_N_WALKERS": MCMC_N_WALKERS,
+        "MCMC_CHECKPOINT_NITERS": MCMC_CHECKPOINT_NITERS,
+        "MCMC_MIN_NITERS": MCMC_MIN_NITERS, "MCMC_MAX_NITERS": MCMC_MAX_NITERS,
+        "MCMC_FIXED_MODE": MCMC_FIXED_MODE, "MCMC_BURN_IN_STEPS": MCMC_BURN_IN_STEPS,
+        "NM_MAXITER": NM_MAXITER, "CONVERGENCE_MULTIPLIER": CONVERGENCE_MULTIPLIER,
+        "RHAT_CONVERGENCE_THRESHOLD": RHAT_CONVERGENCE_THRESHOLD,
+        "FILLOUT_FLOOR": FILLOUT_FLOOR, "ROCHE_LOBE_CAP": ROCHE_LOBE_CAP,
+        "phoebe": phoebe.__version__, "emcee": emcee.__version__,
+    },
+    code_files=[os.path.abspath(__file__), runstats.__file__, paths.__file__,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "Audits",
+                             "audit_mcmc_chains.py")],
+)
+
+# For the batch ETA (5F): which targets still lack a results file at launch. Counted
+# once; a star finished during this run is always earlier in the list than the one
+# being estimated, so it is never double-counted.
+target_pending = [
+    not os.path.exists(os.path.join(paths.RESULTS_DIR,
+                                    f"results_{t['name'].replace(' ', '_')}.csv"))
+    for t in target_list
+]
+
+for target_index, target in enumerate(target_list):
     star_name     = target["name"]
     variable_type = target["type"]
     safe_name     = star_name.replace(" ", "_")
+    run_tracker.star_start(star_name)
+    star_t0         = time.time()
+    star_audit      = None
+    last_nm_seconds = float("nan")
+    setup_seconds   = float("nan")
 
     master_print("\n" + "=" * 70)
     master_print(f"OPTIMISATION: {star_name}  ({variable_type})  |  Strategy: MCMC (emcee)")
@@ -952,6 +1096,7 @@ for target in target_list:
     # pick up where it stopped.
     if os.path.exists(results_path):
         master_print(f"  [skip] {results_path} already exists — target complete.")
+        run_tracker.star_end(star_name, "skipped", reason="results already exist")
         continue
 
     resuming = os.path.exists(mcmc_checkpoint)
@@ -968,8 +1113,12 @@ for target in target_list:
         master_print(f"  [resume] Loaded {mcmc_checkpoint} — {already}/{MCMC_MAX_NITERS} "
                      "iterations already complete.")
     else:
-        prepared = prepare_bundle_for_mcmc(star_name, variable_type, bundle_path)
+        already   = 0
+        _setup_t0 = time.time()
+        prepared  = prepare_bundle_for_mcmc(star_name, variable_type, bundle_path)
+        setup_seconds = time.time() - _setup_t0
         if prepared is None:
+            run_tracker.star_end(star_name, "skipped", reason="bundle not found")
             continue
         bundle, free_params, is_contact_binary, n_free_params = prepared
 
@@ -999,6 +1148,12 @@ for target in target_list:
     # but stop as soon as every sampled parameter clears both the 50τ and R̂<1.1
     # tests once past the floor MCMC_MIN_NITERS. In fixed mode MIN=MAX=MCMC_NITERS,
     # so this reduces exactly to the former fixed-length behaviour.
+    chunk_seconds: list = []
+    chunk_steps: list = []
+    mcmc_error_text = ""
+    # Failed-model baseline: carried over on a resume; 0 on a fresh star (no solution
+    # exists yet, so reading it would return "unavailable").
+    failed_before = read_failed_models(bundle)[0] if done else 0
     while done < MCMC_MAX_NITERS:
         prev_done = done
         # +1 compensates for the continue_from overlap (a resumed chunk re-uses the
@@ -1017,15 +1172,67 @@ for target in target_list:
         try:
             master_print(f"  [MCMC] chunk → +{n_this} iters "
                          f"(from {done}/{MCMC_MAX_NITERS})...")
+            _chunk_t0 = time.time()
             bundle.run_solver("mcmc_sampler", solution="best_solution", overwrite=True)
+            chunk_seconds.append(time.time() - _chunk_t0)
         except Exception as mcmc_error:
             master_print(f"  MCMC error: {mcmc_error}")
             mcmc_failed = True
+            mcmc_error_text = f"MCMC error: {mcmc_error}"
+            run_tracker.count_error("MCMC error")
             break
 
         bundle.save(mcmc_checkpoint)
         done = completed_iterations(bundle, "best_solution")
         master_print(f"  [checkpoint] {done}/{MCMC_MAX_NITERS} iters saved → {mcmc_checkpoint}")
+
+        # ── 5F-b: per-chunk statistics + ETA (Runs/run_stats/05Optimization_chunks.csv)
+        # Bookkeeping only: wrapped so that no fault here can stop the sampler.
+        # Acceptance is measured from the chain (walker moved between steps), NOT from
+        # PHOEBE's `acceptance_fractions`, which is wrong after continue_from.
+        try:
+            chunk_steps.append(done - prev_done)
+            _new_steps = chunk_steps[-1]
+            _rate_s    = sum(chunk_seconds[-3:]) / max(1, sum(chunk_steps[-3:]))
+            _acc_mean, _acc_min = runstats.chain_acceptance(
+                bundle.get_value("samples", solution="best_solution"),
+                prev_done, done, MCMC_N_WALKERS)
+            _failed_cum, _failed_top = read_failed_models(bundle)
+            _failed_new = (_failed_cum - failed_before
+                           if isinstance(_failed_cum, int) and isinstance(failed_before, int)
+                           else "")
+            if isinstance(_failed_cum, int):
+                failed_before = _failed_cum
+            _eta_star  = runstats.eta_seconds(_rate_s, MCMC_MAX_NITERS - done)
+            _n_pending = sum(target_pending[target_index + 1:])
+            _done_secs = run_tracker.done_star_seconds()
+            if _done_secs:
+                _per_star, _basis = statistics.median(_done_secs), "median completed star"
+            else:
+                _per_star = (time.time() - star_t0) + _eta_star
+                _basis    = "assuming each is like this star"
+            _eta_batch = _eta_star + _n_pending * _per_star
+            run_tracker.chunk_row(
+                star_name, step_from=prev_done, step_to=done, steps=_new_steps,
+                chunk_seconds=chunk_seconds[-1],
+                s_per_iter=chunk_seconds[-1] / _new_steps if _new_steps else "",
+                accept_mean=_acc_mean, accept_min=_acc_min,
+                failed_new=_failed_new, failed_cum=_failed_cum,
+                failed_frac_chunk=(_failed_new / (_new_steps * MCMC_N_WALKERS)
+                                   if isinstance(_failed_new, int) and _new_steps else ""),
+                failed_top=_failed_top, eta_star_s=_eta_star, eta_batch_s=_eta_batch,
+            )
+            _gate_note = (f"; gate may stop from step {MCMC_MIN_NITERS}"
+                          if not MCMC_FIXED_MODE and MCMC_MIN_NITERS < MCMC_MAX_NITERS
+                          else "")
+            master_print(
+                f"  [eta] {done}/{MCMC_MAX_NITERS} steps · last {len(chunk_seconds[-3:])} "
+                f"chunk(s) {_rate_s:.1f} s/it · accept {_acc_mean:.2f} · failed models "
+                f"+{_failed_new} · star ≤ {runstats.format_hms(_eta_star)} (ceiling"
+                f"{_gate_note}) · batch ≈ {runstats.format_hms(_eta_batch)} "
+                f"({_n_pending} more star(s) pending, {_basis}; rough)")
+        except Exception as stats_error:
+            master_print(f"  [eta] chunk statistics unavailable: {stats_error}")
 
         if done <= prev_done:
             # No forward progress (continue_from overlap at the tail): stop here and
@@ -1046,6 +1253,9 @@ for target in target_list:
 
     if mcmc_failed and done == 0:
         master_print("  No usable samples produced — skipping target.")
+        run_tracker.star_end(star_name, "failed", reason="MCMC produced no samples",
+                             setup_seconds=setup_seconds, nm_seconds=last_nm_seconds,
+                             resumed_from=already)
         continue
     if converged_early:
         master_print(f"  MCMC sampling complete (converged at {done} steps).")
@@ -1100,6 +1310,12 @@ for target in target_list:
         )
     except Exception as compute_error:
         master_print(f"  Final compute error: {compute_error}")
+        run_tracker.star_end(star_name, "failed",
+                             reason=f"final compute error: {compute_error}",
+                             setup_seconds=setup_seconds, nm_seconds=last_nm_seconds,
+                             resumed_from=already, final_steps=done,
+                             steps_this_session=done - already,
+                             mcmc_seconds=sum(chunk_seconds))
         continue
 
     chi2, chi2_red, n_obs = compute_reduced_chi2(bundle, n_free_params)
@@ -1107,7 +1323,21 @@ for target in target_list:
                  f"(N = {n_obs}, dof = {n_obs - n_free_params})")
 
     # ── 5I: GELMAN-RUBIN R̂ CONVERGENCE CHECK ─────────────────────────────────
-    master_print("\n  [5I] Gelman-Rubin R̂ convergence diagnostics:")
+    # The stop REASON is already printed above ("converged at N" vs "reached
+    # ceiling"), but it is ~40 lines earlier and the per-parameter Status column
+    # below is computed from R̂ ALONE. A star that ran out of budget with τ far
+    # short of the gate therefore reads as "CONVERGED" on every row. Repeating
+    # the reason in this header keeps the table from being quoted out of context
+    # — three of the four batch-4 stars stopped at the ceiling while every row
+    # said CONVERGED. See Pipeline_Log Entries 60/62/63.
+    if MCMC_FIXED_MODE:
+        _stop_reason = f"fixed-length mode, {done} steps — gate NOT applied"
+    elif converged_early:
+        _stop_reason = f"gate satisfied at {done} steps"
+    else:
+        _stop_reason = (f"stopped at ceiling {MCMC_MAX_NITERS} — gate NOT satisfied; "
+                        "see τ above")
+    master_print(f"\n  [5I] Gelman-Rubin R̂ convergence diagnostics  [{_stop_reason}]:")
     try:
         # R̂ from the shared helper (the same one the convergence gate uses), so the
         # post-hoc report and the stop criterion can never diverge.
@@ -1127,7 +1357,7 @@ for target in target_list:
         r_hats_full = gelman_rubin_rhat(oriented)
         r_hats      = gelman_rubin_rhat(oriented[trim:])
 
-        master_print(f"  {'Parameter':<40} {'R̂_full':>8} {'R̂_trim':>8}  {'Status'}")
+        master_print(f"  {'Parameter':<40} {'R̂_full':>8} {'R̂_trim':>8}  {'Status (R̂ only)'}")
         master_print("  " + "─" * 70)
         for i, param_name in enumerate(fitted_twigs):
             r_hat  = float(r_hats[i]) if i < len(r_hats) else float("inf")
@@ -1138,6 +1368,46 @@ for target in target_list:
             master_print(f"  {param_name:<40} {r_full:>8.4f} {r_hat:>8.4f}  {status}")
     except Exception as rhat_error:
         master_print(f"  Gelman-Rubin diagnostic failed: {rhat_error}")
+
+    # ── 5I-b: PER-WALKER CHAIN HEALTH + TRACE PLOT ────────────────────────────
+    # R̂ above is an ensemble aggregate and can be misleading on its own: a single
+    # frozen walker inflates it, and burn-in scatter used to mask it (Entry 47).
+    # This scores the chain walker-by-walker using the same thresholds as the
+    # standalone audit — one definition, in Audits/audit_mcmc_chains.py — and
+    # writes a trace figure for EVERY star so the chain can be inspected later
+    # without re-running anything. Diagnostics must never kill a completed fit,
+    # so the whole block is defensive.
+    #
+    # The shared audit CSVs are deliberately NOT written here: concurrent batch
+    # processes would interleave appends. `python Audits/audit_mcmc_chains.py
+    # <catalogue> --per-walker` regenerates them in one pass instead.
+    if chain_audit is not None:
+        master_print("\n  [5I-b] Per-walker chain health:")
+        try:
+            lnprob = np.asarray(
+                bundle.get_value("lnprobabilities", solution="best_solution"),
+                dtype=float)
+            audit = chain_audit.audit_chain_arrays(
+                star_name,
+                bundle.get_value("samples", solution="best_solution"),
+                lnprob,
+                bundle.get_value("fitted_twigs", solution="best_solution"),
+                burn=MCMC_BURN_IN_STEPS,
+                chi2_red=chi2_red,
+            )
+            star_audit = audit
+            master_print(f"  verdict: {' + '.join(audit['verdicts'])}")
+            if audit.get("detail"):
+                for line in audit["detail"].split("; "):
+                    master_print(f"    - {line}")
+
+            if mpi_rank == 0:
+                trace_path = chain_audit.plot_walker_traces(
+                    audit, out_dir=paths.PLOT_MCMC_DIR)
+                if trace_path:
+                    master_print(f"  Chain plot saved:   {trace_path}")
+        except Exception as chain_error:
+            master_print(f"  Chain health diagnostic failed: {chain_error}")
 
     # ── 5J: RESULT EXTRACTION ─────────────────────────────────────────────────
     # Summarise the post-burn-in chain first, then attach ±σ to the adopted medians.
@@ -1270,6 +1540,38 @@ for target in target_list:
 
         except Exception as output_error:
             master_print(f"  Could not generate final plot / bundle: {output_error}")
+            run_tracker.count_error("final plot/bundle")
+
+    # ── 5L: PER-STAR TIMING ROW (Runs/run_stats/05Optimization_stars.csv) ─────
+    # s_per_iter covers only steps run in THIS session (a resumed star's earlier
+    # steps were timed by a previous process — see resumed_from).
+    _steps_now = done - already
+    _mcmc_s    = sum(chunk_seconds)
+    # Proposals whose forward model failed (lnprob = −inf), keyed by PHOEBE's error
+    # message. PHOEBE carries this dict across continue_from, so it covers the whole
+    # chain, resumed sessions included. Distinct from acceptance: a walker that does
+    # not move may have been Metropolis-rejected with a perfectly valid model.
+    _failed_n, _failed_top = read_failed_models(bundle)
+    _failed_frac = (_failed_n / (done * MCMC_N_WALKERS)
+                    if isinstance(_failed_n, int) and done else "")
+    run_tracker.star_end(
+        star_name, "done", reason=mcmc_error_text,
+        setup_seconds=setup_seconds, nm_seconds=last_nm_seconds,
+        resumed_from=already, steps_this_session=_steps_now, final_steps=done,
+        n_chunks=len(chunk_seconds), mcmc_seconds=_mcmc_s,
+        s_per_iter=(_mcmc_s / _steps_now) if _steps_now > 0 else "",
+        chunk_first_s=chunk_seconds[0] if chunk_seconds else "",
+        chunk_min_s=min(chunk_seconds) if chunk_seconds else "",
+        chunk_max_s=max(chunk_seconds) if chunk_seconds else "",
+        chunk_last_s=chunk_seconds[-1] if chunk_seconds else "",
+        stop_reason=_stop_reason, chi2_red=chi2_red,
+        err_scale=(max(1.0, float(np.sqrt(chi2_red))) if np.isfinite(chi2_red) else 1.0),
+        median_accept=star_audit["median_accept"] if star_audit else "",
+        min_accept=star_audit["min_accept"] if star_audit else "",
+        failed_models=_failed_n, failed_frac=_failed_frac, failed_top_reason=_failed_top,
+        verdicts=" + ".join(star_audit["verdicts"]) if star_audit else "",
+        morphology_flag=morphology_flag,
+    )
 
 master_print("\n" + "=" * 70)
 master_print("SCRIPT 05 COMPLETE — Statistical optimisation finished for all targets.")
