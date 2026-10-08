@@ -71,6 +71,34 @@ from typing import Optional
 # (Override with PHOEBE_ENABLE_ONLINE_PASSBANDS=TRUE if a new passband is needed.)
 os.environ.setdefault("PHOEBE_ENABLE_ONLINE_PASSBANDS", "FALSE")
 
+# Semi-detached stars (Entry 77): PHOEBE's 'semidetached' constraint sets the
+# secondary's volume EXACTLY to its critical (Roche-lobe) value; floating-point
+# rounding then lands it ~1e-16 above, and backend/universe.py clamps it back with a
+# WARNING on its "UNIVERSE" logger — on every mesh of every model, from every MPI
+# rank (~100 lines/min, tens of millions per star). PHOEBE only clamps when the
+# excess is < 1e-10 relative and raises an error otherwise, so the message carries no
+# information. Show it once per process, then drop it. MUST be installed before
+# `import phoebe`: worker ranks stay inside that import and never run later code.
+import logging
+
+
+class _OnceNumericsVolumeWarning(logging.Filter):
+    """Pass the 'target_volume ... slightly over critical value' warning once."""
+    _seen = False
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if "slightly over critical value, likely due to numerics" not in record.getMessage():
+            return True
+        if _OnceNumericsVolumeWarning._seen:
+            return False
+        _OnceNumericsVolumeWarning._seen = True
+        record.msg = (str(record.msg) + "  [further identical clamps suppressed "
+                      "in this process — semi-detached lobe constraint, Entry 80]")
+        return True
+
+
+logging.getLogger("UNIVERSE").addFilter(_OnceNumericsVolumeWarning())
+
 # ── Scientific libraries ──────────────────────────────────────────────────────
 import numpy as np
 import matplotlib
@@ -260,54 +288,96 @@ FREE_PARAMS_DETACHED: dict[str, tuple[float, float, str]] = {
     "requiv@secondary": (0.1,   1.0,  "Secondary equivalent radius (R_sun; sma-scaled at runtime)"),
 }
 
+# Semi-detached: Script 04 adds PHOEBE's 'semidetached' constraint, so the
+# secondary's radius equals its Roche lobe at every sampled q and is NOT free.
+FREE_PARAMS_SEMIDETACHED: dict[str, tuple[float, float, str]] = {
+    k: v for k, v in FREE_PARAMS_DETACHED.items() if k != "requiv@secondary"
+}
+
 
 # =============================================================================
 # SECTION 3 — HELPER FUNCTIONS
 # =============================================================================
 
-# Per-star morphology override, consulted by resolve_morphology() BEFORE the GCVS
-# classifier. Use it to force a star modelled as detached when the contact model is
-# geometrically wrong for it (assess_contact_validity flags RECONSIDER_DETACHED, or the
-# batch-3 production log shows "requiv too close to requiv_min / use detached model").
-# Mirrors GAIA_TEFF_OVERRIDE_K in Script 04. MUST stay byte-identical between Scripts 04
-# and 05 (same requirement that binds is_contact_morphology), or a bundle would be built
-# under one morphology and optimised under another. Value: "detached" or "contact".
-# Workflow for a flagged star: add it here (both scripts) → re-run Script 04 (rebuilds a
-# detached bundle) → clear its results_<star>.csv → re-run Script 05.
-MORPHOLOGY_OVERRIDE: dict[str, str] = {
-    # "FI Boo": "detached",  # DETECTOR FALSE POSITIVE — light curve is clearly EW/contact
-    #                        # (continuous variation + O'Connell); kept CONTACT. See log.
-    # "Y Sex":  "detached",  # pending: run not finished / not yet verified
-}
+# Morphology (contact / detached / semi-detached) comes from the shared module
+# morphology.py, imported by Scripts 04, 05 and 06 alike, so a bundle is always
+# optimised under the geometry it was built with. It replaces the local copies of
+# MORPHOLOGY_OVERRIDE / is_contact_morphology / resolve_morphology (Entry 76).
+from morphology import (                                    # noqa: E402
+    CONTACT, DETACHED, SEMIDETACHED, MORPHOLOGY_OVERRIDE,
+    is_contact_morphology, resolve_morphology, resolve_morphology_kind, morphology_source,
+)
 
 
-def is_contact_morphology(gcvs_type: str) -> bool:
+def free_params_for(kind: str) -> dict:
+    """Copy of the free-parameter set for a morphology kind."""
+    return {CONTACT: FREE_PARAMS_CONTACT, DETACHED: FREE_PARAMS_DETACHED,
+            SEMIDETACHED: FREE_PARAMS_SEMIDETACHED}[kind].copy()
+
+
+def adaptive_burn_in(chains_steps_first: np.ndarray) -> int:
     """
-    Decide whether a GCVS variability type denotes a contact (overcontact) binary.
-
-    Qualified contact codes ("EW/KW", "EW/DW", "EW:", "EW/RS", ...) must be
-    treated as contact systems; a bare `gcvs_type == "EW"` test misclassifies
-    them as detached and selects the wrong free-parameter set and irradiation
-    scheme. We strip the qualifier suffix and test only the leading code. This
-    must stay identical to the classifier in Script 04 so a bundle is optimised
-    under the same morphology it was built with.
+    Burn-in = max(MCMC_BURN_IN_STEPS, 2·τ_max), with τ measured on the chain
+    AFTER the fixed floor (an untrimmed chain carries the initial transient into
+    τ). Capped at half the chain. A fixed 350 steps was ~1.5 τ_max for V358 Cep
+    (τ_incl ≈ 232); 2 τ is the usual minimum (Entry 76).
     """
-    base = gcvs_type.strip().upper().replace(":", "").split("/")[0]
-    return base == "EW"
+    n_steps = chains_steps_first.shape[0]
+    floor = min(MCMC_BURN_IN_STEPS, max(0, n_steps - 2))
+    tail = chains_steps_first[floor:]
+    burn = floor
+    if tail.shape[0] > 50:
+        tau = np.atleast_1d(assess_autocorrelation_convergence(tail))
+        if np.all(np.isfinite(tau)):
+            burn = max(floor, int(np.ceil(2.0 * float(np.max(tau)))))
+    return int(min(burn, n_steps // 2)) if n_steps > 2 else 0
 
 
-def resolve_morphology(star_name: str, gcvs_type: str) -> bool:
-    """
-    Decide contact (True) vs detached (False) for a star, honouring MORPHOLOGY_OVERRIDE
-    first and falling back to the pure GCVS classifier is_contact_morphology(). This is
-    the single entry point the pipeline should call; is_contact_morphology stays a pure,
-    star-agnostic classifier. MUST behave identically in Scripts 04 and 05 (same override
-    table) so a bundle is built and optimised under the same morphology.
-    """
-    override = MORPHOLOGY_OVERRIDE.get(star_name)
-    if override is not None:
-        return override.strip().lower() == "contact"
-    return is_contact_morphology(gcvs_type)
+def steps_first(chains: np.ndarray) -> np.ndarray:
+    """Orient an emcee chain as (n_steps, n_walkers, n_params)."""
+    chains = np.asarray(chains)
+    if chains.ndim == 3 and chains.shape[0] == MCMC_N_WALKERS and chains.shape[1] != MCMC_N_WALKERS:
+        chains = np.swapaxes(chains, 0, 1)
+    return chains
+
+
+def prior_bounds(bundle: object, twig: str, fallback: tuple) -> tuple[float, float]:
+    """(low, high) of the uniform prior actually stored in the bundle for `twig`."""
+    try:
+        qualifier, _, rest = twig.partition("@")
+        kwargs = {"qualifier": qualifier, "context": "distribution", "distribution": "my_priors"}
+        comp = rest.split("@")[0] if rest else ""
+        if comp in ("primary", "secondary", "binary", "contact_envelope"):
+            kwargs["component"] = comp
+        dist = bundle.get_parameter(**kwargs).get_value()
+        return float(dist.low), float(dist.high)
+    except Exception:
+        return float(fallback[0]), float(fallback[1])
+
+
+def file_sha(path: str) -> str:
+    """sha256 of a file's bytes, first 12 hex digits ('' if unreadable)."""
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+        return h.hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+def read_results_meta(results_path: str) -> dict:
+    """Symbol → Value for the provenance rows of an existing results CSV."""
+    meta = {}
+    try:
+        with open(results_path, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                meta[row.get("Symbol", "")] = row.get("Value", "")
+    except OSError:
+        pass
+    return meta
 
 
 def assess_contact_validity(bundle: object) -> str:
@@ -481,13 +551,11 @@ def chains_meet_convergence(bundle: object, done: int,
     except Exception:
         return False
     # τ estimator wants time on axis 0 (emcee-native); guard a transposed layout.
-    tau_chains = chains
-    if tau_chains.ndim == 3 and tau_chains.shape[0] == MCMC_N_WALKERS \
-            and tau_chains.shape[1] != MCMC_N_WALKERS:
-        tau_chains = np.swapaxes(tau_chains, 0, 1)
-    tau  = np.atleast_1d(assess_autocorrelation_convergence(tau_chains))
-    # tau_chains is steps-first, so the burn-in slice is unambiguous here.
-    trim = min(MCMC_BURN_IN_STEPS, max(0, tau_chains.shape[0] - 2))
+    tau_chains = steps_first(chains)
+    # Adaptive burn-in (2·τ_max, floor MCMC_BURN_IN_STEPS); τ and R̂ are both
+    # measured on the POST-burn-in chain the posterior is drawn from.
+    trim = adaptive_burn_in(tau_chains)
+    tau  = np.atleast_1d(assess_autocorrelation_convergence(tau_chains[trim:]))
     rhat = np.atleast_1d(gelman_rubin_rhat(tau_chains[trim:]))
     if not (np.all(np.isfinite(tau)) and np.all(np.isfinite(rhat))):
         return False
@@ -695,10 +763,9 @@ def derive_free_params_meta(
     loaded checkpoint and only the membership/count metadata is needed downstream
     (degrees of freedom, contact-vs-detached result extraction).
     """
-    is_contact = resolve_morphology(star_name, variable_type)
-    free_params = (
-        FREE_PARAMS_CONTACT.copy() if is_contact else FREE_PARAMS_DETACHED.copy()
-    )
+    kind = resolve_morphology_kind(star_name, variable_type)
+    is_contact = kind == CONTACT
+    free_params = free_params_for(kind)
     if star_name == "BD And":
         free_params["l3_frac@lc01"] = (0.0, 0.20, "Third-light contamination fraction")
     return free_params, is_contact, len(free_params)
@@ -738,6 +805,14 @@ def prepare_bundle_for_mcmc(
             bundle.set_value(f"irrad_frac_refl_bol@{component}", 0.6)
             master_print(f"  [physics] {component}: convective β₁=0.32, A=0.6  ({teff:.0f} K)")
 
+    # Irradiation method in the COMPUTE OPTIONS, so the sampler and the final
+    # compute use the same model (contact = Wilson, otherwise Horvat). Script 04
+    # stores it since 2026-10; set here too so an older bundle cannot sample with
+    # PHOEBE's default (Horvat) and report with Wilson (Entry 76).
+    _kind = resolve_morphology_kind(star_name, variable_type)
+    bundle.set_value("irrad_method", compute="phoebe01",
+                     value="wilson" if _kind == CONTACT else "horvat")
+
     # ── 5B: DATA SANITISATION ─────────────────────────────────────────────────
     # Duplicate timestamps cause PHOEBE 2's interpolation to fail. Remove them
     # by rebuilding the dataset with only the unique-time subset.
@@ -747,6 +822,17 @@ def prepare_bundle_for_mcmc(
         obs_sigmas = bundle.get_value("sigmas", dataset="lc01", context="dataset")
         passband   = bundle.get_value("passband",   dataset="lc01", context="dataset")
         pblum_mode = bundle.get_value("pblum_mode", dataset="lc01")
+        # The dataset is rebuilt below; exptime (set by Script 04 for long-cadence
+        # data, with fti_method="oversample" in the compute options) would be lost.
+        exptime    = float(bundle.get_value("exptime", dataset="lc01", context="dataset",
+                                            check_visible=False))
+        # fti_method / fti_oversample are PER-DATASET compute options
+        # (fti_method@lc01@phoebe01): re-adding lc01 resets them to "none" / default,
+        # which silently switched exposure integration off (Phase D, Entry 79).
+        fti_method = bundle.get_value("fti_method", compute="phoebe01", dataset="lc01",
+                                      check_visible=False)
+        fti_over   = bundle.get_value("fti_oversample", compute="phoebe01", dataset="lc01",
+                                      check_visible=False)
 
         unique_mask     = np.unique(obs_times, return_index=True)[1]
         n_duplicates    = len(obs_times) - len(unique_mask)
@@ -760,16 +846,28 @@ def prepare_bundle_for_mcmc(
             passband=passband,
             dataset="lc01",
         )
-        # Detached binaries: 'dataset-scaled' silences the secondary's flux
-        # contribution (secondary eclipse and ellipsoidal variation disappear from
-        # the model). 'component-coupled' derives pblum@secondary from the physical
-        # T/R ratio relative to the primary, preserving the correct flux ratio.
-        pblum_mode_eff = (pblum_mode if resolve_morphology(star_name, variable_type)
-                          else "component-coupled")
-        bundle.set_value("pblum_mode", dataset="lc01", value=pblum_mode_eff)
-        if pblum_mode_eff != pblum_mode:
-            master_print(f"  [pblum] Detached binary: pblum_mode "
-                         f"'{pblum_mode}' → '{pblum_mode_eff}'")
+        if exptime > 0:
+            bundle.set_value("exptime", dataset="lc01", context="dataset", value=exptime)
+            bundle.set_value("fti_method", compute="phoebe01", dataset="lc01", value=fti_method)
+            if fti_method != "none":
+                bundle.set_value("fti_oversample", compute="phoebe01", dataset="lc01",
+                                 value=int(fti_over))
+            _fti_now = bundle.get_value("fti_method", compute="phoebe01", dataset="lc01",
+                                        check_visible=False)
+            _ovs_now = bundle.get_value("fti_oversample", compute="phoebe01", dataset="lc01",
+                                        check_visible=False)
+            master_print(f"  [sanitise] exptime {exptime:.0f} s restored "
+                         f"(fti_method = {_fti_now}, fti_oversample = {_ovs_now})")
+        # 'dataset-scaled' for EVERY morphology: the model is computed with the
+        # components' physical (coupled) luminosities and then rescaled as a whole
+        # to the data, so the flux level is effectively free at every step.
+        # Measured 2026-10-07 (Entry 76) on a detached bundle: dataset-scaled =
+        # k × component-coupled to 1e-15 of the amplitude in four configurations
+        # (it does NOT silence the secondary, as the old "Bug C" note claimed), and
+        # k ranged 0.37-0.83 with T2 and the radii — which is exactly the flux-level
+        # drift that the former component-coupled mode, rescaled once at the seed,
+        # forced the fit to absorb into r1, r2 and T2.
+        bundle.set_value("pblum_mode", dataset="lc01", value="dataset-scaled")
         master_print(f"  [sanitise] Removed {n_duplicates} duplicate timestamps.")
     except Exception as sanitise_error:
         master_print(f"  [sanitise warning] {sanitise_error}")
@@ -791,7 +889,8 @@ def prepare_bundle_for_mcmc(
             master_print(f"  [LD warning] {comp}: {ld_error}")
 
     # ── 5D: FREE PARAMETERS & PRIORS ─────────────────────────────────────────
-    is_contact_binary = resolve_morphology(star_name, variable_type)
+    morphology_kind   = resolve_morphology_kind(star_name, variable_type)
+    is_contact_binary = morphology_kind == CONTACT
 
     if is_contact_binary:
         try:
@@ -799,10 +898,8 @@ def prepare_bundle_for_mcmc(
         except Exception:
             pass  # constraint may already be inverted from Script 04
 
-    free_params = (
-        FREE_PARAMS_CONTACT.copy() if is_contact_binary
-        else FREE_PARAMS_DETACHED.copy()
-    )
+    free_params = free_params_for(morphology_kind)
+    master_print(f"  [morphology] {morphology_kind} ({morphology_source(star_name)})")
 
     # Apply a temperature prior anchored to T1 to prevent the secondary from
     # wandering into physically implausible regions during burn-in.
@@ -856,9 +953,17 @@ def prepare_bundle_for_mcmc(
     if "requiv@primary" in free_params:
         q_seed       = bundle.get_value("q@binary",   context="component")
         sma          = bundle.get_value("sma@binary", context="component")  # R⊙
-        rl_primary   = eggleton_roche_radius(1.0 / q_seed)   # primary lobe fraction r_L/a
-        rl_secondary = eggleton_roche_radius(q_seed)          # secondary lobe fraction
+        # Caps at the LARGEST lobe the q prior allows (primary: lowest q; secondary:
+        # highest q). Before 2026-10 the cap was evaluated at the SEED q, so it was
+        # tighter than the true lobe whenever q sampled the other way (Entry 76). An
+        # over-permissive cap is harmless: PHOEBE's own exact overflow check rejects
+        # requiv > requiv_max at the sampled q.
+        q_lo, q_hi   = free_params["q@binary"][0], free_params["q@binary"][1]
+        rl_primary   = eggleton_roche_radius(1.0 / q_lo)     # primary lobe fraction r_L/a
+        rl_secondary = eggleton_roche_radius(q_hi)           # secondary lobe fraction
         for twig, rl in (("requiv@primary", rl_primary), ("requiv@secondary", rl_secondary)):
+            if twig not in free_params:
+                continue                  # semi-detached: r2 is set by the lobe constraint
             _, _, desc = free_params[twig]
             # NOTE: `sma` cancels out of the effective constraint — both bounds
             # carry a factor of sma and the physical quantity is r = requiv/sma,
@@ -868,19 +973,24 @@ def prepare_bundle_for_mcmc(
             lo_solrad  = 0.05 * sma         # fractional-radius floor r ≈ 0.05
             free_params[twig] = (lo_solrad, cap_solrad, desc)
             master_print(f"  [prior] {twig} ∈ [{lo_solrad:.3f}, {cap_solrad:.3f}] R⊙  "
-                         f"(R/a ≤ {ROCHE_LOBE_CAP * rl:.3f} = {ROCHE_LOBE_CAP:.2f}×lobe at the "
-                         f"SEED q={q_seed:.3f}; sma={sma:.2f} R⊙)")
+                         f"(R/a ≤ {ROCHE_LOBE_CAP * rl:.3f} = {ROCHE_LOBE_CAP:.2f}×largest lobe "
+                         f"over q ∈ [{q_lo}, {q_hi}]; sma={sma:.2f} R⊙)")
 
         # r₂ > r₁ seed: a deep total primary eclipse requires the secondary to be
         # larger than the primary. A symmetric seed consistently fell into the
         # r₁-at-cap attractor (small secondary transiting giant primary → wrong basin).
         r1_seed = 0.17 * sma
-        r2_seed = 0.24 * sma
         bundle.set_value("requiv@primary",   r1_seed)
-        bundle.set_value("requiv@secondary", r2_seed)
-        master_print(f"  [seed] requiv@primary = {r1_seed:.3f} R⊙ (r/a = 0.17), "
-                     f"requiv@secondary = {r2_seed:.3f} R⊙ (r/a = 0.24)  "
-                     f"[r₂/r₁ = 1.41, total-eclipse NM seed]")
+        if "requiv@secondary" in free_params:
+            r2_seed = 0.24 * sma
+            bundle.set_value("requiv@secondary", r2_seed)
+            master_print(f"  [seed] requiv@primary = {r1_seed:.3f} R⊙ (r/a = 0.17), "
+                         f"requiv@secondary = {r2_seed:.3f} R⊙ (r/a = 0.24)  "
+                         f"[r₂/r₁ = 1.41, total-eclipse NM seed]")
+        else:
+            r2_lobe = bundle.get_value("requiv", component="secondary", context="component")
+            master_print(f"  [seed] requiv@primary = {r1_seed:.3f} R⊙ (r/a = 0.17); "
+                         f"requiv@secondary = {r2_lobe:.3f} R⊙ (= Roche lobe, constrained)")
 
     # Third-light optimisation for BD And — TESS's coarse pixel scale (~21"/px)
     # makes contamination from nearby field stars a realistic systematic for this
@@ -908,26 +1018,9 @@ def prepare_bundle_for_mcmc(
 
     bundle.add_distribution(prior_distributions, distribution="my_priors")
 
-    # Bug E fix: component-coupled pblum does not auto-scale model flux to the
-    # data. The bundle's pblum@primary was tuned for dataset-scaled; adding the
-    # secondary's physical luminosity on top makes the combined model ~10% too
-    # bright. NM compensates by collapsing r₂ → zero. One forward model at the
-    # seed point gives the exact factor needed to correct pblum@primary before NM.
-    if not resolve_morphology(star_name, variable_type):
-        try:
-            bundle.run_compute(model="pblum_norm", overwrite=True)
-            model_f = bundle.get_value("fluxes", dataset="lc01", model="pblum_norm")
-            data_f  = bundle.get_value("fluxes", dataset="lc01", context="dataset")
-            scale   = float(np.mean(data_f) / np.mean(model_f))
-            pblum0  = bundle.get_value("pblum", component="primary",
-                                       dataset="lc01", context="dataset")
-            bundle.set_value("pblum", component="primary",
-                             dataset="lc01", value=pblum0 * scale)
-            master_print(f"  [pblum_norm] pblum@primary ×{scale:.4f}  "
-                         f"(model mean {np.mean(model_f):.4f} → "
-                         f"data mean {np.mean(data_f):.4f})")
-        except Exception as _pn_err:
-            master_print(f"  [pblum_norm warning] {_pn_err} — skipping.")
+    # (The former "Bug E" pblum@primary rescale at the seed is gone: with
+    # dataset-scaled luminosities for every morphology the flux level is fitted at
+    # every step — see 5B.)
 
     # ── 5E: STAGE 1 — NELDER-MEAD PRE-WASH ──────────────────────────────────
     master_print(f"\n  [Stage 1] Nelder-Mead simplex pre-wash (max {NM_MAXITER} iterations)...")
@@ -949,7 +1042,13 @@ def prepare_bundle_for_mcmc(
         bundle.run_solver("nm_solver", solution="nm_solution", overwrite=True)
         last_nm_seconds = time.time() - _nm_t0
         bundle.adopt_solution("nm_solution", adopt_values=True)
-        master_print("  Nelder-Mead converged — adopted as MCMC starting point.")
+        try:
+            _nm_ok  = bool(bundle.get_value("success", solution="nm_solution"))
+            _nm_msg = str(bundle.get_value("message", solution="nm_solution"))
+        except Exception:
+            _nm_ok, _nm_msg = None, "status unavailable"
+        _nm_state = {True: "converged", False: "did NOT converge", None: "finished"}[_nm_ok]
+        master_print(f"  Nelder-Mead {_nm_state} ({_nm_msg}) — adopted as MCMC starting point.")
     except Exception as nm_error:
         master_print(f"  [NM warning] Pre-wash failed: {nm_error}. Using initial guess.")
 
@@ -1009,6 +1108,102 @@ def prepare_bundle_for_mcmc(
     return bundle, free_params, is_contact_binary, n_free_params
 
 
+# Stars whose TESS aperture holds a VARIABLE neighbour that PDCSAP's constant
+# crowding correction cannot remove (Entry 76: BW Dra and BV Dra, 16.05″ apart,
+# each carrying the other's eclipses at its P/2). Kept in the sample by decision
+# and FLAGGED in every results file.
+VARIABLE_BLENDS: dict[str, str] = {
+    "BW Dra": "blended_with_variable_neighbour:BV Dra (16 arcsec)",
+    "BV Dra": "blended_with_variable_neighbour:BW Dra (16 arcsec)",
+}
+
+
+# Pre-audit results KEPT by decision (Pipeline_Log Entry 78): fold-smearing cost
+# them < 3 % of light-curve amplitude (Audits/kept_results_caveats.csv), so they
+# are documented rather than refitted. Without this list the Entry-77 skip rule
+# would supersede and refit them, because they carry no input_bundle_sha row.
+KEEP_PRE_AUDIT_RESULTS: frozenset = frozenset({
+    "BO CVn", "DF Hya", "EF Cep", "EF Dra", "FP Boo", "FU Dra", "GQ Cnc", "HI Pup",
+    "II UMa", "NU Cyg", "RT Hyi", "RW Dor", "TY Men", "TY UMa", "V1044 Her",
+    "V1055 Her", "V1128 Tau", "V1918 Cyg", "V776 Cas", "V842 Her", "VW Cep", "Y Sex",
+})
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def acquire_star_lock(safe_name: str) -> tuple[bool, str]:
+    """
+    Claim a star for THIS Script-05 process (rank 0) with an exclusive lock file
+    data/bundles/bundle_<star>.lock holding "<host>:<pid>". Lets two or more queues
+    run from the same catalogue (the "dynamic -n" mode, Entry 78): each queue
+    skips stars another live queue holds. A lock left by a dead process on this
+    host (crash, segfault, Ctrl-C) is taken over. Returns (acquired, holder).
+    """
+    import socket
+    path = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}.lock")
+    me = f"{socket.gethostname()}:{os.getpid()}"
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, me.encode())
+            os.close(fd)
+            return True, me
+        except FileExistsError:
+            try:
+                holder = open(path, encoding="utf-8").read().strip()
+                host, pid = holder.rsplit(":", 1)
+                pid = int(pid)
+            except (OSError, ValueError):
+                holder, host, pid = "unreadable", "", 0
+            if host == socket.gethostname() and not _pid_alive(pid):
+                try:
+                    os.remove(path)          # stale lock from a dead process
+                except OSError:
+                    pass
+                continue
+            return False, holder
+    return False, "race"
+
+
+def release_star_lock(safe_name: str) -> None:
+    """Remove the star's lock if (and only if) this process holds it."""
+    import socket
+    path = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}.lock")
+    try:
+        if open(path, encoding="utf-8").read().strip() == f"{socket.gethostname()}:{os.getpid()}":
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def phoebe_light_curve_flags(safe_name: str) -> dict:
+    """FLUXSRC / CROWDSAP from the Script 02 clean-FITS header, plus data flags."""
+    from astropy.io import fits as _fits
+    out = {"flags": []}
+    star = safe_name.replace("_", " ")
+    if star in VARIABLE_BLENDS:
+        out["flags"].append(VARIABLE_BLENDS[star])
+    path = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_clean.fits")
+    with _fits.open(path) as hdul:
+        for hdu in hdul[:2]:
+            for key in ("FLUXSRC", "CROWDSAP", "SECTOR"):
+                if key in hdu.header and key not in out:
+                    out[key] = hdu.header[key]
+    if out.get("FLUXSRC") == "SAP_CROWDCORR":
+        out["flags"].append("SAP_flux_PDC_distorted")
+    return out
+
+
 # =============================================================================
 # SECTION 4 — TARGET LIST
 # =============================================================================
@@ -1059,6 +1254,7 @@ run_tracker.record_provenance(
         "phoebe": phoebe.__version__, "emcee": emcee.__version__,
     },
     code_files=[os.path.abspath(__file__), runstats.__file__, paths.__file__,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "morphology.py"),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "Audits",
                              "audit_mcmc_chains.py")],
 )
@@ -1066,16 +1262,33 @@ run_tracker.record_provenance(
 # For the batch ETA (5F): which targets still lack a results file at launch. Counted
 # once; a star finished during this run is always earlier in the list than the one
 # being estimated, so it is never double-counted.
-target_pending = [
-    not os.path.exists(os.path.join(paths.RESULTS_DIR,
-                                    f"results_{t['name'].replace(' ', '_')}.csv"))
-    for t in target_list
-]
+def _is_complete(name: str) -> bool:
+    """Results exist AND were fitted from the current input bundle (see the skip rule)."""
+    safe = name.replace(" ", "_")
+    res = os.path.join(paths.RESULTS_DIR, f"results_{safe}.csv")
+    if not os.path.exists(res):
+        return False
+    if name in KEEP_PRE_AUDIT_RESULTS:
+        return True
+    recorded = read_results_meta(res).get("input_bundle_sha", "")
+    return bool(recorded) and recorded == file_sha(os.path.join(paths.BUNDLE_DIR, f"bundle_{safe}.phoebe"))
+
+
+target_pending = [not _is_complete(t["name"]) for t in target_list]
+
+# Per-star locks (see acquire_star_lock): the lock held for the current star is
+# released when the loop moves on, and at exit whatever the exit path.
+_held_lock: list = []
+if mpi_rank == 0:
+    import atexit
+    atexit.register(lambda: [release_star_lock(n) for n in list(_held_lock)])
 
 for target_index, target in enumerate(target_list):
     star_name     = target["name"]
     variable_type = target["type"]
     safe_name     = star_name.replace(" ", "_")
+    while _held_lock:
+        release_star_lock(_held_lock.pop())
     run_tracker.star_start(star_name)
     star_t0         = time.time()
     star_audit      = None
@@ -1091,13 +1304,72 @@ for target_index, target in enumerate(target_list):
     mcmc_checkpoint = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}_mcmc.phoebe")
     results_path    = os.path.join(paths.RESULTS_DIR, f"results_{safe_name}.csv")
 
-    # Idempotent re-runs: a completed target (results file present) is skipped, so
-    # an interrupted batch can simply be relaunched with the same command and will
-    # pick up where it stopped.
-    if os.path.exists(results_path):
-        master_print(f"  [skip] {results_path} already exists — target complete.")
-        run_tracker.star_end(star_name, "skipped", reason="results already exist")
+    # Idempotent re-runs: a completed target is skipped, so an interrupted batch can
+    # simply be relaunched with the same command and will pick up where it stopped.
+    # "Completed" now means the results file exists AND was fitted from the CURRENT
+    # input bundle (its input_bundle_sha row matches bundle_<star>.phoebe). A results
+    # file from an older bundle, or one without the row (every pre-2026-10 result),
+    # is renamed *_superseded_<date>.csv and the star is refitted (Entry 76: before
+    # this, a rebuilt bundle was never refitted).
+    if star_name in KEEP_PRE_AUDIT_RESULTS and os.path.exists(results_path):
+        master_print(f"  [keep] {results_path} is a pre-audit result KEPT by decision "
+                     "(Pipeline_Log Entry 78) — not refitted.")
+        run_tracker.star_end(star_name, "skipped", reason="kept pre-audit result (Entry 78)")
         continue
+
+    # Claim the star before touching its results or checkpoint, so a second queue
+    # running the same catalogue can never resume, supersede or refit a star this
+    # queue is fitting (Entry 78, dynamic -n mode).
+    if mpi_rank == 0:
+        _got, _holder = acquire_star_lock(safe_name)
+        if not _got:
+            master_print(f"  [skip] {star_name} is being fitted by another queue ({_holder}).")
+            run_tracker.star_end(star_name, "skipped", reason=f"locked by {_holder}")
+            continue
+        _held_lock.append(safe_name)
+
+    input_sha = file_sha(bundle_path)
+    if os.path.exists(results_path):
+        recorded = read_results_meta(results_path).get("input_bundle_sha", "")
+        if recorded and recorded == input_sha:
+            master_print(f"  [skip] {results_path} exists and matches the current bundle "
+                         f"({input_sha}) — target complete.")
+            run_tracker.star_end(star_name, "skipped", reason="results already exist")
+            continue
+        _stamp = time.strftime('%Y%m%d')
+        superseded = results_path.replace(".csv", f"_superseded_{_stamp}.csv")
+        # The old FINAL bundle holds the old posterior chain (the expensive part) and
+        # would be overwritten by this refit — keep it, and the old final plot, under
+        # the same suffix (blast radius; cf. the V899 Her incident, Entry 58).
+        _old_final = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}_final.phoebe")
+        _old_plot  = os.path.join(paths.PLOT_FINAL_DIR, f"phoebe_final_{safe_name}.png")
+        if mpi_rank == 0:
+            os.replace(results_path, superseded)
+            for _src in (_old_final, _old_plot):
+                if os.path.exists(_src):
+                    _root, _ext = os.path.splitext(_src)
+                    os.replace(_src, f"{_root}_superseded_{_stamp}{_ext}")
+        master_print(f"  [refit] {results_path} was fitted from "
+                     f"{'bundle ' + recorded if recorded else 'an unrecorded (pre-2026-10) bundle'}; "
+                     f"current bundle is {input_sha}. Old results, final bundle and plot kept "
+                     f"with suffix _superseded_{_stamp}.")
+
+    # A checkpoint is only resumable if it was started from the current bundle
+    # (sidecar <checkpoint>.input_sha written at the fresh start); otherwise it is
+    # set aside and the star starts fresh.
+    sidecar = mcmc_checkpoint + ".input_sha"
+    if os.path.exists(mcmc_checkpoint):
+        try:
+            started_from = open(sidecar, encoding="utf-8").read().strip()
+        except OSError:
+            started_from = ""
+        if started_from != input_sha:
+            stale = mcmc_checkpoint.replace(".phoebe", f"_stale_{time.strftime('%Y%m%d')}.phoebe")
+            if mpi_rank == 0:
+                os.replace(mcmc_checkpoint, stale)
+            master_print(f"  [resume] checkpoint was started from "
+                         f"{'bundle ' + started_from if started_from else 'an unrecorded bundle'}, "
+                         f"not the current {input_sha} — set aside as {stale}; starting fresh.")
 
     resuming = os.path.exists(mcmc_checkpoint)
     if resuming:
@@ -1121,6 +1393,9 @@ for target_index, target in enumerate(target_list):
             run_tracker.star_end(star_name, "skipped", reason="bundle not found")
             continue
         bundle, free_params, is_contact_binary, n_free_params = prepared
+        if mpi_rank == 0:
+            with open(sidecar, "w", encoding="utf-8") as fh:
+                fh.write(input_sha + "\n")
 
     # ── 5F: STAGE 2 — CHUNKED MCMC WITH CHECKPOINTING ────────────────────────
     # Run the sampler in MCMC_CHECKPOINT_NITERS-sized chunks, saving the bundle
@@ -1182,7 +1457,11 @@ for target_index, target in enumerate(target_list):
             run_tracker.count_error("MCMC error")
             break
 
-        bundle.save(mcmc_checkpoint)
+        # Atomic save: write a temporary file and rename it over the checkpoint, so
+        # a crash mid-write can never leave a truncated checkpoint behind.
+        _tmp_checkpoint = mcmc_checkpoint + ".tmp"
+        bundle.save(_tmp_checkpoint)
+        os.replace(_tmp_checkpoint, mcmc_checkpoint)
         done = completed_iterations(bundle, "best_solution")
         master_print(f"  [checkpoint] {done}/{MCMC_MAX_NITERS} iters saved → {mcmc_checkpoint}")
 
@@ -1268,15 +1547,13 @@ for target_index, target in enumerate(target_list):
     # ── 5G: AUTOCORRELATION CONVERGENCE DIAGNOSTICS ───────────────────────────
     master_print("\n  [5G] Convergence diagnostics — Integrated Autocorrelation Time τ...")
     try:
-        raw_chains = np.asarray(bundle.get_value("samples", solution="best_solution"))
-        # emcee.autocorr.integrated_time wants time on axis 0, which is exactly
-        # PHOEBE's native (n_steps, n_walkers, n_params) layout — so it is passed
-        # straight through. (An earlier np.swapaxes here put walkers on axis 0 and
-        # corrupted τ.) Guard only against a transposed layout.
-        if raw_chains.ndim == 3 and raw_chains.shape[0] == MCMC_N_WALKERS \
-                and raw_chains.shape[1] != MCMC_N_WALKERS:
-            raw_chains = np.swapaxes(raw_chains, 0, 1)
-        tau_values = assess_autocorrelation_convergence(raw_chains)
+        # emcee.autocorr.integrated_time wants time on axis 0 (PHOEBE's native
+        # (n_steps, n_walkers, n_params) layout); steps_first guards a transposed one.
+        raw_chains = steps_first(bundle.get_value("samples", solution="best_solution"))
+        burn_used  = adaptive_burn_in(raw_chains)
+        tau_values = assess_autocorrelation_convergence(raw_chains[burn_used:])
+        master_print(f"  burn-in used: {burn_used} steps "
+                     f"(max({MCMC_BURN_IN_STEPS}, 2·τ_max)); τ measured after it")
 
         master_print(f"  {'Parameter':<40} {'τ (steps)':>12}  {'Status'}")
         master_print("  " + "─" * 70)
@@ -1288,16 +1565,28 @@ for target_index, target in enumerate(target_list):
         master_print(f"  Autocorrelation diagnostic failed: {autocorr_error}")
 
     # ── 5H: ADOPT SOLUTION & FINAL COMPUTE ───────────────────────────────────
-    master_print("\n  [5H] Adopting posterior median into physical parameters...")
+    try:
+        burn_used
+    except NameError:
+        burn_used = MCMC_BURN_IN_STEPS        # τ diagnostic failed above
+    master_print(f"\n  [5H] Adopting posterior median into physical parameters "
+                 f"(burn-in {burn_used})...")
     try:
         bundle.adopt_solution(
             "best_solution",
-            burnin=MCMC_BURN_IN_STEPS,
+            burnin=burn_used,
             adopt_values=True,
             adopt_distributions=True,
         )
     except Exception as adopt_error:
-        master_print(f"  Adoption error: {adopt_error}")
+        # Never write results from a bundle that still holds the Nelder-Mead values
+        # with posterior σ attached (Entry 76): fail the star instead.
+        master_print(f"  Adoption error: {adopt_error} — star NOT written.")
+        run_tracker.star_end(star_name, "failed", reason=f"adopt_solution error: {adopt_error}",
+                             setup_seconds=setup_seconds, nm_seconds=last_nm_seconds,
+                             resumed_from=already, final_steps=done,
+                             steps_this_session=done - already, mcmc_seconds=sum(chunk_seconds))
+        continue
 
     try:
         # Wilson irradiation accounts for the large mutual radiative flux exchange
@@ -1319,8 +1608,35 @@ for target_index, target in enumerate(target_list):
         continue
 
     chi2, chi2_red, n_obs = compute_reduced_chi2(bundle, n_free_params)
-    master_print(f"\n  Final reduced χ² = {chi2_red:.4f}  "
+    master_print(f"\n  Final reduced χ² = {chi2_red:.4f}  at the marginal medians  "
                  f"(N = {n_obs}, dof = {n_obs - n_free_params})")
+
+    # χ² at the maximum-posterior SAMPLE as well: for correlated or railed
+    # parameters the vector of marginal medians can sit off the posterior ridge
+    # and inflate χ² (Entry 76). err_scale uses the smaller (best-fit) value.
+    chi2_red_map = np.nan
+    try:
+        _chain = steps_first(bundle.get_value("samples", solution="best_solution"))
+        _lnp   = np.asarray(bundle.get_value("lnprobabilities", solution="best_solution"), float)
+        if _lnp.shape[0] != _chain.shape[0]:
+            _lnp = _lnp.T
+        _post  = _lnp[burn_used:]
+        _k     = np.unravel_index(np.nanargmax(_post), _post.shape)
+        _best  = _chain[burn_used:][_k[0], _k[1], :]
+        _twigs = list(bundle.get_value("fitted_twigs", solution="best_solution"))
+        _saved = {t: bundle.get_value(t, context=["component", "dataset"]) for t in _twigs}
+        for t, v in zip(_twigs, _best):
+            bundle.set_value(t, context=["component", "dataset"], value=float(v))
+        bundle.run_compute(model="map_model", overwrite=True)
+        _obs = bundle.get_value("fluxes", dataset="lc01", context="dataset")
+        _sig = bundle.get_value("sigmas", dataset="lc01", context="dataset")
+        _syn = bundle.get_value("fluxes", dataset="lc01", model="map_model")
+        chi2_red_map = float(np.sum(((_obs - _syn) / _sig) ** 2) / max(1, len(_obs) - n_free_params))
+        for t, v in _saved.items():
+            bundle.set_value(t, context=["component", "dataset"], value=v)
+        master_print(f"  Reduced χ² at the maximum-posterior sample = {chi2_red_map:.4f}")
+    except Exception as map_error:
+        master_print(f"  [χ² MAP] unavailable: {map_error}")
 
     # ── 5I: GELMAN-RUBIN R̂ CONVERGENCE CHECK ─────────────────────────────────
     # The stop REASON is already printed above ("converged at N" vs "reached
@@ -1349,7 +1665,7 @@ for target_index, target in enumerate(target_list):
         if oriented.ndim == 3 and oriented.shape[0] == MCMC_N_WALKERS \
                 and oriented.shape[1] != MCMC_N_WALKERS:
             oriented = np.swapaxes(oriented, 0, 1)
-        trim = min(MCMC_BURN_IN_STEPS, max(0, oriented.shape[0] - 2))
+        trim = min(burn_used, max(0, oriented.shape[0] - 2))
 
         # Both variants are reported: R̂_full is what this pipeline printed through
         # batch 4 (keeping older run logs comparable), R̂_trim is the honest figure
@@ -1392,7 +1708,7 @@ for target_index, target in enumerate(target_list):
                 bundle.get_value("samples", solution="best_solution"),
                 lnprob,
                 bundle.get_value("fitted_twigs", solution="best_solution"),
-                burn=MCMC_BURN_IN_STEPS,
+                burn=burn_used,
                 chi2_red=chi2_red,
             )
             star_audit = audit
@@ -1411,18 +1727,49 @@ for target_index, target in enumerate(target_list):
 
     # ── 5J: RESULT EXTRACTION ─────────────────────────────────────────────────
     # Summarise the post-burn-in chain first, then attach ±σ to the adopted medians.
-    posterior = compute_posterior_summary(bundle, "best_solution", MCMC_BURN_IN_STEPS)
+    posterior = compute_posterior_summary(bundle, "best_solution", burn_used)
     results   = extract_best_fit_parameters(bundle, free_params, posterior)
+
+    # ── 5J-a: RAILING FLAGS ──────────────────────────────────────────────────
+    # A parameter is RAILED when its median lies within 2 raw σ (or 0.1 % of the
+    # range) of a prior bound: its interval is then truncated by the prior, not
+    # by the data, and must be reported as a limit (Entry 76: V358 Cep i and r₂,
+    # FI Boo T₂/T₁, V857 Her / TV Mus / FN Cam f, GQ Cnc / V1128 Tau i).
+    _sma = bundle.get_value("sma", component="binary", context="component")
+    _t1  = results["T1_K"][0]
+    result_bounds: dict[str, tuple[float, float]] = {}
+    for _key, _twig, _conv in (("T2_K", "teff@secondary", 1.0),
+                               ("T2_over_T1", "teff@secondary", 1.0 / _t1),
+                               ("incl_deg", "incl@binary", 1.0),
+                               ("q", "q@binary", 1.0),
+                               ("fillout_factor", "fillout_factor@contact_envelope", 1.0),
+                               ("r1_frac", "requiv@primary", 1.0 / _sma),
+                               ("r2_frac", "requiv@secondary", 1.0 / _sma)):
+        if _twig in free_params and _key in results:
+            _lo, _hi = prior_bounds(bundle, _twig, free_params[_twig][:2])
+            result_bounds[_key] = (_lo * _conv, _hi * _conv)
+    railed = []
+    for _key, (_lo, _hi) in result_bounds.items():
+        _v, _sm, _sp = results[_key]
+        if not np.isfinite(_v):
+            continue
+        _tol_lo = max(2.0 * (_sm if np.isfinite(_sm) else 0.0), 1e-3 * (_hi - _lo))
+        _tol_hi = max(2.0 * (_sp if np.isfinite(_sp) else 0.0), 1e-3 * (_hi - _lo))
+        if _v - _lo <= _tol_lo:
+            railed.append(f"{_key}@low")
+        elif _hi - _v <= _tol_hi:
+            railed.append(f"{_key}@high")
+    if railed:
+        master_print(f"  [railed] {', '.join(railed)} — interval truncated by the prior; "
+                     "report as a limit.")
 
     # ── 5J-b: MORPHOLOGY PROVENANCE + CONTACT-MODEL VALIDITY FLAG ─────────────
     # morphology_source records WHY the model was contact/detached (GCVS label vs a
     # MORPHOLOGY_OVERRIDE). For contact stars, assess_contact_validity flags whether
     # the fit actually wants to be detached — a heads-up for human review, never an
     # automatic switch. (Runs on rank 0 only, like the rest of this post-run block.)
-    if star_name in MORPHOLOGY_OVERRIDE:
-        morphology_source = "OVERRIDE_" + MORPHOLOGY_OVERRIDE[star_name].strip().upper()
-    else:
-        morphology_source = "GCVS"
+    morphology_src  = morphology_source(star_name)
+    morphology_kind = resolve_morphology_kind(star_name, variable_type)
     if is_contact_binary:
         morphology_flag = assess_contact_validity(bundle)
         if morphology_flag == "RECONSIDER_DETACHED":
@@ -1435,12 +1782,13 @@ for target_index, target in enumerate(target_list):
                          "(flat")
             master_print("  out-of-eclipse) warrants the switch. The detector cannot tell these "
                          "apart.")
-            master_print(f"  If detached: add \"{star_name}\": \"detached\" to MORPHOLOGY_OVERRIDE "
-                         "(04 AND 05),")
+            master_print(f"  If detached: add \"{star_name}\": DETACHED to MORPHOLOGY_OVERRIDE "
+                         "(morphology.py),")
             master_print(f"  re-run Script 04, clear {results_path}, re-run Script 05.")
             master_print("  " + "!" * 72)
     else:
-        morphology_flag = "DETACHED_MODEL"
+        morphology_flag = ("SEMIDETACHED_MODEL" if morphology_kind == SEMIDETACHED
+                           else "DETACHED_MODEL")
 
     master_print("\n  ─── FINAL PARAMETER POSTERIOR ──────────────────────────────")
     for key, (value, sig_minus, sig_plus) in results.items():
@@ -1454,28 +1802,13 @@ for target_index, target in enumerate(target_list):
     # ── 5K: FILE I/O (RANK 0 ONLY) ────────────────────────────────────────────
     # MPI worker ranks must not write files; simultaneous writes would corrupt
     # the output. All I/O is gated on rank 0.
+    # Order matters: the final bundle and plot are written BEFORE the results CSV.
+    # A results file is what marks a star complete, so it must never exist without
+    # its final bundle (before 2026-10 a crash between the two left a results file
+    # with a stale or missing _final, and the star was then skipped forever).
+    err_scale = 1.0
     if mpi_rank == 0:
-        with open(results_path, "w", newline="", encoding="utf-8") as results_file:
-            # Rescale the posterior uncertainties so the reduced χ² is effectively 1.
-            # When the formal photometric errors underestimate unmodelled systematics
-            # (starspots, the O'Connell effect), the raw posterior widths are
-            # unrealistically tight; multiplying them by sqrt(χ²_red) is the standard
-            # correction (Kallrath & Milone 2009). Only inflates (never shrinks).
-            err_scale = (max(1.0, float(np.sqrt(chi2_red)))
-                         if np.isfinite(chi2_red) else 1.0)
-            writer = csv.writer(results_file)
-            writer.writerow(["Parameter", "Symbol", "Value", "Sigma_minus", "Sigma_plus", "Unit"])
-            for key, (value, sig_minus, sig_plus) in results.items():
-                label, unit = PARAM_DISPLAY_LABELS.get(key, (key, ""))
-                sm = sig_minus * err_scale if np.isfinite(sig_minus) else sig_minus
-                sp = sig_plus  * err_scale if np.isfinite(sig_plus)  else sig_plus
-                writer.writerow([label, key, value, sm, sp, unit])
-            writer.writerow(["Reduced chi-squared", "chi2_red", chi2_red, "", "", "—"])
-            writer.writerow(["Error scale (sqrt reduced chi2)", "err_scale", err_scale, "", "", "—"])
-            writer.writerow(["Morphology flag", "morphology_flag", morphology_flag, "", "", "—"])
-            writer.writerow(["Morphology source", "morphology_source", morphology_source, "", "", "—"])
-        master_print(f"\n  Results saved: {results_path}")
-
+        output_ok = False
         try:
             obs_flux  = bundle.get_value("fluxes", dataset="lc01", context="dataset")
             obs_times = bundle.get_value("times",  dataset="lc01", context="dataset")
@@ -1508,7 +1841,7 @@ for target_index, target in enumerate(target_list):
             param_annotation = (
                 f"T₁ = {results['T1_K'][0]:.0f} K  |  "
                 f"T₂ = {t2_val:.0f} K  |  "
-                f"i = {results['incl_deg'][0]:.1f}°"
+                f"i = {results['incl_deg'][0]:.1f}°  |  {morphology_kind}"
             )
             ax_lc.text(0.02, 0.04, param_annotation, transform=ax_lc.transAxes,
                        fontsize=10,
@@ -1532,15 +1865,79 @@ for target_index, target in enumerate(target_list):
             bundle.save(final_bundle_path)
             master_print(f"  Final bundle saved: {final_bundle_path}")
             master_print(f"  Final plot saved:   {plot_path}")
-
-            # Target finished — drop the mid-run checkpoint so a future relaunch
-            # is recognised as complete (via results_<star>.csv) rather than resumed.
-            if os.path.exists(mcmc_checkpoint):
-                os.remove(mcmc_checkpoint)
-
+            output_ok = True
         except Exception as output_error:
             master_print(f"  Could not generate final plot / bundle: {output_error}")
             run_tracker.count_error("final plot/bundle")
+
+        if output_ok:
+            # Rescale the posterior uncertainties so the reduced χ² is effectively 1.
+            # When the formal photometric errors underestimate unmodelled systematics
+            # (starspots, the O'Connell effect), the raw posterior widths are
+            # unrealistically tight; multiplying them by sqrt(χ²_red) is the standard
+            # correction (Kallrath & Milone 2009). Only inflates (never shrinks).
+            # χ²_red here is the BEST-FIT value (maximum-posterior sample when
+            # available, else the marginal-median model).
+            _chi2_for_scale = chi2_red_map if np.isfinite(chi2_red_map) else chi2_red
+            err_scale = (max(1.0, float(np.sqrt(_chi2_for_scale)))
+                         if np.isfinite(_chi2_for_scale) else 1.0)
+            flags = list(railed)
+            clipped = []
+            try:
+                _hdr = phoebe_light_curve_flags(safe_name)
+            except Exception:
+                _hdr = {}
+            flags += _hdr.get("flags", [])
+            if morphology_kind == SEMIDETACHED:
+                flags.append("r2_constrained_to_roche_lobe")
+            with open(results_path, "w", newline="", encoding="utf-8") as results_file:
+                writer = csv.writer(results_file)
+                writer.writerow(["Parameter", "Symbol", "Value", "Sigma_minus", "Sigma_plus", "Unit"])
+                for key, (value, sig_minus, sig_plus) in results.items():
+                    label, unit = PARAM_DISPLAY_LABELS.get(key, (key, ""))
+                    sm = sig_minus * err_scale if np.isfinite(sig_minus) else sig_minus
+                    sp = sig_plus  * err_scale if np.isfinite(sig_plus)  else sig_plus
+                    # Scaled intervals must not cross the prior bounds (they did:
+                    # i up to 90.6°, r₂ past the lobe cap — Entry 76).
+                    if key in result_bounds and np.isfinite(value):
+                        _lo, _hi = result_bounds[key]
+                        if np.isfinite(sm) and value - sm < _lo:
+                            sm = value - _lo
+                            clipped.append(f"{key}-")
+                        if np.isfinite(sp) and value + sp > _hi:
+                            sp = _hi - value
+                            clipped.append(f"{key}+")
+                    writer.writerow([label, key, value, sm, sp, unit])
+                if clipped:
+                    flags.append("interval_clipped_at_bound:" + ",".join(clipped))
+                writer.writerow(["Reduced chi-squared", "chi2_red", chi2_red, "", "", "—"])
+                writer.writerow(["Reduced chi-squared at max-posterior sample", "chi2_red_map",
+                                 chi2_red_map, "", "", "—"])
+                writer.writerow(["Error scale (sqrt best-fit reduced chi2)", "err_scale",
+                                 err_scale, "", "", "—"])
+                writer.writerow(["Morphology flag", "morphology_flag", morphology_flag, "", "", "—"])
+                writer.writerow(["Morphology source", "morphology_source", morphology_src, "", "", "—"])
+                writer.writerow(["Morphology", "morphology", morphology_kind, "", "", "—"])
+                # Provenance (Entry 76): which code, input and chain produced this row.
+                writer.writerow(["Run id", "run_id", run_tracker.run_id, "", "", "—"])
+                writer.writerow(["Code sha", "code_sha", run_tracker.code_sha, "", "", "—"])
+                writer.writerow(["Input bundle sha", "input_bundle_sha", input_sha, "", "", "—"])
+                writer.writerow(["Chain steps", "steps", done, "", "", "—"])
+                writer.writerow(["Burn-in steps", "burn_in", burn_used, "", "", "—"])
+                writer.writerow(["Stop reason", "stop_reason", _stop_reason, "", "", "—"])
+                writer.writerow(["Flux source", "flux_source", _hdr.get("FLUXSRC", ""), "", "", "—"])
+                writer.writerow(["Flags", "flags", "; ".join(flags), "", "", "—"])
+            master_print(f"\n  Results saved: {results_path}"
+                         + (f"  [flags: {'; '.join(flags)}]" if flags else ""))
+
+            # Target finished — drop the mid-run checkpoint (and its sidecar) so a
+            # future relaunch is recognised as complete rather than resumed.
+            for _f in (mcmc_checkpoint, sidecar):
+                if os.path.exists(_f):
+                    os.remove(_f)
+        else:
+            master_print("  Results NOT written (final bundle/plot failed); the checkpoint is "
+                         "kept, so a relaunch resumes and retries.")
 
     # ── 5L: PER-STAR TIMING ROW (Runs/run_stats/05Optimization_stars.csv) ─────
     # s_per_iter covers only steps run in THIS session (a resumed star's earlier
@@ -1565,7 +1962,7 @@ for target_index, target in enumerate(target_list):
         chunk_max_s=max(chunk_seconds) if chunk_seconds else "",
         chunk_last_s=chunk_seconds[-1] if chunk_seconds else "",
         stop_reason=_stop_reason, chi2_red=chi2_red,
-        err_scale=(max(1.0, float(np.sqrt(chi2_red))) if np.isfinite(chi2_red) else 1.0),
+        err_scale=err_scale,
         median_accept=star_audit["median_accept"] if star_audit else "",
         min_accept=star_audit["min_accept"] if star_audit else "",
         failed_models=_failed_n, failed_frac=_failed_frac, failed_top_reason=_failed_top,

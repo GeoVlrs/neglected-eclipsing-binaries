@@ -19,8 +19,16 @@ Inputs:
 
     An optional target catalogue may be passed as the first CLI argument
     (e.g. Targets/neglected_targets_batch1.csv); its 'name' column then defines
-    which targets appear in the table and in what order. With no argument, the
-    original Andromeda cohort is used for backward compatibility.
+    which targets appear in the table and in what order. With no argument, every
+    star in Targets/neglected_targets_batch*.csv is listed, in catalogue order.
+
+    Since the 2026-10 pipeline audit (Pipeline_Log Entry 76) the table states
+    what each number IS, not only its value:
+      * fixed parameters (T1 always; q for contact stars) are marked as fixed;
+      * the morphology (C contact, D detached, SD semi-detached) is a column;
+      * χ²ν and a Notes column carry the stop reason, prior railing, blends,
+        SAP flux, interval clipping, and whether the row is a PRE-AUDIT result
+        (no provenance rows) that the corrected pipeline has yet to replace.
 
 Outputs:
     Prints the complete LaTeX table block to stdout. Redirect to a .tex file and
@@ -75,6 +83,7 @@ def read_results_file(star_name: str) -> Optional[dict[str, tuple[float, float, 
         return None
 
     data: dict[str, tuple[float, float, float]] = {}
+    text: dict[str, str] = {}
     with open(results_path, "r", encoding="utf-8") as results_file:
         reader = csv.reader(results_file)
         header = next(reader, None)  # skip header row
@@ -92,7 +101,9 @@ def read_results_file(star_name: str) -> Optional[dict[str, tuple[float, float, 
             else:
                 sigma_minus = sigma_plus = float("nan")
             data[symbol] = (value, sigma_minus, sigma_plus)
+            text[symbol] = row[2]           # raw cell, for the non-numeric rows
 
+    data["_text"] = text                     # type: ignore[assignment]
     return data
 
 
@@ -126,14 +137,55 @@ def format_with_uncertainty(
 
 
 def load_target_names(catalog_path: Optional[str]) -> list[str]:
-    """Read target names from a catalogue CSV, or fall back to the And cohort."""
-    if not catalog_path:
-        return ["WZ And", "AA And", "AB And", "AD And", "BD And"]
+    """Target names from a catalogue CSV, or from every batch catalogue in order."""
+    import glob
+    paths_in = ([catalog_path] if catalog_path else
+                sorted(glob.glob(os.path.join(paths.TARGETS_DIR, "neglected_targets_batch[0-9].csv"))))
     names: list[str] = []
-    with open(catalog_path, newline="", encoding="utf-8") as csv_file:
-        for row in csv.DictReader(csv_file):
-            names.append(row["name"])
+    for path in paths_in:
+        with open(path, newline="", encoding="utf-8-sig") as csv_file:
+            for row in csv.DictReader(csv_file):
+                if row["name"] not in names:
+                    names.append(row["name"])
     return names
+
+
+# Footnote letters for the Notes column (defined once in the table caption).
+NOTE_LETTERS = {
+    # After Phase E the only pre-audit rows left are the 22 KEPT stars (Entry 78):
+    # their smeared fold cost < 3 % of the light-curve amplitude (per-star values in
+    # Audits/kept_results_caveats.csv). Before Phase E finishes, re-run stars also
+    # carry this note until their new results replace them.
+    "pre_audit":  ("a", "pre-audit pipeline (Entry 76): folded at a slightly wrong "
+                        "period, costing $<3$\\,\\% of the light-curve amplitude; "
+                        "kept and documented (Entry 78)"),
+    "ceiling":    ("b", "MCMC stopped at the step ceiling; the $50\\tau$ gate was not met"),
+    "railed":     ("c", "posterior railed at a prior bound; quoted interval is a limit"),
+    "blend":      ("d", "blended with a variable neighbour (BW/BV Dra, 16\\arcsec)"),
+    "sap":        ("e", "SAP flux (PDCSAP distorted every sector)"),
+    "clipped":    ("f", "error-scaled interval clipped at a prior bound"),
+}
+MORPH_SHORT = {"contact": "C", "detached": "D", "semidetached": "SD"}
+
+
+def notes_for(data: dict) -> list[str]:
+    """Footnote keys that apply to one results file."""
+    text = data.get("_text", {})
+    flags = text.get("flags", "")
+    keys = []
+    if "input_bundle_sha" not in text:
+        keys.append("pre_audit")
+    if "ceiling" in text.get("stop_reason", ""):
+        keys.append("ceiling")
+    if "@low" in flags or "@high" in flags:
+        keys.append("railed")
+    if "blended_with_variable_neighbour" in flags:
+        keys.append("blend")
+    if "SAP_flux" in flags or text.get("flux_source", "") == "SAP_CROWDCORR":
+        keys.append("sap")
+    if "interval_clipped_at_bound" in flags:
+        keys.append("clipped")
+    return keys
 
 
 def render_latex_results_table(target_names: list[str]) -> None:
@@ -141,37 +193,71 @@ def render_latex_results_table(target_names: list[str]) -> None:
     Print a complete LaTeX table of derived parameters for all target systems.
 
     Columns:
-        Target | T₁ (K) | T₂ (K) | i (°) | q (m₂/m₁)
+        Target | Model | T₁ (K, fixed) | T₂ (K) | i (°) | q | f  or  r₁, r₂ | χ²ν | Notes
 
-    Values carry their asymmetric 1σ MCMC uncertainties where available. A
-    "[Pending Optimization]" placeholder spans the data columns for any target
-    whose Script 05 results file does not yet exist.
+    Values carry their asymmetric 1σ MCMC uncertainties (already multiplied by
+    err_scale in the results file). q is FIXED at 0.5 for contact stars and is
+    printed with a dagger; T₁ is always fixed (Gaia DR3 or the period-colour
+    estimate). A "[Pending Optimization]" placeholder spans the data columns
+    for any target whose Script 05 results file does not yet exist.
     """
+    used_notes: list[str] = []
+    rows: list[str] = []
+    for star_name in target_names:
+        parameter_data = read_results_file(star_name)
+        if parameter_data is None:
+            rows.append(fr"{star_name} & \multicolumn{{8}}{{c}}{{[Pending Optimization]}} \\")
+            continue
+        text  = parameter_data.get("_text", {})
+        morph = text.get("morphology", "")
+        if not morph:   # pre-audit files: infer from the parameters present
+            morph = "contact" if "fillout_factor" in parameter_data else "detached"
+        t1_cell   = format_with_uncertainty(parameter_data.get("T1_K"),     decimals=0)
+        t2_cell   = format_with_uncertainty(parameter_data.get("T2_K"),     decimals=0)
+        incl_cell = format_with_uncertainty(parameter_data.get("incl_deg"), decimals=1)
+        q_entry   = parameter_data.get("q")
+        q_fixed   = q_entry is not None and (math.isnan(q_entry[1]) or q_entry[1] == 0.0)
+        q_cell    = format_with_uncertainty(q_entry, decimals=3)
+        if q_fixed and q_cell != "--":
+            q_cell = q_cell[:-1] + r"^{\dagger}$"
+        if morph == "contact":
+            geom_cell = format_with_uncertainty(parameter_data.get("fillout_factor"), decimals=3)
+        else:
+            r1 = format_with_uncertainty(parameter_data.get("r1_frac"), decimals=4)
+            r2 = format_with_uncertainty(parameter_data.get("r2_frac"), decimals=4)
+            if morph == "semidetached":
+                r2 = r2[:-1] + r"^{\ddagger}$" if r2 != "--" else r2
+            geom_cell = f"{r1}, {r2}"
+        chi2 = parameter_data.get("chi2_red", (float("nan"),))[0]
+        chi2_cell = "--" if math.isnan(chi2) else f"{chi2:.2f}"
+        keys = notes_for(parameter_data)
+        for k in keys:
+            if k not in used_notes:
+                used_notes.append(k)
+        notes_cell = ",".join(NOTE_LETTERS[k][0] for k in keys)
+        rows.append(f"{star_name} & {MORPH_SHORT.get(morph, morph)} & {t1_cell} & {t2_cell} & "
+                    f"{incl_cell} & {q_cell} & {geom_cell} & {chi2_cell} & {notes_cell} \\\\")
+
+    legend = "; ".join(f"$^{{{NOTE_LETTERS[k][0]}}}$ {NOTE_LETTERS[k][1]}"
+                       for k in NOTE_LETTERS if k in used_notes)
     print("\n% --- AUTOMATED RESULTS TABLE (generated by GenerateThesisTables.py) ---")
     print(r"\begin{table}[htbp]")
     print(r"\centering")
-    print(r"\sffamily\small")
-    print(r"\caption{Derived Physical and Thermodynamic Parameters}")
+    print(r"\sffamily\scriptsize")
+    print(r"\caption{Derived parameters. Model: C contact, D detached, SD semi-detached. "
+          r"$T_1$ is held fixed; $^{\dagger}$\,fixed (contact $q = 0.5$); "
+          r"$^{\ddagger}$\,set by the Roche-lobe constraint. Uncertainties are 1$\sigma$ "
+          r"MCMC intervals scaled by $\sqrt{\chi^2_\nu}$. Geometry: fill-out $f$ (C) or "
+          r"fractional radii $r_1, r_2$ (D, SD). "
+          + (r"Notes: " + legend + "." if legend else "") + "}")
     print(r"\label{tab:results}")
-    print(r"\begin{tabular}{l c c c c}")
+    print(r"\begin{tabular}{l c c c c c c c l}")
     print(r"\toprule")
-    print(r"Target & $T_1$ (K) & $T_2$ (K) & $i$ ($^\circ$) & $q\ (m_2/m_1)$ \\")
+    print(r"Target & Model & $T_1$ (K) & $T_2$ (K) & $i$ ($^\circ$) & $q$ & $f$ / $r_1, r_2$ "
+          r"& $\chi^2_\nu$ & Notes \\")
     print(r"\midrule")
-
-    for star_name in target_names:
-        parameter_data = read_results_file(star_name)
-
-        if parameter_data is not None:
-            t1_cell   = format_with_uncertainty(parameter_data.get("T1_K"),     decimals=0)
-            t2_cell   = format_with_uncertainty(parameter_data.get("T2_K"),     decimals=0)
-            incl_cell = format_with_uncertainty(parameter_data.get("incl_deg"), decimals=1)
-            q_cell    = format_with_uncertainty(parameter_data.get("q"),        decimals=3)
-            print(f"{star_name} & {t1_cell} & {t2_cell} & {incl_cell} & {q_cell} \\\\")
-        else:
-            # Results not yet available; insert a placeholder spanning the data
-            # columns so the table remains well-formed.
-            print(fr"{star_name} & \multicolumn{{4}}{{c}}{{[Pending Optimization]}} \\")
-
+    for row in rows:
+        print(row)
     print(r"\bottomrule")
     print(r"\end{tabular}")
     print(r"\end{table}")

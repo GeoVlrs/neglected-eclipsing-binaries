@@ -38,6 +38,8 @@ SCRIPTS: list[tuple[Path, Path]] = [
     (CODE / "paths.py",                REPO / "src" / "paths.py"),
     # Run timing / provenance / statistics; every stage and audit does `import runstats`.
     (CODE / "runstats.py",             REPO / "src" / "runstats.py"),
+    # Contact / detached / semi-detached routing shared by 04, 05 and 06 (Entry 76).
+    (CODE / "morphology.py",           REPO / "src" / "morphology.py"),
     (CODE / "01TargetSelection.py",    REPO / "src" / "TargetSelection.py"),
     (CODE / "02DataAcquisition.py",    REPO / "src" / "DataAcquisition.py"),
     (CODE / "03OCAnalysis.py",         REPO / "src" / "OCAnalysis.py"),
@@ -45,8 +47,21 @@ SCRIPTS: list[tuple[Path, Path]] = [
     (CODE / "05Optimization.py",       REPO / "src" / "Optimization.py"),
     (CODE / "06Visualization.py",      REPO / "src" / "Visualization.py"),
     (CODE / "GenerateThesisTables.py", REPO / "src" / "GenerateThesisTables.py"),
-    # Standalone illustration utility, not a numbered pipeline stage.
+    # Standalone illustration utilities, not numbered pipeline stages.
     (CODE / "SchematicRocheGeometry.py", REPO / "src" / "SchematicRocheGeometry.py"),
+    (CODE / "SchematicRocheEquipotentials.py", REPO / "src" / "SchematicRocheEquipotentials.py"),
+    # The operating manual. Written with working-tree names; its section 9 maps them
+    # to the published layout, so it is copied unchanged.
+    (CODE / "HOW_TO.md",               REPO / "HOW_TO.md"),
+]
+
+# Files whose text names a working-tree script that is RENAMED on publication. They
+# are copied with each (old, new) substitution applied, so the published copy calls
+# the published script (e.g. the Stage-05 launcher runs Optimization.py, not
+# 05Optimization.py). The privacy guard applies as for every other file.
+TRANSLATED: list[tuple[Path, Path, list[tuple[str, str]]]] = [
+    (CODE / "run_05_autorestart.sh", REPO / "src" / "run_05_autorestart.sh",
+     [("05Optimization.py", "Optimization.py")]),
 ]
 
 # (source_dir, glob_pattern, destination_dir)
@@ -83,11 +98,32 @@ def _copy(src: Path, dst: Path) -> None:
     print(f"  {src.name}  ->  {dst.relative_to(REPO)}")
 
 
+def _copy_translated(src: Path, dst: Path, substitutions: list[tuple[str, str]]) -> None:
+    """Copy a text file applying literal (old, new) substitutions; keep LF endings."""
+    if not src.exists():
+        print(f"  SKIP (missing): {src}")
+        return
+    if _is_private(src):
+        print(f"  REFUSED (private): {src.name}")
+        return
+    text = src.read_text(encoding="utf-8")
+    for old, new in substitutions:
+        text = text.replace(old, new)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    shutil.copystat(src, dst)
+    subs = ", ".join(f"{o} -> {n}" for o, n in substitutions)
+    print(f"  {src.name}  ->  {dst.relative_to(REPO)}  [translated: {subs}]")
+
+
 def main() -> int:
     print(f"Syncing working tree -> repo\n  CODE: {CODE}\n  REPO: {REPO}\n")
     print("Scripts:")
     for src, dst in SCRIPTS:
         _copy(src, dst)
+    for src, dst, subs in TRANSLATED:
+        _copy_translated(src, dst, subs)
     for src_dir, pattern, dst_dir in GLOBS:
         print(f"\n{src_dir.name}/{pattern}:")
         for src in sorted(src_dir.glob(pattern)):

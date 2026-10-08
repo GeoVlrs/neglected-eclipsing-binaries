@@ -31,3 +31,6 @@ venv/
 
 # Plot output
 plots/
+
+# Office documents are not part of the code release
+*.docx

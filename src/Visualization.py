@@ -160,15 +160,11 @@ FORCE_RERENDER: bool = os.environ.get("FORCE_RERENDER", "0") == "1"
 # SECTION 2 — HELPER FUNCTIONS
 # =============================================================================
 
-def is_contact_morphology(gcvs_type: str) -> bool:
-    """
-    Decide whether a GCVS variability type denotes a contact (overcontact)
-    binary. Qualifier suffixes after a slash or colon are stripped and only
-    the leading code is tested, so "EW/KW", "EW/DW" and "EW:" all classify as
-    contact. Identical to the classifier in Scripts 04 and 05.
-    """
-    leading_code = gcvs_type.split("/")[0].split(":")[0].strip().upper()
-    return leading_code.startswith("EW")
+# Morphology comes from the shared module morphology.py (Scripts 04, 05 and 06
+# alike). This script used to carry its own classifier, which ignored
+# MORPHOLOGY_OVERRIDE and the GCVS physical class, so a star could be rendered
+# with a different irradiation scheme from the one it was fitted with (Entry 76).
+from morphology import resolve_morphology               # noqa: E402
 
 
 def resolve_bundle_state(safe_name: str) -> dict:
@@ -362,9 +358,14 @@ def render_static_png(bundle_path: str, safe_name: str, star_name: str,
 
     bundle = phoebe.load(bundle_path)
     try:
-        components  = compute_mesh_dataset(bundle, [0.0], irrad_method)
-        tmin, tmax  = global_teff_range(bundle, [0.0], components)
-        frame       = extract_mesh_frame(bundle, 0.0, components)
+        # The still is drawn at QUADRATURE (phase 0.25 after the primary eclipse),
+        # where both stars are side by side. It used to be drawn at t = 0 BJD, an
+        # arbitrary orbital phase that differed from star to star (Entry 76).
+        t_still     = (bundle.get_value("t0_supconj@binary")
+                       + 0.25 * orbital_period_of(bundle))
+        components  = compute_mesh_dataset(bundle, [t_still], irrad_method)
+        tmin, tmax  = global_teff_range(bundle, [t_still], components)
+        frame       = extract_mesh_frame(bundle, t_still, components)
         surface     = draw_mesh_frame(figure, frame, tmin, tmax)
         annotate_scene(figure, surface, f"{star_name} ({label})")
         mlab.savefig(out_path, figure=figure)
@@ -392,7 +393,9 @@ def render_orbital_gif(bundle_path: str, safe_name: str, star_name: str,
         bundle = phoebe.load(bundle_path)
         try:
             period     = orbital_period_of(bundle)
-            times      = list(np.linspace(0.0, period, N_FRAMES, endpoint=False))
+            # One cycle starting at the primary eclipse (phase 0), not at t = 0 BJD.
+            t_start    = bundle.get_value("t0_supconj@binary")
+            times      = list(t_start + np.linspace(0.0, period, N_FRAMES, endpoint=False))
             components = compute_mesh_dataset(bundle, times, irrad_method)
             tmin, tmax = global_teff_range(bundle, times, components)
 
@@ -545,7 +548,7 @@ for target in target_list:
     star_name         = target["name"]
     variable_type     = target["type"]
     safe_name         = star_name.replace(" ", "_")
-    is_contact_binary = is_contact_morphology(variable_type)
+    is_contact_binary = resolve_morphology(star_name, variable_type)
     run_tracker.star_start(star_name)
     _rendered_before, _skipped_before = n_rendered, n_skipped
 

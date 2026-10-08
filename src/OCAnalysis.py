@@ -9,16 +9,28 @@ Summary:
 
         1. Kwee–van Woerden (KvW): model-independent geometric method that
            identifies the centre of eclipse symmetry by minimising the
-           residual sum of squares (RSS) between the ascending and descending
-           branches. Preferred for well-sampled eclipses.
+           residual sum of squares between the ascending and descending
+           branches, reflected over a FIXED symmetric range about each trial
+           centre. Preferred for well-sampled eclipses.
 
-        2. Polynomial fallback: fits a degree-4 polynomial to the eclipse
-           bottom and reports its analytic minimum. Used when the KvW window
-           contains too few data points for reliable branch-interleaving.
+        2. Polynomial fallback: fits a parabola to the eclipse bottom (centred
+           times) and reports its vertex. Used when the KvW window has a gap
+           or the KvW minimum is not bracketed.
 
     A refined linear ephemeris (T0_new, P_new) is derived by weighted
-    least-squares fitting of all accepted ToM measurements against the
-    orbital epoch numbers computed from the Kreiner (2004) baseline.
+    least-squares fitting of all accepted ToM measurements against epoch
+    numbers counted from the Kreiner (2004) baseline at HALF-cycle resolution
+    (primary and secondary minima both used, with a separate zero-point for
+    the secondaries). A phase-dispersion check then compares the fold at
+    P_new with the fold at the Kreiner period and reverts to Kreiner if the
+    refined period folds the data worse.
+
+    History (Pipeline_Log Entry 76): before 2026-10 the KvW residual sum was
+    unnormalised over a shrinking mirrored overlap (minimum pulled to the
+    window edge), its σ parabola was fitted on absolute BJD (numerically
+    unresolved), and every ToM was rounded to an INTEGER epoch. P_new was
+    therefore off by 10–510 s for 57 of 60 stars. The replica of that code in
+    Audits/audit_tom_estimator.py documents it.
 
     A three-panel O–C diagram is produced for each target:
         Panel (a) — Global drift over the ~20-year baseline since Kreiner (2004).
@@ -72,15 +84,35 @@ import runstats
 run_tracker = runstats.RunTracker("03OCAnalysis", catalogue=sys.argv[1:],
                                   columns=["n_minima", "n_toms", "period_refined", "period_err"])
 
-# TESS mission time offset: BTJD + offset = BJD.
-# Historical ephemerides (Kreiner 2004) are in HJD; the BJD–HJD difference
-# is <4 s for solar-system targets and is absorbed into T0_new during the fit.
+# TESS mission time offset: BTJD + offset = BJD_TDB.
+# Historical ephemerides (Kreiner 2004) are in HJD(UTC). HJD(UTC) and BJD(TDB)
+# differ by ~65–69 s (mostly the TDB–UTC clock offset). Kreiner's T0 only sets
+# the epoch COUNT here (an absolute O–C at the minute level is not quoted), so
+# the offset is noted rather than corrected.
 TESS_BTJD_TO_BJD_OFFSET: float = 2_457_000.0
 
 # Maximum acceptable formal uncertainty for a ToM measurement (days).
-# 0.015 d ≈ 21 min; chosen to accommodate the higher Poisson scatter
-# inherent to 2-min PDCSAP cadence for faint targets.
+# 0.015 d ≈ 21 min. With the corrected KvW, TESS ToM errors are ~10–60 s, so
+# this only rejects pathological minima (partial eclipses, gaps).
 MAX_TOM_UNCERTAINTY_DAYS: float = 0.015
+
+# KvW reflection: trial centres within ±KVW_REFLECT_HALF_FRAC·P of the candidate
+# and branches reflected over a fixed |dt| ≤ KVW_REFLECT_HALF_FRAC·P. 0.06 P
+# covers the steep part of a contact-binary minimum without reaching the maxima.
+KVW_REFLECT_HALF_FRAC: float = 0.06
+KVW_MIN_POINTS_PER_BRANCH: int = 8
+
+# Smoothing before candidate detection, in TIME (not samples): 30 min, whatever
+# the cadence (120 s, 200 s or 600 s).
+SMOOTH_MINUTES: float = 30.0
+
+# Phase-dispersion self-check (same statistic as Audits/audit_period_fold.py).
+DISPERSION_BINS: int = 100
+# Revert to Kreiner if the refined period's fold is more than 1 % more dispersed.
+# With a working ToM estimator the two periods agree to a few seconds on clean
+# stars, so reverting costs nothing there; a looser 5 % let BW Dra (timings
+# pulled by its blended neighbour BV Dra, Entry 76) keep a period 2.4 % worse.
+DISPERSION_REVERT_TOLERANCE: float = 1.01
 
 
 # =============================================================================
@@ -91,107 +123,59 @@ def compute_tom_kwee_van_woerden(
     time_bjd: np.ndarray,
     flux: np.ndarray,
     t_trial: float,
-    half_window: float = 0.05,
+    reflect_half: float,
+    cadence_days: float,
 ) -> tuple[float, float]:
     """
     Determine the Time of Minimum (ToM) via the Kwee–van Woerden (1956) method.
 
-    The algorithm mirrors the eclipse profile about a trial centre t_test,
-    interpolates the descending branch onto the ascending branch's time grid,
-    and computes the RSS of the per-point flux differences. The t_test that
-    minimises the RSS is adopted as the ToM. This is model-independent: it
-    makes no assumption about the eclipse profile shape.
+    For each trial centre t_c within ±reflect_half of t_trial, the light curve
+    is interpolated at t_c + dt and t_c − dt over a FIXED grid of offsets
+    0 < dt ≤ reflect_half, and the residual S(t_c) = Σ [f(t_c+dt) − f(t_c−dt)]²
+    is formed. Because the reflection range is the same for every t_c, S is
+    comparable across trial centres and its minimum marks the centre of
+    symmetry. A parabola S(x) = A x² + B x + C is fitted around the minimum on
+    CENTRED times x = t − t_k (on absolute BJD the quadratic term is not
+    numerically resolvable), and the ToM is its vertex.
 
-    Uncertainty estimate:
-        A parabola is fit to the RSS trough. Its curvature (the coefficient of
-        the quadratic term 'a') encodes how sharply the RSS rises away from the
-        minimum. The formal error is σ_t = sqrt(RSS_min / (N_pairs × a)).
-
-    Parameters
-    ----------
-    time_bjd:
-        Barycentric Julian Date time array for the full light curve.
-    flux:
-        Normalised flux array (same length as time_bjd).
-    t_trial:
-        Approximate centre of the eclipse (initial guess in BJD).
-    half_window:
-        Half-width of the time window around t_trial (days). Should be
-        slightly larger than the eclipse half-duration.
-
-    Returns
-    -------
-    t_minimum:
-        Best-fit time of minimum (BJD).
-    t_uncertainty:
-        Formal 1σ uncertainty (days); falls back to 1e-4 d if the parabola
-        fit fails.
+    Uncertainty (Kwee & van Woerden 1956):
+        σ² = (4AC − B²) / (4A² (Z − 1)),
+    with Z the number of independent reflected pairs (≈ points per branch).
 
     Raises
     ------
     ValueError:
-        If fewer than 6 data points fall within the eclipse window.
+        If the window has a gap (> 3 cadences) or is not fully covered, if too
+        few points fall on each branch, or if the S minimum is not bracketed
+        inside the trial range (eclipse centre further than reflect_half from
+        the candidate) or the parabola is not convex.
     """
-    in_window = (time_bjd >= t_trial - half_window) & (time_bjd <= t_trial + half_window)
-    t_window  = time_bjd[in_window]
-    f_window  = flux[in_window]
+    w = 2.0 * reflect_half                   # data needed: t_c ± reflect_half, t_c ∈ t_trial ± reflect_half
+    sel = np.abs(time_bjd - t_trial) <= w
+    t, f = time_bjd[sel], flux[sel]
+    n_ref = max(KVW_MIN_POINTS_PER_BRANCH, int(reflect_half / cadence_days))
+    if len(t) < 2 * n_ref:
+        raise ValueError("too few points in the KvW window")
+    if np.max(np.diff(t)) > 3.0 * cadence_days:
+        raise ValueError("gap inside the KvW window")
+    if t.min() > t_trial - w + 2 * cadence_days or t.max() < t_trial + w - 2 * cadence_days:
+        raise ValueError("KvW window not fully covered")
 
-    if len(t_window) < 6:
-        raise ValueError("Fewer than 6 points in eclipse window — KvW unreliable.")
-
-    # Dense trial grid: 500 points across the window gives sub-minute resolution
-    # for typical TESS 2-min cadence data.
-    trial_centres = np.linspace(t_window.min(), t_window.max(), 500)
-    rss_values    = np.zeros(len(trial_centres))
-
-    for idx, t_test in enumerate(trial_centres):
-        dt         = t_window - t_test
-        right_mask = dt >= 0   # ascending branch (t > t_test)
-        left_mask  = dt <  0   # descending branch (t < t_test)
-        dt_right   = dt[right_mask]
-        dt_left    = -dt[left_mask]      # mirror so both run 0 → positive
-        f_right    = f_window[right_mask]
-        f_left     = f_window[left_mask]
-
-        if len(dt_right) < 2 or len(dt_left) < 2:
-            rss_values[idx] = np.inf
-            continue
-
-        # Interpolate the descending branch onto the ascending branch's δt grid.
-        f_left_interp = np.interp(dt_right, dt_left[::-1], f_left[::-1],
-                                  left=np.nan, right=np.nan)
-        valid_pairs   = np.isfinite(f_left_interp)
-        if valid_pairs.sum() < 2:
-            rss_values[idx] = np.inf
-            continue
-
-        rss_values[idx] = np.sum((f_right[valid_pairs] - f_left_interp[valid_pairs]) ** 2)
-
-    best_idx    = np.argmin(rss_values)
-    t_minimum   = trial_centres[best_idx]
-
-    # Fit a parabola to the ±15 points around the RSS minimum to estimate the
-    # curvature and derive the formal timing uncertainty.
-    lo = max(best_idx - 15, 0)
-    hi = min(best_idx + 16, len(trial_centres))
-    finite_mask = np.isfinite(rss_values[lo:hi])
-
-    t_uncertainty = 1e-4  # fallback if parabola fit fails (≈ 9 s)
-    if finite_mask.sum() >= 3:
-        try:
-            parabola_coeffs = np.polyfit(
-                trial_centres[lo:hi][finite_mask],
-                rss_values[lo:hi][finite_mask],
-                2,
-            )
-            curvature = parabola_coeffs[0]  # coefficient of the quadratic term
-            if curvature > 0:
-                n_pairs       = max(1, finite_mask.sum())
-                t_uncertainty = np.sqrt(rss_values[best_idx] / (n_pairs * curvature))
-        except np.linalg.LinAlgError:
-            pass
-
-    return t_minimum, t_uncertainty
+    offsets = np.linspace(cadence_days, reflect_half, n_ref)
+    centres = np.linspace(t_trial - reflect_half, t_trial + reflect_half, 241)
+    s = np.array([np.sum((np.interp(tc + offsets, t, f) - np.interp(tc - offsets, t, f)) ** 2)
+                  for tc in centres])
+    k = int(np.argmin(s))
+    if k < 5 or k > len(centres) - 6:
+        raise ValueError("KvW minimum not bracketed inside the trial range")
+    x = centres[k - 5:k + 6] - centres[k]
+    a, b, c = np.polyfit(x, s[k - 5:k + 6], 2)
+    if a <= 0:
+        raise ValueError("KvW residual parabola not convex")
+    t_minimum = centres[k] - b / (2.0 * a)
+    variance = (4.0 * a * c - b * b) / (4.0 * a * a * (n_ref - 1))
+    t_uncertainty = float(np.sqrt(variance)) if variance > 0 else float(cadence_days)
+    return float(t_minimum), t_uncertainty
 
 
 # =============================================================================
@@ -202,68 +186,36 @@ def compute_tom_polynomial_fallback(
     time_bjd: np.ndarray,
     flux: np.ndarray,
     t_trial: float,
-    half_window: float = 0.05,
-    polynomial_degree: int = 4,
+    half_window: float,
 ) -> tuple[float, float]:
     """
-    Determine the ToM by fitting a polynomial to the eclipse bottom.
+    Determine the ToM from a parabola fitted to the eclipse bottom.
 
-    This fallback is invoked when the KvW window contains too few data points
-    for reliable branch-interleaving (fewer than 6 points). A degree-4
-    polynomial is appropriate for typical smooth eclipse profiles without
-    significant starspot contamination.
-
-    Uncertainty estimate:
-        σ_t = RMS_residuals / curvature, where curvature is the second
-        derivative of the fitted polynomial at its minimum. A steeply
-        curved, low-scatter eclipse yields a small uncertainty; a shallow
-        eclipse with high scatter yields a large one.
-
-    Parameters
-    ----------
-    time_bjd, flux:
-        Full light-curve arrays.
-    t_trial:
-        Approximate eclipse centre (BJD).
-    half_window:
-        Half-width of fitting window (days).
-    polynomial_degree:
-        Degree of the fitted polynomial (default 4).
-
-    Returns
-    -------
-    t_minimum, t_uncertainty:
-        Best-fit ToM (BJD) and formal 1σ uncertainty (days).
+    Used when KvW raises (gap in its window, minimum not bracketed). The
+    parabola is fitted on times centred on t_trial within ±half_window; the
+    ToM is its vertex −b/2a and σ comes from propagating the fit covariance
+    (scaled by the residual scatter) through the vertex formula.
 
     Raises
     ------
     ValueError:
-        If the window contains fewer than (degree + 2) data points.
+        If fewer than 8 points fall in the window, the parabola is not convex,
+        or the vertex lies outside the window.
     """
-    in_window = (time_bjd >= t_trial - half_window) & (time_bjd <= t_trial + half_window)
-    t_window  = time_bjd[in_window]
-    f_window  = flux[in_window]
-
-    if len(t_window) < polynomial_degree + 2:
-        raise ValueError("Insufficient data points for polynomial fit.")
-
-    # Centre the time axis on t_trial to improve numerical conditioning of the
-    # polynomial fit (avoids catastrophic cancellation for large BJD values).
-    t_centred    = t_window - t_trial
-    poly_coeffs  = np.polyfit(t_centred, f_window, polynomial_degree)
-    poly_func    = np.poly1d(poly_coeffs)
-
-    t_fine_centred = np.linspace(t_centred.min(), t_centred.max(), 10_000)
-    f_fine         = poly_func(t_fine_centred)
-    t_minimum      = t_trial + t_fine_centred[np.argmin(f_fine)]
-
-    residuals     = f_window - poly_func(t_centred)
-    rms_residuals = np.std(residuals)
-    poly_deriv2   = np.polyder(poly_func, 2)
-    curvature     = abs(float(poly_deriv2(t_fine_centred[np.argmin(f_fine)])))
-    t_uncertainty = rms_residuals / curvature if curvature > 0 else 1e-4
-
-    return t_minimum, t_uncertainty
+    sel = np.abs(time_bjd - t_trial) <= half_window
+    x, f = time_bjd[sel] - t_trial, flux[sel]
+    if len(x) < 8:
+        raise ValueError("insufficient points for the parabola fallback")
+    (a, b, c), cov = np.polyfit(x, f, 2, cov=True)
+    if a <= 0:
+        raise ValueError("fallback parabola not convex")
+    x_min = -b / (2.0 * a)
+    if abs(x_min) > half_window:
+        raise ValueError("fallback vertex outside the window")
+    # σ(x_min)² = J Σ Jᵀ with J = ∂x_min/∂(a, b) = (b/(2a²), −1/(2a))
+    jac = np.array([b / (2.0 * a * a), -1.0 / (2.0 * a)])
+    var = float(jac @ cov[:2, :2] @ jac)
+    return float(t_trial + x_min), float(np.sqrt(var)) if var > 0 else float(np.nan)
 
 
 # =============================================================================
@@ -275,52 +227,38 @@ def compute_oc_residuals(
     t_observed_err: np.ndarray,
     t0_kreiner: float,
     period_kreiner: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute O–C (Observed minus Calculated) residuals against Kreiner (2004).
 
-    The orbital epoch E for each observed minimum is the integer cycle count
-    elapsed since the Kreiner (2004) reference epoch T0_kreiner:
-        E = round((T_obs − T0_kreiner) / P_kreiner)
-
-    A cycle-jump guard checks whether the fractional residual exceeds 0.25
-    phase units, and if so, reassigns the epoch to the neighbouring integer
-    that minimises the residual — preventing ±1-cycle aliasing.
-
-    Parameters
-    ----------
-    t_observed_bjd:
-        Array of observed ToM values (BJD).
-    t_observed_err:
-        Array of formal ToM uncertainties (days).
-    t0_kreiner:
-        Kreiner (2004) reference epoch (HJD; BJD–HJD offset absorbed in fit).
-    period_kreiner:
-        Kreiner (2004) orbital period (days).
+    Epochs are assigned at HALF-cycle resolution,
+        E = round(2 (T_obs − T0_kreiner) / P_kreiner) / 2,
+    because both primary (integer E) and secondary (half-integer E) minima are
+    timed. (Rounding every ToM to an integer — the pre-2026-10 behaviour —
+    put each secondary ±P/2 off and biased the refined period; Entry 76.)
 
     Returns
     -------
     epoch_numbers:
-        Integer orbital epoch E for each observed ToM.
+        Epoch E (float; integer for primaries, half-integer for secondaries).
     oc_days:
-        O–C residuals in days (T_obs − T_calc).
+        O–C residuals in days (T_obs − T0_kreiner − P_kreiner·E).
     oc_uncertainties:
-        Propagated uncertainties (equal to t_observed_err at this stage).
+        Per-ToM uncertainties (days).
+    is_secondary:
+        True where E is half-integer.
     """
-    fractional_epochs = (t_observed_bjd - t0_kreiner) / period_kreiner
-    epoch_numbers     = np.round(fractional_epochs).astype(int)
-
-    # Guard against ±1-cycle aliasing (can occur at the beginning or end of
-    # a TESS sector when fewer eclipses constrain the phase solution).
-    for i, (frac_e, epoch_e) in enumerate(zip(fractional_epochs, epoch_numbers)):
-        if abs(frac_e - epoch_e) > 0.25:
-            neighbour_epochs = np.array([epoch_e - 1, epoch_e, epoch_e + 1])
-            best_neighbour   = neighbour_epochs[np.argmin(np.abs(frac_e - neighbour_epochs))]
-            epoch_numbers[i] = best_neighbour
-
+    # Kreiner's ephemeris extrapolated ~20 000 cycles can land the TESS minima
+    # anywhere up to ±P/4 off; rounding about the MEAN offset (circular mean in
+    # half-cycle units) keeps every ToM on the same side of the rounding boundary.
+    frac2 = 2.0 * (t_observed_bjd - t0_kreiner) / period_kreiner
+    angle = 2.0 * np.pi * frac2
+    centre = np.arctan2(np.mean(np.sin(angle)), np.mean(np.cos(angle))) / (2.0 * np.pi)
+    epoch_numbers = np.round(frac2 - centre) / 2.0
+    is_secondary  = (np.round(2.0 * epoch_numbers).astype(int) % 2) == 1
     t_calculated  = t0_kreiner + period_kreiner * epoch_numbers
-    oc_days        = t_observed_bjd - t_calculated
-    return epoch_numbers, oc_days, t_observed_err
+    oc_days       = t_observed_bjd - t_calculated
+    return epoch_numbers, oc_days, t_observed_err, is_secondary
 
 
 # =============================================================================
@@ -331,89 +269,85 @@ def refine_linear_ephemeris(
     epoch_numbers: np.ndarray,
     t_observed_bjd: np.ndarray,
     t_observed_err: np.ndarray,
-) -> tuple[float, float, float, float]:
+    is_secondary: np.ndarray,
+) -> tuple[float, float, float, float, float]:
     """
-    Fit a refined linear ephemeris via weighted least squares:
-        T_min(E) = T0_new + P_new × E
+    Fit a refined linear ephemeris by weighted least squares:
+        T_min(E) = T0_new + P_new × E + δ·[secondary]
 
-    A polyfit-derived initial guess is used regardless of how far the epoch
-    counter has grown from the Kreiner reference (E can exceed 10 000 cycles),
-    preventing poor initialisation of the scipy curve_fit optimiser.
-
-    Parameters
-    ----------
-    epoch_numbers:
-        Integer orbital epoch array E.
-    t_observed_bjd:
-        Observed ToM values (BJD).
-    t_observed_err:
-        Formal 1σ uncertainties on each ToM (days), used as weights.
+    δ is a separate zero-point for the secondaries (non-zero for eccentric
+    orbits or asymmetric minima), so secondaries help pin P without being
+    forced to sit exactly at phase 0.5. When there are no secondaries δ is
+    dropped. Epochs are centred before the fit (E can exceed 20 000 cycles),
+    and the covariance is scaled by the reduced χ² of the fit, so the errors
+    reflect the actual scatter of the ToMs, not only their formal σ.
 
     Returns
     -------
-    t0_new, period_new:
-        Refined reference epoch (BJD) and orbital period (days).
-    t0_err, period_err:
-        Formal 1σ uncertainties derived from the covariance matrix diagonal.
-        Returns NaN if scipy.optimize.curve_fit fails to converge.
+    t0_new, period_new, t0_err, period_err, secondary_offset_days
+        T0_new refers to E = 0 (the Kreiner epoch count), as before.
     """
-    def linear_model(epoch: np.ndarray, t0: float, period: float) -> np.ndarray:
-        return t0 + period * epoch
+    e_ref = float(np.round(np.mean(epoch_numbers)))
+    x = epoch_numbers - e_ref
+    use_sec = bool(np.any(is_secondary)) and bool(np.any(~is_secondary))
+    cols = [np.ones_like(x), x] + ([is_secondary.astype(float)] if use_sec else [])
+    design = np.vstack(cols).T
+    w = 1.0 / np.square(np.where(t_observed_err > 0, t_observed_err, np.nanmedian(t_observed_err)))
+    sw = np.sqrt(w)
+    coef, *_ = np.linalg.lstsq(design * sw[:, None], t_observed_bjd * sw, rcond=None)
+    resid = t_observed_bjd - design @ coef
+    dof = max(len(x) - design.shape[1], 1)
+    chi2_red = float(np.sum(w * resid ** 2) / dof)
+    cov = np.linalg.inv(design.T @ (design * w[:, None])) * max(chi2_red, 1.0)
+    t_ref, period_new = coef[0], coef[1]
+    t0_new = t_ref - period_new * e_ref                     # back to E = 0
+    period_err = float(np.sqrt(cov[1, 1]))
+    t0_err = float(np.sqrt(cov[0, 0] + (e_ref ** 2) * cov[1, 1] - 2 * e_ref * cov[0, 1]))
+    sec_offset = float(coef[2]) if use_sec else 0.0
+    return float(t0_new), float(period_new), t0_err, period_err, sec_offset
 
-    # polyfit gives a numerically stable initial guess for any epoch range.
-    slope, intercept = np.polyfit(epoch_numbers, t_observed_bjd, 1)
-    initial_guess    = [intercept, slope]
 
-    try:
-        optimal_params, covariance = curve_fit(
-            linear_model, epoch_numbers, t_observed_bjd,
-            p0=initial_guess, sigma=t_observed_err, absolute_sigma=True,
-        )
-        param_errors = np.sqrt(np.diag(covariance))
-        return optimal_params[0], optimal_params[1], param_errors[0], param_errors[1]
-    except RuntimeError:
-        # curve_fit failed to converge: return the polyfit values with NaN errors.
-        return intercept, slope, np.nan, np.nan
-
-
-def fold_depth(
+def phase_dispersion(
     time_bjd: np.ndarray,
     flux: np.ndarray,
     period: float,
-    n_bins: int = 50,
+    n_bins: int = DISPERSION_BINS,
 ) -> float:
     """
-    Peak-to-trough depth of the phase-folded, median-binned light curve.
+    Pooled within-bin variance of the fold at `period` divided by the total
+    variance (~0 for a perfect fold, → 1 for a fold carrying no signal).
 
-    The correct orbital period folds every eclipse onto the same phase, maximising
-    the binned eclipse depth; an incorrect period smears the eclipses across phase
-    and shrinks the depth. This makes the metric a cheap, model-free sharpness
-    score used by the Section-6D self-check to reject a refined period that folds
-    worse than the Kreiner baseline.
-
-    Parameters
-    ----------
-    time_bjd, flux:
-        Cleaned light-curve time (BJD) and normalised flux.
-    period:
-        Trial period in days.
-    n_bins:
-        Number of phase bins.
-
-    Returns
-    -------
-    Depth = median(binned flux) − min(binned flux); 0.0 if it cannot be computed.
+    The correct period folds every cycle onto the same phase; a wrong one
+    smears successive cycles. Unlike a peak-to-trough depth, which barely
+    changes when a contact binary's smooth curve is smeared by ~0.1 cycle,
+    the dispersion responds to ANY misalignment. Same statistic as
+    Audits/audit_period_fold.py, used by the Section-6D self-check.
     """
-    phase    = (time_bjd / period) % 1.0
-    edges    = np.linspace(0.0, 1.0, n_bins + 1)
-    binned   = np.full(n_bins, np.nan)
-    for i in range(n_bins):
-        m = (phase >= edges[i]) & (phase < edges[i + 1])
-        if np.any(m):
-            binned[i] = np.nanmedian(flux[m])
-    if np.all(np.isnan(binned)):
-        return 0.0
-    return float(np.nanmedian(binned) - np.nanmin(binned))
+    b = ((time_bjd / period) % 1.0 * n_bins).astype(int)
+    n = np.bincount(b, minlength=n_bins)
+    s = np.bincount(b, flux, n_bins)
+    s2 = np.bincount(b, flux * flux, n_bins)
+    ok = n > 1
+    within = np.sum(s2[ok] - s[ok] ** 2 / n[ok]) / np.sum(n[ok] - 1)
+    return float(within / np.var(flux))
+
+
+def best_dispersion_period(
+    time_bjd: np.ndarray,
+    flux: np.ndarray,
+    p_lo: float,
+    p_hi: float,
+) -> float:
+    """Phase-dispersion minimum over [p_lo, p_hi] (cross-check, written to the ephem file)."""
+    span = time_bjd.max() - time_bjd.min()
+    step = 0.005 * (0.5 * (p_lo + p_hi)) ** 2 / span        # ≤ 0.005-cycle end-of-span error
+    grid = np.arange(p_lo, p_hi + step, step)
+    p_best = grid[int(np.argmin([phase_dispersion(time_bjd, flux, p) for p in grid]))]
+    for _ in range(2):
+        grid = np.linspace(p_best - 2 * step, p_best + 2 * step, 81)
+        step = grid[1] - grid[0]
+        p_best = grid[int(np.argmin([phase_dispersion(time_bjd, flux, p) for p in grid]))]
+    return float(p_best)
 
 
 # =============================================================================
@@ -484,20 +418,21 @@ for target in target_list:
     # ── 6A: ECLIPSE MINIMUM DETECTION ─────────────────────────────────────────
     print("\n  [6A] Identifying eclipse minima candidates...")
 
-    # Smooth with a uniform filter to suppress high-frequency noise before
-    # local minimum detection; size 15 ≈ 30 min for 2-min cadence data.
-    flux_smoothed = uniform_filter1d(flux, size=15)
+    # Smooth over SMOOTH_MINUTES of TIME before local-minimum detection (a fixed
+    # sample count would mean 30 min at 120 s cadence but 2.5 h at 600 s).
+    cadence_days  = float(np.median(np.diff(time_btjd)))
+    smooth_points = max(3, int(round(SMOOTH_MINUTES / 1440.0 / cadence_days)))
+    flux_smoothed = uniform_filter1d(flux, size=smooth_points)
 
     # Set the argrelmin order so that two candidate minima must be separated
     # by at least 20% of one orbital period — preventing double-detection of
     # the same eclipse bottom in noisy data.
-    cadence_days       = float(np.median(np.diff(time_btjd)))
     points_per_period  = orbital_period / cadence_days
     min_separation_pts = max(5, int(points_per_period * 0.2))
 
     candidate_min_indices = argrelmin(flux_smoothed, order=min_separation_pts)[0]
     print(f"  Found {len(candidate_min_indices)} candidate minima "
-          f"(separation order = {min_separation_pts} pts).")
+          f"(separation order = {min_separation_pts} pts, smoothing {smooth_points} pts).")
 
     if len(candidate_min_indices) == 0:
         print("  ERROR: No minima detected. Check light curve quality.")
@@ -507,36 +442,38 @@ for target in target_list:
     # ── 6B: PRECISE ToM EXTRACTION ────────────────────────────────────────────
     print("\n  [6B] Computing precise Times of Minimum...")
 
-    eclipse_half_window = orbital_period * 0.15
+    reflect_half = orbital_period * KVW_REFLECT_HALF_FRAC
     accepted_toms: list[tuple[float, float]] = []
+    n_fallback = 0
 
     for min_idx in candidate_min_indices:
         t_trial_bjd = time_bjd[min_idx]
         try:
             t_min, t_err = compute_tom_kwee_van_woerden(
-                time_bjd, flux, t_trial_bjd, half_window=eclipse_half_window,
+                time_bjd, flux, t_trial_bjd, reflect_half=reflect_half, cadence_days=cadence_days,
             )
             method = "KvW"
-        except ValueError:
+        except ValueError as kvw_err:
             try:
                 t_min, t_err = compute_tom_polynomial_fallback(
-                    time_bjd, flux, t_trial_bjd, half_window=eclipse_half_window,
+                    time_bjd, flux, t_trial_bjd, half_window=reflect_half,
                 )
-                method = "poly"
+                method = f"poly ({kvw_err})"
+                n_fallback += 1
             except ValueError as poly_err:
-                print(f"    Skipped minimum at BJD {t_trial_bjd:.4f}: {poly_err}")
+                print(f"    Skipped minimum at BJD {t_trial_bjd:.4f}: KvW: {kvw_err}; poly: {poly_err}")
                 continue
 
-        if t_err <= MAX_TOM_UNCERTAINTY_DAYS:
+        if np.isfinite(t_err) and t_err <= MAX_TOM_UNCERTAINTY_DAYS:
             accepted_toms.append((t_min, t_err))
             print(f"    ToM = {t_min:.6f} BJD  ±{t_err:.6f} d  ({method})")
         else:
             print(f"    Rejected: ToM at {t_min:.4f} BJD  "
                   f"uncertainty ±{t_err:.4f} d > {MAX_TOM_UNCERTAINTY_DAYS} d")
 
-    if not accepted_toms:
-        print("  ERROR: No ToM measurements passed the quality filter. Skipping.")
-        run_tracker.star_end(star_name, "failed", reason="no ToM passed quality filter",
+    if len(accepted_toms) < 3:
+        print("  ERROR: fewer than 3 ToM measurements passed the quality filter. Skipping.")
+        run_tracker.star_end(star_name, "failed", reason="fewer than 3 ToMs passed quality filter",
                              n_minima=len(candidate_min_indices))
         continue
 
@@ -546,82 +483,119 @@ for target in target_list:
     # ── 6C: O–C RESIDUALS ─────────────────────────────────────────────────────
     print("\n  [6C] Computing O–C residuals vs. Kreiner (2004) baseline...")
 
-    if star_name in historical_ephemerides:
+    has_kreiner = star_name in historical_ephemerides
+    if has_kreiner:
         t0_kreiner, period_kreiner = historical_ephemerides[star_name]
         print(f"    Kreiner baseline: T0 = {t0_kreiner},  P = {period_kreiner}")
     else:
-        print(f"  WARNING: No Kreiner entry for {star_name}. Using first ToM as T0.")
+        # No catalogue ephemeris: count epochs from the first measured ToM at the
+        # catalogue period. The ephem file labels this honestly (not "Kreiner").
+        print(f"  WARNING: No Kreiner entry for {star_name}. Using first ToM as T0 "
+              f"and the catalogue period.")
         t0_kreiner     = t_obs_array[0]
         period_kreiner = orbital_period
 
-    epoch_numbers, oc_days, oc_uncertainties = compute_oc_residuals(
+    epoch_numbers, oc_days, oc_uncertainties, is_secondary = compute_oc_residuals(
         t_obs_array, t_err_array, t0_kreiner, period_kreiner,
     )
+    print(f"    {int(np.sum(~is_secondary))} primary + {int(np.sum(is_secondary))} secondary minima")
 
     # ── 6D: EPHEMERIS REFINEMENT ──────────────────────────────────────────────
     print("\n  [6D] Fitting refined linear ephemeris...")
 
-    t0_new, period_new, t0_err, period_err = refine_linear_ephemeris(
-        epoch_numbers, t_obs_array, t_err_array,
+    t0_new, period_new, t0_err, period_err, secondary_offset = refine_linear_ephemeris(
+        epoch_numbers, t_obs_array, t_err_array, is_secondary,
     )
     print(f"  Refined ephemeris (BJD):")
     print(f"    T_min = {t0_new:.6f} (±{t0_err:.6f}) "
-          f"+ {period_new:.8f} (±{period_err:.8f}) × E")
+          f"+ {period_new:.8f} (±{period_err:.8f}) × E   "
+          f"[secondary offset {secondary_offset * 86400:+.1f} s]")
 
-    # ── 6D-check: PERIOD FOLD-QUALITY SELF-CHECK (Flag 2 remediation) ─────────
+    # ── 6D-check: PERIOD FOLD-QUALITY SELF-CHECK ──────────────────────────────
     # A refined period that folds the light curve WORSE than the Kreiner baseline
-    # signals that the O–C linear fit locked onto an aliased / mis-counted set of
-    # epochs. This was observed for large-|ΔP| stars (e.g. II UMa, GK Cep), where
-    # the refined period smeared the eclipses and corrupted the Script 04 bundle.
-    # We compare the median-binned fold depth at both periods and, if the refined
-    # fold is materially shallower, reject it and retain the Kreiner period.
-    depth_new       = fold_depth(time_bjd, flux, period_new)
-    depth_kreiner   = fold_depth(time_bjd, flux, period_kreiner)
+    # means the timing fit went wrong (aliased / mis-counted epochs, distorted
+    # minima). The check compares PHASE DISPERSION at the two periods: the
+    # former peak-to-trough depth test passed contact-binary folds smeared by
+    # up to ~0.1 cycle (Pipeline_Log Entry 76). The phase-dispersion minimum
+    # near both periods is also found and written as a cross-check.
+    disp_new     = phase_dispersion(time_bjd, flux, period_new)
+    disp_kreiner = phase_dispersion(time_bjd, flux, period_kreiner)
+    period_best_pdm = best_dispersion_period(
+        time_bjd, flux,
+        min(period_new, period_kreiner) * (1 - 0.003),
+        max(period_new, period_kreiner) * (1 + 0.003),
+    )
+    span_days = float(time_btjd.max() - time_btjd.min())
+    drift_vs_pdm = abs(period_new - period_best_pdm) * span_days / period_best_pdm ** 2
     period_reverted = False
-    if depth_kreiner > 0.0 and depth_new < 0.85 * depth_kreiner:
+    if disp_new > DISPERSION_REVERT_TOLERANCE * disp_kreiner:
         period_reverted = True
-        # Re-derive T0 at the fixed Kreiner period from the observed ToMs so the
-        # reference epoch sits within the TESS data rather than the 2004 baseline.
-        epochs_k   = np.round((t_obs_array - t0_kreiner) / period_kreiner)
-        weights    = 1.0 / np.square(t_err_array)
-        t0_new     = float(np.average(t_obs_array - epochs_k * period_kreiner, weights=weights))
+        # Re-derive T0 at the fixed Kreiner period from the PRIMARY minima (the
+        # secondaries carry their own zero-point).
+        primaries  = ~is_secondary if np.any(~is_secondary) else np.ones_like(is_secondary)
+        weights    = 1.0 / np.square(t_err_array[primaries])
+        t0_new     = float(np.average(t_obs_array[primaries]
+                                      - epoch_numbers[primaries] * period_kreiner, weights=weights))
         t0_err     = float(np.sqrt(1.0 / np.sum(weights)))
         period_new = period_kreiner
         period_err = np.nan
+        if np.any(is_secondary):
+            secondary_offset = float(np.median(t_obs_array[is_secondary]
+                                               - (t0_new + period_new * epoch_numbers[is_secondary])))
+        drift_vs_pdm = abs(period_new - period_best_pdm) * span_days / period_best_pdm ** 2
         print(f"  [WARNING] Refined period folds worse than Kreiner "
-              f"(depth {depth_new:.3f} < 0.85 × {depth_kreiner:.3f}). "
+              f"(dispersion {disp_new:.4f} > {DISPERSION_REVERT_TOLERANCE} × {disp_kreiner:.4f}). "
               f"Reverting to Kreiner P = {period_kreiner:.8f} d.")
     else:
-        print(f"  [fold-check] refined depth {depth_new:.3f} vs "
-              f"Kreiner {depth_kreiner:.3f} — refined period retained.")
+        print(f"  [fold-check] dispersion refined {disp_new:.4f} vs Kreiner {disp_kreiner:.4f} "
+              f"— refined period retained.")
+    print(f"  [pdm cross-check] P_best_pdm = {period_best_pdm:.8f} d; "
+          f"|P_new − P_best_pdm| = {abs(period_new - period_best_pdm) * 86400:.2f} s "
+          f"→ drift {drift_vs_pdm:.4f} cycles over {span_days:.1f} d")
+    if drift_vs_pdm > 0.01:
+        print(f"  [WARNING] P_new drifts {drift_vs_pdm:.3f} cycles from the phase-dispersion "
+              f"period across the data — inspect this star before modelling.")
 
     # ── 6E: WRITE OUTPUT FILES ────────────────────────────────────────────────
     ephem_path = os.path.join(paths.TIMING_DIR, f"ephem_{safe_name}.txt")
+    t0_label = ("HJD(UTC) (Kreiner 2004)" if has_kreiner
+                else "BJD — first measured ToM (no Kreiner entry)")
+    p_label = "days (Kreiner 2004)" if has_kreiner else "days (catalogue period; no Kreiner entry)"
     with open(ephem_path, "w") as ephem_file:
         ephem_file.write(f"# Refined linear ephemeris for {star_name}\n")
-        ephem_file.write("# T_min (BJD) = T0_new + P_new * E\n")
-        ephem_file.write("# NOTE: Kreiner T0 is HJD; ToM are in BJD.\n"
-                         "#       The <4 s HJD-to-BJD offset is absorbed into T0_new.\n")
-        ephem_file.write(f"T0_new     = {t0_new:.8f}    # BJD\n")
-        ephem_file.write(f"T0_err     = {t0_err:.8f}    # BJD\n")
+        ephem_file.write("# T_min (BJD_TDB) = T0_new + P_new * E   (E half-integer for secondaries;\n"
+                         "#                   secondaries also add SEC_OFFSET_days)\n")
+        ephem_file.write("# NOTE: Kreiner T0 is HJD(UTC), ToMs are BJD(TDB) (~65-69 s apart). Kreiner\n"
+                         "#       only sets the epoch count; T0_new is fitted to the TESS ToMs.\n")
+        ephem_file.write(f"T0_new     = {t0_new:.8f}    # BJD_TDB at E = 0\n")
+        ephem_file.write(f"T0_err     = {t0_err:.8f}    # days\n")
         ephem_file.write(f"P_new      = {period_new:.10f}  # days\n")
-        ephem_file.write(f"P_err      = {period_err:.10f}  # days\n")
-        ephem_file.write(f"T0_kreiner = {t0_kreiner:.8f}  # HJD (Kreiner 2004)\n")
-        ephem_file.write(f"P_kreiner  = {period_kreiner:.10f}  # days (Kreiner 2004)\n")
+        ephem_file.write(f"P_err      = {period_err:.10f}  # days (fit covariance scaled by reduced chi2)\n")
+        ephem_file.write(f"T0_kreiner = {t0_kreiner:.8f}  # {t0_label}\n")
+        ephem_file.write(f"P_kreiner  = {period_kreiner:.10f}  # {p_label}\n")
         ephem_file.write(f"PERIOD_REVERTED = {period_reverted}  "
                          "# True if the refined period was rejected (folded worse than Kreiner)\n")
+        ephem_file.write(f"SEC_OFFSET_days = {secondary_offset:.8f}  # secondary minima: T - (T0 + P*E)\n")
+        ephem_file.write(f"N_PRIMARY  = {int(np.sum(~is_secondary))}\n")
+        ephem_file.write(f"N_SECONDARY = {int(np.sum(is_secondary))}\n")
+        ephem_file.write(f"N_FALLBACK = {n_fallback}  # minima timed by the parabola fallback\n")
+        ephem_file.write(f"DISP_NEW   = {disp_new:.6f}  # phase dispersion at P_new\n")
+        ephem_file.write(f"DISP_KREINER = {disp_kreiner:.6f}  # phase dispersion at P_kreiner\n")
+        ephem_file.write(f"P_best_pdm = {period_best_pdm:.10f}  # phase-dispersion minimum (cross-check)\n")
+        ephem_file.write(f"DRIFT_VS_PDM_cycles = {drift_vs_pdm:.5f}  # |P_new - P_best_pdm| x span / P^2\n")
 
     tominima_path = os.path.join(paths.TIMING_DIR, f"tominima_{safe_name}.csv")
     with open(tominima_path, "w", newline="") as tominima_file:
         writer = csv.writer(tominima_file)
-        writer.writerow(["Star", "T_min_BJD", "T_min_err_days", "Epoch_E", "OC_days"])
+        writer.writerow(["Star", "T_min_BJD", "T_min_err_days", "Epoch_E", "OC_days", "Type"])
         for i in range(len(t_obs_array)):
             writer.writerow([
                 star_name,
                 f"{t_obs_array[i]:.8f}",
                 f"{t_err_array[i]:.8f}",
-                epoch_numbers[i],
+                f"{epoch_numbers[i]:.1f}",
                 f"{oc_days[i]:.8f}",
+                "S" if is_secondary[i] else "P",
             ])
 
     print(f"  Saved: {tominima_path}")
@@ -630,7 +604,8 @@ for target in target_list:
     # ── 6F: THREE-PANEL O–C DIAGRAM ───────────────────────────────────────────
     print(f"  Generating O–C diagram...")
 
-    oc_vs_new_ephemeris = t_obs_array - (t0_new + period_new * epoch_numbers)
+    oc_vs_new_ephemeris = t_obs_array - (t0_new + period_new * epoch_numbers
+                                         + secondary_offset * is_secondary)
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 18), gridspec_kw={"hspace": 0.4})
     fig.suptitle(
@@ -699,8 +674,8 @@ for target in target_list:
     axes[2].text(
         0.015, 0.05,
         f"• All {len(epoch_numbers)} ToM measurements from the TESS sector.\n"
-        "• Vertical scatter reflects the formal per-eclipse timing uncertainty.\n"
-        "• Internal consistency validates the refined orbital solution.",
+        "• Error bars: formal KvW σ. The scatter is larger (spots, noise);\n"
+        "  P_err is scaled to the observed scatter (reduced χ²).",
         transform=axes[2].transAxes, fontsize=10, linespacing=1.4,
         bbox=dict(boxstyle="round,pad=0.5", facecolor="honeydew",
                   edgecolor="gray", alpha=0.85),

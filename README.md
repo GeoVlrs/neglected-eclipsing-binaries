@@ -22,9 +22,14 @@ The project targets "neglected" binaries whose historical ground-based timings h
 ## Repository Layout
 
 ```
-src/        pipeline stages 01–06 + the table generator and schematic utility
-audits/     standalone diagnostic scripts (light-curve, O–C, modeling, phase-offset,
-            per-walker MCMC chain health)
+HOW_TO.md   operating manual for every script
+src/        pipeline stages 01–06, the table generator, two schematic utilities,
+            the shared modules (paths, runstats, morphology) and the Stage-05
+            launcher run_05_autorestart.sh
+audits/     standalone diagnostic scripts (period/fold check, time-of-minimum
+            estimator, crowding and PDCSAP distortion, results ledger, per-walker
+            MCMC chain health, phase alignment, fill-out identifiability; plus
+            legacy light-curve / O–C / modeling checks)
 docs/       methodology notes and expansion plans
 data/       tominima tables and the sample definition (data/targets/)
 tools/      sync_from_working_tree.py — publish-mirror updater
@@ -46,30 +51,50 @@ pip install mayavi vtk pyqt5 pillow
 
 ## Execution
 
-Run a stage against one batch (all stages take the same optional catalogue argument):
+**Full operating manual: [HOW_TO.md](HOW_TO.md)** — every script, its arguments,
+inputs/outputs, run times, the Stage-05 operating procedure (start / pause / resume,
+two queues, recovery after a power cut) and troubleshooting. It uses the working-tree
+script names; its section 9 maps them to the names in this repository.
+
+The scripts expect `Targets/` and `data/` in the current directory, so run them from a
+working folder (see HOW_TO.md §9.3):
 
 ```bash
-python src/DataAcquisition.py Targets/neglected_targets_batch1.csv
-python src/OCAnalysis.py      Targets/neglected_targets_batch1.csv
-python src/Modeling.py        Targets/neglected_targets_batch1.csv
+mkdir run && cd run
+cp ../src/*.py ../src/run_05_autorestart.sh . && mkdir -p Audits Targets
+cp ../audits/*.py Audits/ && cp ../data/targets/*.csv Targets/
+
+python DataAcquisition.py Targets/neglected_targets_batch1.csv
+python OCAnalysis.py      Targets/neglected_targets_batch1.csv
+python3 Modeling.py       Targets/neglected_targets_batch1.csv      # Linux / WSL
 ```
 
-Stage 05 runs under MPI (one walker per rank) and is resumable — re-running the same command continues an interrupted chain and skips completed targets:
+Stage 05 runs under MPI (Linux / WSL) and is resumable: re-running the same command
+continues an interrupted chain and skips completed targets. One star uses at most 8
+MPI processes (emcee evaluates half of its 14 walkers at a time), so `-n 8` is the
+efficient size. The supervised launcher restarts from the last checkpoint if a run
+crashes:
 
 ```bash
-mpirun --use-hwthread-cpus -n 14 python3 src/Optimization.py Targets/neglected_targets_batch1.csv
+bash run_05_autorestart.sh Targets/neglected_targets_batch1.csv Runs/batch1_05.log "BATCH 1"
+# or directly:
+mpirun --use-hwthread-cpus -n 8 python3 -u Optimization.py Targets/neglected_targets_batch1.csv
 ```
 
-Run-size knobs are environment-overridable for fast smoke tests (defaults are production values):
+Run-size knobs are environment-overridable for smoke tests (defaults are production
+values); under `mpirun` they must be forwarded with `-x`. Test on a scratch copy of a
+bundle, never on a star with results (HOW_TO.md §6.8):
 
 ```bash
-MCMC_NITERS=45 MCMC_CHECKPOINT=15 MCMC_BURNIN=10 NM_MAXITER=20 python3 src/Optimization.py trial.csv
+export MCMC_NITERS=45 MCMC_CHECKPOINT=15 MCMC_BURNIN=10 NM_MAXITER=20
+mpirun -n 8 -x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN -x NM_MAXITER python3 -u Optimization.py trial.csv
 ```
 
-Stage 06 is safe to re-run after every batch — it renders only stars whose bundles are newer than their images, and skips the rest:
+Stage 06 (Windows, Mayavi) is safe to re-run after every batch — it renders only stars
+whose bundles are newer than their images:
 
 ```bash
-python src/Visualization.py Targets/neglected_targets_batch1.csv
+python Visualization.py Targets/neglected_targets_batch1.csv
 ```
 
 Pass `FORCE_RERENDER=1` to rebuild every image regardless of modification time.

@@ -95,8 +95,22 @@ TESS_BTJD_TO_BJD_OFFSET: float = 2_457_000.0
 RADIATIVE_CONVECTIVE_BOUNDARY_K: float = 8_000.0
 
 # Number of phase bins used to reduce the light curve before attaching to
-# PHOEBE 2. 150 bins balances ingress/egress resolution against compute cost.
-PHASE_BIN_COUNT: int = 150
+# PHOEBE 2. ~150 bins balance ingress/egress resolution against compute cost.
+# The count is ODD so that one bin is centred exactly on phase 0 (the primary
+# minimum); with 150 bins phase 0 was a bin EDGE and the deepest point was split
+# between two half-bins at ±0.0033 (Pipeline_Log Entry 76).
+PHASE_BIN_COUNT: int = 151
+
+# Exposure-time integration (PHOEBE fti_method="oversample") for long-cadence
+# data. A 600 s TESS-SPOC FFI exposure spans ~0.015 of a 0.47 d orbit (~2 bins)
+# and smooths eclipse contacts; a 120-200 s exposure is no longer than one phase
+# bin and is left unintegrated (its smoothing is far below the 0.003 σ floor).
+FTI_MIN_CADENCE_S: float = 300.0
+FTI_OVERSAMPLE: int = 5
+
+# Primary-minimum refinement on the UNBINNED fold: parabola through the points
+# within ±T0_FIT_HALF_WIDTH (phase) of a candidate minimum.
+T0_FIT_HALF_WIDTH: float = 0.03
 
 # Systematic photometric error floor (in normalised flux), added in quadrature to
 # each bin's statistical error. The standard-error-of-the-mean (std/√N) collapses
@@ -288,57 +302,15 @@ GAIA_TEFF_OVERRIDE_K: dict[str, float] = {
 # SECTION 3 — HELPER FUNCTIONS
 # =============================================================================
 
-# Per-star morphology override, consulted by resolve_morphology() BEFORE the GCVS
-# classifier. Use it to force a star BUILT as detached when the contact model is
-# geometrically wrong for it (Script 05's assess_contact_validity flags
-# RECONSIDER_DETACHED, or the production log shows "requiv too close to requiv_min /
-# use detached model"). Mirrors GAIA_TEFF_OVERRIDE_K. MUST stay byte-identical to the
-# same dict in Script 05, or a bundle would be built under one morphology and optimised
-# under another. Value: "detached" or "contact". Workflow: add here (both scripts) →
-# re-run Script 04 (rebuilds a detached bundle) → clear results_<star>.csv → re-run 05.
-MORPHOLOGY_OVERRIDE: dict[str, str] = {
-    # "FI Boo": "detached",  # DETECTOR FALSE POSITIVE — light curve is clearly EW/contact
-    #                        # (continuous variation + O'Connell); kept CONTACT. See log.
-    # "Y Sex":  "detached",  # pending: run not finished / not yet verified
-}
-
-
-def is_contact_morphology(gcvs_type: str) -> bool:
-    """
-    Decide whether a GCVS variability type denotes a contact (overcontact) binary.
-
-    The GCVS strings in the catalogue carry qualifier suffixes after a slash or
-    colon — e.g. "EW/KW", "EW/DW", "EW:", "EW/RS" are all W UMa contact systems,
-    while "EB", "EB/SD", "EB/KE" are detached or semi-detached. A naive
-    `gcvs_type == "EW"` test (used in earlier drafts) silently misclassified
-    every qualified contact system as detached, building it with the wrong Roche
-    geometry. We therefore strip qualifiers and test only the leading code.
-
-    Parameters
-    ----------
-    gcvs_type:
-        Raw GCVS type string from the target catalogue (e.g. "EW/KW").
-
-    Returns
-    -------
-    True for contact (EW-family) systems, False otherwise (EB / SD / detached).
-    """
-    base = gcvs_type.strip().upper().replace(":", "").split("/")[0]
-    return base == "EW"
-
-
-def resolve_morphology(star_name: str, gcvs_type: str) -> bool:
-    """
-    Decide contact (True) vs detached (False) for a star, honouring MORPHOLOGY_OVERRIDE
-    first and falling back to the pure GCVS classifier is_contact_morphology(). This is
-    the single entry point the pipeline should call; is_contact_morphology stays a pure,
-    star-agnostic classifier. MUST behave identically in Scripts 04 and 05 (same override
-    table) so a bundle is built and optimised under the same morphology.
-    """
-    override = MORPHOLOGY_OVERRIDE.get(star_name)
-    if override is not None:
-        return override.strip().lower() == "contact"
-    return is_contact_morphology(gcvs_type)
+# Morphology (contact / detached / semi-detached) comes from the shared module
+# morphology.py, imported by Scripts 04, 05 and 06 alike, so a bundle is always
+# built, optimised and rendered under the same geometry. It replaces the copies of
+# MORPHOLOGY_OVERRIDE / is_contact_morphology / resolve_morphology that used to live
+# here and in 05 (and a third, override-blind copy in 06) — Pipeline_Log Entry 76.
+from morphology import (                                    # noqa: E402
+    CONTACT, DETACHED, SEMIDETACHED, MORPHOLOGY_OVERRIDE,
+    is_contact_morphology, resolve_morphology, resolve_morphology_kind,
+)
 
 
 def estimate_contact_spectral_type(period_days: float) -> str:
@@ -558,7 +530,9 @@ def bin_phase_curve(
     bin_flux:
         Median flux within each non-empty bin.
     bin_flux_err:
-        Standard error of the median within each non-empty bin.
+        Standard error of the MEAN (std/√N) within each non-empty bin (the bin
+        value itself is the median; the median's SE is ~1.25× larger, absorbed
+        by the systematic floor below).
         Combined in quadrature with SYS_ERROR_FLOOR; never below that floor.
     """
     bin_edges   = np.linspace(-0.5, 0.5, n_bins + 1)
@@ -648,34 +622,49 @@ for target in target_list:
     phase, flux, flux_err = bin_phase_curve(raw_phase, raw_flux, raw_ferr, PHASE_BIN_COUNT)
     print(f"  Binned to {len(flux)} phase points.")
 
-    # ── BUG B FIX: anchor t0 to the TESS-epoch primary eclipse minimum ────────
-    # T0_new from Script 03 is anchored at a Kreiner-2002 epoch. Propagating
-    # forward ~20 000 cycles of TESS observations with any residual period error
-    # shifts the data primary eclipse away from phase 0, preventing the model
-    # from matching depth regardless of inclination. We therefore re-anchor t0
-    # to the deepest binned minimum of this star's own TESS light curve, which
-    # by definition places the primary eclipse at phase 0 in the bundle.
-    primary_phase_offset = float(phase[np.argmin(flux)])
-    t0_tess = t0_model + primary_phase_offset * period_model
-    print(f"  t0 correction: {primary_phase_offset:+.6f} cycles"
-          f"  = {primary_phase_offset * period_model * 86400:+.1f} s"
-          f"  (T0_new → TESS epoch)")
+    # ── 5B-t0: PRIMARY MINIMUM AT PHASE 0 ─────────────────────────────────────
+    # Script 03's ephemeris is fitted to the TESS times of minimum (since the
+    # 2026-10 fix, Entry 76), so phase 0 of the fold above IS a minimum to within
+    # seconds — but it is the minimum that Kreiner's epoch count calls "primary",
+    # which need not be the deeper one in TESS. Primary = DEEPER minimum: fit a
+    # parabola to the UNBINNED fold within ±T0_FIT_HALF_WIDTH of phase 0 and of
+    # phase 0.5, take the deeper vertex, and put it at phase 0 (sub-bin precision).
+    # This replaces the binned-argmin anchor and the detached-only "|offset| > 0.4
+    # → flip by half a period" rule, which assumed T0_new was good to ±0.1 cycle
+    # while the old period bug spread the offsets uniformly over ±0.5 (GK Cep was
+    # flipped onto its secondary).
+    def _local_minimum(centre: float) -> tuple[float, float]:
+        """(phase of the vertex, flux at the vertex) near `centre`, unbinned."""
+        d = ((raw_phase - centre + 0.5) % 1.0) - 0.5
+        sel = np.abs(d) <= T0_FIT_HALF_WIDTH
+        if sel.sum() < 10:
+            return centre, float("inf")
+        a2, b2, c2 = np.polyfit(d[sel], raw_flux[sel], 2)
+        if a2 <= 0:
+            k = int(np.argmin(raw_flux[sel]))
+            return centre + float(d[sel][k]), float(raw_flux[sel][k])
+        x_v = float(np.clip(-b2 / (2 * a2), -T0_FIT_HALF_WIDTH, T0_FIT_HALF_WIDTH))
+        return centre + x_v, float(a2 * x_v ** 2 + b2 * x_v + c2)
 
-    # For DETACHED binaries (EB/SD) only: if |offset| > 0.4, a flat-bottomed total
-    # secondary eclipse can produce a lower median-flux per 150-bin than the
-    # V-shaped primary transit, so argmin(bin_flux) catches the secondary. Flip
-    # by half a period to recover the primary. For CONTACT binaries (EW/KW) the
-    # two eclipses are similarly shaped so argmin reliably finds the deeper
-    # (= primary) eclipse regardless of how large the offset is.
-    if abs(primary_phase_offset) > 0.4 and not resolve_morphology(star_name, variable_type):
-        primary_phase_offset -= np.sign(primary_phase_offset) * 0.5
-        t0_tess = t0_model + primary_phase_offset * period_model
-        print(f"  (EB |offset|>0.4 → half-period flip → {primary_phase_offset:+.6f} cycles)")
+    phase_a, depth_a = _local_minimum(0.0)
+    phase_b, depth_b = _local_minimum(0.5)
+    primary_phase_offset = phase_a if depth_a <= depth_b else phase_b
+    primary_phase_offset = ((primary_phase_offset + 0.5) % 1.0) - 0.5
+    t0_tess = t0_model + primary_phase_offset * period_model
+    print(f"  Minima on the unbinned fold: φ={phase_a:+.4f} (flux {depth_a:.4f}), "
+          f"φ={phase_b:+.4f} (flux {depth_b:.4f})")
+    print(f"  t0 → deeper minimum: {primary_phase_offset:+.5f} cycles"
+          f"  = {primary_phase_offset * period_model * 86400:+.1f} s from T0_new")
 
     # Re-fold and re-bin with the corrected t0 so phase 0 = primary eclipse.
     raw_phase_corr = ((time_bjd - t0_tess) / period_model + 0.5) % 1.0 - 0.5
     phase, flux, flux_err = bin_phase_curve(raw_phase_corr, raw_flux, raw_ferr, PHASE_BIN_COUNT)
-    print(f"  Re-binned: {len(flux)} points  |  t0_tess = {t0_tess:.6f} BJD")
+    residual_offset = float(phase[np.argmin(flux)])
+    print(f"  Re-binned: {len(flux)} points  |  t0_tess = {t0_tess:.6f} BJD  |  deepest bin at "
+          f"φ = {residual_offset:+.4f}")
+    if abs(residual_offset) > 2.0 / PHASE_BIN_COUNT:
+        print(f"  [WARNING] deepest bin is {abs(residual_offset) * PHASE_BIN_COUNT:.1f} bins from "
+              f"phase 0 — flat-bottomed or near-equal minima; inspect phoebe_init_{safe_name}.png.")
 
     # ── 5C: PRIMARY TEMPERATURE ANCHOR ────────────────────────────────────────
     # T1 is held fixed throughout the MCMC, so its source matters: a Gaia DR3
@@ -699,8 +688,9 @@ for target in target_list:
     print(f"  T1 = {t1_kelvin:.0f} K  ({t1_source})")
 
     # ── 5D: PHOEBE 2 BUNDLE INSTANTIATION ────────────────────────────────────
-    is_contact_binary = resolve_morphology(star_name, variable_type)
-    print(f"\n  [5D] Building bundle  (contact_binary={is_contact_binary})...")
+    morphology_kind   = resolve_morphology_kind(star_name, variable_type)
+    is_contact_binary = morphology_kind == CONTACT
+    print(f"\n  [5D] Building bundle  (morphology={morphology_kind})...")
     bundle = phoebe.default_binary(contact_binary=is_contact_binary)
 
     # ── 5E: ORBITAL PARAMETERS ────────────────────────────────────────────────
@@ -731,6 +721,14 @@ for target in target_list:
         bundle.set_value("q@binary",         init_params["q_init"])
         bundle.set_value("requiv@primary",   0.8)
         bundle.set_value("requiv@secondary", 0.6)
+        if morphology_kind == SEMIDETACHED:
+            # The secondary fills its Roche lobe: PHOEBE's 'semidetached'
+            # constraint sets requiv@secondary = requiv_max@secondary at every q,
+            # so r₂ is no longer a free parameter (Script 05 fits q, i, T₂, r₁).
+            bundle.add_constraint("semidetached", "secondary")
+            print(f"  [5G] Semi-detached: requiv@secondary constrained to its Roche lobe "
+                  f"({bundle.get_value('requiv', component='secondary', context='component'):.3f} R⊙ "
+                  f"at q={init_params['q_init']:.2f}).")
 
     # ── 5H: DYNAMIC RADIATIVE PHYSICS ─────────────────────────────────────────
     print("\n  [5H] Setting radiative physics coefficients...")
@@ -764,6 +762,23 @@ for target in target_list:
     # to the observed median flux, removing the need to specify absolute pblum.
     bundle.set_value("pblum_mode", dataset="lc01", value="dataset-scaled")
 
+    # Irradiation method is stored in the COMPUTE OPTIONS, so the MCMC samples the
+    # same model that Script 05's final compute and Script 06 report. Before
+    # 2026-10 it was never set here: the sampler ran PHOEBE's default (Horvat)
+    # while the final compute used Wilson for contact stars (Entry 76).
+    irrad_method = "wilson" if is_contact_binary else "horvat"
+    bundle.set_value("irrad_method", compute="phoebe01", value=irrad_method)
+    print(f"  [5J] irrad_method = {irrad_method} (stored in compute options)")
+
+    # Exposure-time integration for long-cadence (FFI) data.
+    cadence_s = float(np.nanmedian(np.diff(lc.time.value)) * 86400.0)
+    if cadence_s >= FTI_MIN_CADENCE_S:
+        bundle.set_value("exptime", dataset="lc01", value=cadence_s)
+        bundle.set_value("fti_method", compute="phoebe01", value="oversample")
+        bundle.set_value("fti_oversample", compute="phoebe01", value=FTI_OVERSAMPLE)
+        print(f"  [5J] Exposure integration: exptime = {cadence_s:.0f} s, "
+              f"fti_oversample = {FTI_OVERSAMPLE}")
+
     # Blackbody atmospheres require manual limb-darkening coefficients because
     # the PHOEBE 2 automatic lookup tables are keyed to Castelli & Kurucz grids.
     bundle.set_value("ld_mode@primary@lc01",   "manual")
@@ -792,7 +807,7 @@ for target in target_list:
         synth_fluxes = bundle.get_value("fluxes", model="init_model", dataset="lc01")
         synth_fluxes = synth_fluxes / np.nanmedian(synth_fluxes)  # normalise to data scale
 
-        synth_phase  = ((synth_times - t0_model) / period_model + 0.5) % 1.0 - 0.5
+        synth_phase  = ((synth_times - t0_tess) / period_model + 0.5) % 1.0 - 0.5
         sort_idx     = np.argsort(synth_phase)
 
         fig, (ax_lc, ax_res) = plt.subplots(
@@ -835,14 +850,14 @@ for target in target_list:
     bundle_path = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}.phoebe")
     bundle.save(bundle_path)
     print(f"\n  Bundle saved: {bundle_path}")
-    print(f"    System type  : {'Contact (EW)' if is_contact_binary else 'Detached/SD (EB)'}")
+    print(f"    System type  : {morphology_kind}")
     print(f"    T1 (fixed)   = {bundle.get_value('teff@primary'):.0f} K")
     print(f"    T2 (initial) = {bundle.get_value('teff@secondary'):.0f} K")
     print(f"    i  (initial) = {bundle.get_value('incl@binary'):.2f}°")
     print(f"    q  (initial) = {bundle.get_value('q@binary'):.3f}")
     run_tracker.star_end(
         star_name, "done",
-        morphology="contact" if is_contact_binary else "detached",
+        morphology=morphology_kind,
         teff1_K=bundle.get_value('teff@primary'),
         teff2_init_K=bundle.get_value('teff@secondary'),
         incl_init=bundle.get_value('incl@binary'),

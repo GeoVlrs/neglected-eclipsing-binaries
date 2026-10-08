@@ -17,8 +17,16 @@ Summary:
     would propagate directly into erroneous radius and inclination estimates.
     PDCSAP was adopted as the primary science product on that basis.
 
+    PDCSAP's co-trending can, for some large-amplitude stars, absorb part of the
+    star's own variation (eclipse depths change from cycle to cycle in PDCSAP
+    but not in SAP; Pipeline_Log Entry 76). Every candidate sector is therefore
+    scored PDCSAP-vs-SAP and the newest CLEAN sector is used; if no sector is
+    clean, crowding-corrected SAP flux is used instead (retrieve_pdcsap_light_curve).
+    The chosen flux source, crowding keywords and selection reason are written
+    to the clean FITS header (FLUXSRC, CROWDSAP, FLFRCSAP, PDCRATIO, SECTSEL).
+
     For each target the script produces:
-        1. A detrended, 4σ-clipped, normalised light curve (clean FITS).
+        1. A 4σ-clipped, normalised light curve (clean FITS).
         2. A phase-folded version of the same curve (folded FITS).
         3. A three-panel diagnostic plot for visual verification.
 
@@ -56,6 +64,7 @@ matplotlib.use("Agg")  # non-interactive backend for server or headless environm
 import matplotlib.pyplot as plt
 
 import lightkurve as lk
+from astropy.io import fits
 from astropy.time import Time
 
 warnings.filterwarnings("ignore", module="lightkurve")
@@ -92,6 +101,16 @@ MIN_POINTS: int = 500             # sanity floor against empty/broken downloads
 # valid sectors are stitched in to boost coverage (Flag 4 remediation).
 STACK_TARGET_POINTS: int = 5000
 
+# PDCSAP-distortion check (Pipeline_Log Entry 76). A sector is "clean" when the
+# cycle-to-cycle amplitude scatter of PDCSAP is at most PDC_CLEAN_RATIO × that of
+# SAP in the same sector, or below PDC_NEGLIGIBLE_SCATTER outright.
+PDC_CLEAN_RATIO: float = 1.5
+PDC_NEGLIGIBLE_SCATTER: float = 0.005
+# Cadence preference: ≤ 200 s first (SPOC 120 s, TESS-SPOC 200 s); 600 s FFI
+# sectors only if no clean faster sector exists (04 then integrates exposures).
+PREFERRED_MAX_CADENCE_S: float = 210.0
+MAX_CADENCE_S: float = 610.0
+
 
 # =============================================================================
 # SECTION 2 — TARGET LIST
@@ -126,55 +145,162 @@ except FileNotFoundError:
 # SECTION 3 — DATA RETRIEVAL
 # =============================================================================
 
+def cycle_amplitude_scatter(time_days: np.ndarray, flux: np.ndarray, period: float) -> float:
+    """
+    Robust relative scatter of the per-orbit amplitude (p95 − p5)/median.
+
+    Each full orbital cycle is normalised by its own median, so slow SAP trends
+    do not count as amplitude changes. Same statistic as
+    Audits/audit_crowding_pdc.py (Pipeline_Log Entry 76). NaN if fewer than four
+    well-covered cycles.
+    """
+    ok = np.isfinite(time_days) & np.isfinite(flux)
+    t, f = time_days[ok], flux[ok]
+    if len(t) < 50:
+        return float("nan")
+    expected = period / float(np.median(np.diff(t)))
+    cyc = np.floor((t - t[0]) / period).astype(int)
+    amps = []
+    for c in np.unique(cyc):
+        m = cyc == c
+        if m.sum() < 0.8 * expected:
+            continue
+        fc = f[m] / np.median(f[m])
+        amps.append(np.percentile(fc, 95) - np.percentile(fc, 5))
+    amps = np.array(amps)
+    if len(amps) < 4:
+        return float("nan")
+    mad = np.median(np.abs(amps - np.median(amps))) * 1.4826
+    return float(mad / np.median(amps))
+
+
+def pdc_quality(lc, period: float) -> dict:
+    """
+    PDCSAP-vs-SAP check for one downloaded sector.
+
+    PDC co-trending can absorb part of a large-amplitude star's own variation,
+    so the eclipse depth then changes from cycle to cycle in PDCSAP but not in
+    SAP (Entry 76: GK Cep ×30, FN Cam ×27, EF Boo ×13, V899 Her ×4). The sector
+    is CLEAN when PDCSAP adds no amplitude scatter beyond SAP's (ratio ≤
+    PDC_CLEAN_RATIO), or when both are negligible. Products without a SAP column
+    (QLP) cannot be scored and are reported as unscored.
+    """
+    t = lc.time.value
+    pdc = cycle_amplitude_scatter(t, np.asarray(lc.flux.value, float), period)
+    if "sap_flux" not in lc.colnames:
+        return {"pdc_scatter": pdc, "sap_scatter": float("nan"), "ratio": float("nan"),
+                "clean": None}
+    sap = cycle_amplitude_scatter(t, np.asarray(lc.sap_flux.value, float), period)
+    ratio = pdc / sap if (np.isfinite(pdc) and np.isfinite(sap) and sap > 0) else float("nan")
+    clean = bool((np.isfinite(ratio) and ratio <= PDC_CLEAN_RATIO)
+                 or (np.isfinite(pdc) and pdc <= PDC_NEGLIGIBLE_SCATTER))
+    return {"pdc_scatter": pdc, "sap_scatter": sap, "ratio": ratio, "clean": clean}
+
+
+def sap_crowding_corrected(lc, period: float):
+    """
+    Build a PDCSAP-equivalent light curve from SAP flux, for sectors where PDC
+    distorts the signal (the SAP fallback of the Entry 76 "hybrid" decision).
+
+    1. Crowding and flux-fraction correction exactly as SPOC applies them to
+       PDCSAP: f = (SAP − (1 − CROWDSAP)·median(SAP)) / FLFRCSAP. The light curve
+       therefore stays on the same footing as PDCSAP stars (third light 0 in 04).
+    2. Slow-trend removal that cannot touch the orbital signal: the mean flux of
+       every FULL orbital cycle (which averages the binary's variation out) is
+       interpolated in time, separately in each spacecraft orbit (segments split
+       at gaps > 1 d), and divided out.
+    """
+    crowd = float(lc.meta.get("CROWDSAP") or 1.0)
+    flfr = float(lc.meta.get("FLFRCSAP") or 1.0)
+    t = lc.time.value
+    sap = np.asarray(lc.sap_flux.value, float)
+    corrected = (sap - (1.0 - crowd) * np.nanmedian(sap)) / flfr
+    trend = np.full_like(corrected, np.nan)
+    gaps = np.where(np.diff(t) > 1.0)[0]
+    for seg in np.split(np.arange(len(t)), gaps + 1):
+        ts, fs = t[seg], corrected[seg]
+        cyc = np.floor((ts - ts[0]) / period).astype(int)
+        centres, means = [], []
+        expected = period / float(np.median(np.diff(ts))) if len(ts) > 1 else 0
+        for c in np.unique(cyc):
+            m = (cyc == c) & np.isfinite(fs)
+            if m.sum() >= 0.8 * expected and expected > 0:
+                centres.append(ts[0] + (c + 0.5) * period)
+                means.append(np.mean(fs[m]))
+        if len(centres) >= 2:
+            trend[seg] = np.interp(ts, centres, means)
+        elif len(centres) == 1:
+            trend[seg] = means[0]
+        else:
+            trend[seg] = np.nanmedian(fs)
+    scale = np.nanmedian(trend) / trend
+    out = lc.copy()
+    out.flux = (corrected * scale) * lc.sap_flux.unit
+    if "sap_flux_err" in lc.colnames:
+        out.flux_err = (np.asarray(lc.sap_flux_err.value, float) / flfr * scale) * lc.sap_flux_err.unit
+    else:
+        out.flux_err = np.full(len(out), np.nan) * lc.sap_flux.unit
+    out.meta["FLUXSRC"] = "SAP_CROWDCORR"
+    return out
+
+
 def retrieve_pdcsap_light_curve(
     star_name: str,
     tic_id: str = "",
     skip_sectors: list = None,
-) -> Optional[object]:
+    orbital_period: float = 1.0,
+) -> tuple[Optional[object], dict]:
     """
-    Download the mission-standard PDCSAP light curve for a given star from MAST.
+    Download the mission-standard PDCSAP light curve for a given star from MAST,
+    choosing a sector in which PDCSAP has not distorted the binary's signal.
 
     The download hierarchy is:
         1. SPOC 2-minute short-cadence (highest time resolution; preferred).
-        2. TESS-SPOC 10-minute FFI-based cadence (fallback for non-GI targets).
-        3. QLP FFI-based cadence (community pipeline; fallback when no SPOC product exists).
+        2. TESS-SPOC FFI-based cadence (200 s / 600 s / 1800 s; fallback for
+           non-GI targets).
+        3. QLP FFI-based cadence (community pipeline; fallback when no SPOC
+           product exists). QLP flux is SAP-like (no CBV co-trending).
 
     When a TIC ID is provided it is used as the MAST search key in preference to
     the star name. This avoids SIMBAD name-resolution collisions where a variable
     star designation (e.g. "NU Cyg") is ambiguous with a Bayer letter (ν Cyg) and
     lightkurve resolves to the wrong target.
 
-    PDCSAP data is chosen over raw SAP because the SPOC pipeline applies
-    Co-trending Basis Vectors (CBVs) — principal components of the variability
-    shared by thousands of simultaneously observed reference stars — to remove
-    instrument-induced flux variations without absorbing the localized
-    astrophysical signal from the binary system.
+    PDCSAP is preferred over raw SAP because SPOC's Co-trending Basis Vectors
+    remove CCD-wide instrumental systematics. For some large-amplitude stars
+    the co-trending ALSO absorbs part of the star's own variation (eclipse
+    depths change from cycle to cycle in PDCSAP but not in SAP; Pipeline_Log
+    Entry 76). Each candidate sector is therefore scored (pdc_quality), and the
+    selection rule ("hybrid", user decision 2026-10-07) is:
 
-    Parameters
-    ----------
-    star_name:
-        Common variable star designation, e.g. "AB And". Used as fallback when
-        tic_id is empty, and always used for display/logging.
-    tic_id:
-        TESS Input Catalog identifier (digits only), e.g. "169936511". When
-        non-empty, the MAST search uses "TIC <tic_id>" as the target string to
-        bypass SIMBAD name resolution entirely.
+        a. the NEWEST valid sector that is clean and has cadence ≤ 200 s;
+        b. else the newest clean sector with cadence ≤ 600 s;
+        c. else SAP flux of the newest valid sector (cadence ≤ 200 s if any),
+           crowding-corrected like PDCSAP and detrended by orbit-averaged
+           means (sap_crowding_corrected).
+
+    Sectors are downloaded newest-first and the search stops at the first
+    sector satisfying (a), so stars whose newest sector is clean cost exactly
+    one download, as before.
 
     Returns
     -------
-    A normalized lightkurve LightCurve object with PDCSAP flux as the primary
-    flux column, or None if no suitable data is found.
+    (light_curve, selection_info) — light_curve is normalised (or None if no
+    product exists); selection_info records the sector, flux source, cadence,
+    PDC/SAP ratio, crowding keywords and the reason for the choice.
     """
     search_target = f"TIC {tic_id}" if tic_id else star_name
 
     print(f"  Searching MAST for SPOC 2-min light curves (target: {search_target})...")
     search_result = lk.search_lightcurve(search_target, mission="TESS", author="SPOC")
+    author = "SPOC"
 
     if len(search_result) == 0:
-        # 10-minute TESS-SPOC FFI data as a fallback for targets that were not
+        # FFI-based TESS-SPOC data as a fallback for targets that were not
         # included in the 2-minute pre-selected target list for a given sector.
         print("  SPOC 2-min not available. Searching TESS-SPOC FFI product...")
         search_result = lk.search_lightcurve(search_target, mission="TESS", author="TESS-SPOC")
+        author = "TESS-SPOC"
 
     if len(search_result) == 0:
         # QLP (Quick Look Pipeline) community FFI products are available for many
@@ -184,15 +310,11 @@ def retrieve_pdcsap_light_curve(
         # is the only available product for these targets.
         print("  TESS-SPOC not available. Searching QLP FFI product...")
         search_result = lk.search_lightcurve(search_target, mission="TESS", author="QLP")
+        author = "QLP"
 
     if len(search_result) == 0:
-        return None
+        return None, {}
 
-    # Validate-and-select: download candidates newest-first and accept only those
-    # with a plausible sector ID and an adequate observing baseline. This skips the
-    # corrupt partial-FFI stubs (e.g. the "Sector 1751" extended-mission artifact,
-    # a 3–7 day / ~1.5k-point fragment) that would otherwise be chosen simply for
-    # being the most recent product. (Flag 1 remediation.)
     def _promote_pdcsap(lc):
         # FFI products already expose PDCSAP as the primary flux column; 2-min
         # products carry an explicit pdcsap_flux column that must be promoted.
@@ -200,65 +322,126 @@ def retrieve_pdcsap_light_curve(
             lc.flux = lc.pdcsap_flux
         return lc
 
+    def _sector(lc):
+        try:
+            return int(lc.sector)
+        except Exception:
+            return None   # QLP / products without a SECTOR keyword
+
+    def _hard_reject(lc) -> bool:
+        # Never usable, not even as a last-resort fallback: bogus sector IDs (the
+        # "Sector 1751" FFI stub) and caller-excluded sectors (skip_sectors).
+        sector = _sector(lc)
+        if sector is not None and sector > MAX_VALID_SECTOR:
+            return True
+        return bool(skip_sectors) and sector in skip_sectors
+
     def _is_valid(lc) -> bool:
         if lc is None or len(lc) < MIN_POINTS:
             return False
-        try:
-            sector = int(lc.sector)
-        except Exception:
-            sector = None  # QLP / products without a SECTOR keyword still qualify
-        if sector is not None and sector > MAX_VALID_SECTOR:
-            return False   # bogus sector ID (metadata artifact)
-        if skip_sectors and sector in skip_sectors:
-            return False   # caller-requested exclusion (e.g. known scattered-light sector)
         baseline = float(lc.time.max().value - lc.time.min().value)
         return baseline >= MIN_BASELINE_DAYS
 
-    valid_lcs    = []      # accepted candidates, newest-first
-    best_invalid = None    # highest-point-count fallback if nothing validates
+    def _cadence_s(lc) -> float:
+        return float(np.nanmedian(np.diff(lc.time.value)) * 86400.0)
+
+    scored = []            # (lc, quality) for every valid sector, newest-first
+    best_invalid = None    # most points among soft-invalid sectors (short baseline)
+    chosen = None
     for result in reversed(search_result):
         try:
             # "hard" bitmask excludes anomalous cadences flagged by the SPOC
-            # pipeline (e.g. momentum dumps, scattered light, cosmic rays).
+            # pipeline (momentum dumps, scattered light, cosmic rays). Checked in
+            # Entry 76: on every selected sector it keeps exactly the cadences
+            # "default" keeps (the flagged cadences already have NaN PDCSAP).
             lc = _promote_pdcsap(result.download(quality_bitmask="hard"))
         except Exception:
             continue
-        if lc is None:
+        if lc is None or _hard_reject(lc):
             continue
-        if _is_valid(lc):
-            valid_lcs.append(lc)
-            # Stop early once total coverage is ample, so well-observed targets do
-            # not trigger dozens of downloads.
-            if sum(len(v) for v in valid_lcs) >= STACK_TARGET_POINTS:
+        if not _is_valid(lc):
+            if best_invalid is None or len(lc) > len(best_invalid):
+                best_invalid = lc
+            continue
+        quality = pdc_quality(lc.remove_nans(), orbital_period)
+        cad = _cadence_s(lc)
+        scored.append((lc, quality, cad))
+        tag = {True: "clean", False: "PDC-DISTORTED", None: "unscored"}[quality["clean"]]
+        print(f"    Sector {_sector(lc)} ({cad:.0f} s, {len(lc)} pts): PDC/SAP amplitude "
+              f"scatter ratio {quality['ratio']:.1f} → {tag}")
+        if chosen is None and quality["clean"] in (True, None) and cad <= PREFERRED_MAX_CADENCE_S:
+            chosen = (lc, quality, cad, "newest clean sector (<=200 s)")
+            # Stop once coverage is ample (Flag 4: thin sectors are stacked below).
+            if len(lc) >= STACK_TARGET_POINTS:
                 break
-        elif best_invalid is None or len(lc) > len(best_invalid):
-            best_invalid = lc
+        elif chosen is not None:
+            if sum(len(s[0]) for s in scored if s[1]["clean"] in (True, None)) >= STACK_TARGET_POINTS:
+                break
 
-    if not valid_lcs:
-        # Never silently drop a star: fall back to the best available product, but
-        # warn that it failed the coverage thresholds.
+    if chosen is None:
+        clean_any = [s for s in scored if s[1]["clean"] in (True, None) and s[2] <= MAX_CADENCE_S]
+        if clean_any:
+            lc, q, cad = clean_any[0]
+            chosen = (lc, q, cad, f"newest clean sector (<={MAX_CADENCE_S:.0f} s); none clean <=200 s")
+        elif scored:
+            # SAP fallback: the sector whose SAP amplitude is most stable from
+            # cycle to cycle (not simply the newest — for GK Cep the newest is
+            # S79, excluded in Entry 10 for scattered light), cadence ≤ 200 s
+            # preferred.
+            fast = [s for s in scored if s[2] <= PREFERRED_MAX_CADENCE_S] or scored
+            fast = sorted(fast, key=lambda s: (s[1]["sap_scatter"]
+                                               if np.isfinite(s[1]["sap_scatter"]) else np.inf))
+            lc, q, cad = fast[0]
+            print(f"  [WARNING] PDCSAP distorted in every scored sector; using SAP flux of "
+                  f"Sector {_sector(lc)}, crowding-corrected and orbit-mean detrended.")
+            sap_lc = sap_crowding_corrected(lc.remove_nans(), orbital_period)
+            chosen = (sap_lc, q, cad, "SAP fallback: no clean PDCSAP sector")
+
+    if chosen is None:
+        # Never silently drop a star: fall back to the best soft-invalid product
+        # (short baseline), but warn. Hard-rejected sectors are never used.
         if best_invalid is None:
-            return None
+            return None, {}
         print(f"  [WARNING] No product met validity thresholds; using best available "
               f"(Sector {best_invalid.sector}, {len(best_invalid)} pts).")
-        return best_invalid.normalize()
+        q = pdc_quality(best_invalid.remove_nans(), orbital_period)
+        chosen = (best_invalid, q, _cadence_s(best_invalid), "below validity thresholds")
 
-    primary = valid_lcs[0]
-    if len(valid_lcs) == 1 or len(primary) >= STACK_TARGET_POINTS:
-        print(f"  Selected Sector {primary.sector} ({len(primary)} pts).")
-        return primary.normalize()
+    lc, quality, cad, reason = chosen
+    flux_source = lc.meta.get("FLUXSRC") or ("QLP_SAP" if author == "QLP" else "PDCSAP")
+    info = {
+        "sector": _sector(lc), "author": author, "flux_source": flux_source,
+        "cadence_s": cad, "pdc_sap_ratio": quality.get("ratio", float("nan")),
+        "crowdsap": lc.meta.get("CROWDSAP"), "flfrcsap": lc.meta.get("FLFRCSAP"),
+        "reason": reason, "stacked": "",
+    }
 
-    # Flag 4 remediation: the best single valid sector is thin (e.g. BO CVn after
-    # heavy quality masking). Stitch the collected valid sectors — already ordered
-    # newest-first, i.e. closest in time — to boost the point count while keeping
-    # the baseline span (and hence period-induced phase smearing) as small as
-    # possible. LightCurveCollection.stitch() normalises each sector before
-    # concatenation, handling inter-sector flux scaling.
-    stacked = lk.LightCurveCollection(valid_lcs).stitch()
-    stacked.meta["SECTOR"] = primary.sector  # keep a usable .sector for downstream logging/plot
-    sectors = ", ".join(str(v.sector) for v in valid_lcs)
-    print(f"  Stacked Sectors [{sectors}] -> {len(stacked)} pts (Flag 4 coverage boost).")
-    return stacked.normalize()
+    # Flag 4 remediation: the chosen sector is thin (e.g. BO CVn after heavy
+    # quality masking). Stitch further CLEAN valid sectors of the same flux
+    # source, newest-first (closest in time, so the least period smearing).
+    # LightCurveCollection.stitch() normalises each sector before concatenation.
+    if flux_source == "PDCSAP" and len(lc) < STACK_TARGET_POINTS:
+        extra = [s[0] for s in scored
+                 if s[0] is not lc and s[1]["clean"] in (True, None) and s[2] <= MAX_CADENCE_S]
+        stack, total = [lc], len(lc)
+        for e in extra:
+            if total >= STACK_TARGET_POINTS:
+                break
+            stack.append(e)
+            total += len(e)
+        if len(stack) > 1:
+            stacked = lk.LightCurveCollection(stack).stitch()
+            # stitch() concatenates in list order (newest sector first), so time
+            # runs backwards at each join; Script 03 interpolates in time and needs
+            # it increasing (found in Phase C, Entry 79).
+            stacked = stacked[np.argsort(stacked.time.value)]
+            stacked.meta.update({k: lc.meta.get(k) for k in ("SECTOR", "CROWDSAP", "FLFRCSAP")})
+            info["stacked"] = ";".join(str(_sector(s)) for s in stack)
+            print(f"  Stacked Sectors [{info['stacked']}] -> {len(stacked)} pts (Flag 4 coverage boost).")
+            return stacked.normalize(), info
+
+    print(f"  Selected Sector {info['sector']} ({len(lc)} pts, {cad:.0f} s, {flux_source}): {reason}.")
+    return lc.normalize(), info
 
 
 # =============================================================================
@@ -280,8 +463,9 @@ for target in target_list:
     print("=" * 70)
 
     # ── 4A: RETRIEVE PDCSAP DATA ──────────────────────────────────────────────
-    clean_lc = retrieve_pdcsap_light_curve(
-        star_name, tic_id=tic_id, skip_sectors=target.get("skip_sectors", [])
+    clean_lc, selection = retrieve_pdcsap_light_curve(
+        star_name, tic_id=tic_id, skip_sectors=target.get("skip_sectors", []),
+        orbital_period=orbital_period,
     )
 
     if clean_lc is None:
@@ -290,7 +474,8 @@ for target in target_list:
         continue
 
     active_sector = clean_lc.sector
-    print(f"  Using Sector {active_sector} PDCSAP data.")
+    flux_source   = selection.get("flux_source", "PDCSAP")
+    print(f"  Using Sector {active_sector} {flux_source} data.")
 
     # ── 4B: OUTLIER REJECTION ─────────────────────────────────────────────────
     # 4σ threshold removes high-energy particle events and momentum-dump
@@ -308,6 +493,27 @@ for target in target_list:
     folded_fits_path = os.path.join(paths.LIGHTCURVE_DIR, f"lc_{safe_name}_folded.fits")
     clean_lc.to_fits(clean_fits_path,   overwrite=True)
     folded_lc.to_fits(folded_fits_path, overwrite=True)
+    # Selection provenance in the clean FITS header (lightkurve's to_fits drops
+    # CROWDSAP/FLFRCSAP). 04 and the audits read these; FLUXSRC records that
+    # constant crowding has already been removed (PDCSAP by SPOC, SAP_CROWDCORR
+    # by sap_crowding_corrected), so 04 keeps third light at 0.
+    with fits.open(clean_fits_path, mode="update") as hdul:
+        for hdu in hdul[:2]:
+            hdr = hdu.header
+            hdr["FLUXSRC"]  = (str(flux_source), "flux column used (Pipeline_Log Entry 76)")
+            hdr["LCAUTHOR"] = (str(selection.get("author", "")), "MAST light-curve author")
+            if selection.get("crowdsap") is not None:
+                hdr["CROWDSAP"] = (float(selection["crowdsap"]), "SPOC target flux fraction in aperture")
+            if selection.get("flfrcsap") is not None:
+                hdr["FLFRCSAP"] = (float(selection["flfrcsap"]), "SPOC fraction of target flux captured")
+            ratio = selection.get("pdc_sap_ratio")
+            if ratio is not None and np.isfinite(ratio):
+                hdr["PDCRATIO"] = (float(ratio), "PDC/SAP cycle-amplitude scatter ratio")
+            # FITS header values must be printable ASCII.
+            reason_ascii = str(selection.get("reason", "")).encode("ascii", "replace").decode()
+            hdr["SECTSEL"]  = (reason_ascii[:60], "sector selection reason")
+            if selection.get("stacked"):
+                hdr["STACKED"] = (selection["stacked"], "stitched sectors")
     print(f"  Exported: {clean_fits_path}, {folded_fits_path}")
 
     # Record the cadence so that Script 03 can set the KvW window dynamically
@@ -328,7 +534,7 @@ for target in target_list:
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 20), gridspec_kw={"hspace": 0.45})
     fig.suptitle(
-        f"{star_name} — TESS PDCSAP Mission Data Product\n"
+        f"{star_name} — TESS {flux_source} Light Curve\n"
         f"Sector {active_sector}  |  {date_start_iso} to {date_end_iso}",
         fontsize=18, fontweight="bold",
     )
@@ -350,31 +556,39 @@ for target in target_list:
         0.015, 0.05,
         f"• TESS Sector {active_sector}\n"
         f"• Observation window: {duration_days:.2f} days\n"
-        "• Source: NASA SPOC 2-min cadence",
+        f"• Source: {selection.get('author', '')}, {cadence_seconds:.0f} s cadence",
         transform=axes[0].transAxes, fontsize=11, linespacing=1.4, fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow",
                   edgecolor="orange", alpha=0.9),
     )
 
-    # Panel (b): PDCSAP flux — instrumental systematics removed by SPOC CBVs.
+    # Panel (b): the flux passed downstream — PDCSAP (SPOC CBV-corrected), or
+    # crowding-corrected SAP where PDC distorts the signal (Entry 76).
+    flux_note = {
+        "PDCSAP": "PDCSAP: SPOC co-trended (CBV) SAP, crowding-corrected.",
+        "SAP_CROWDCORR": "SAP, crowding-corrected as SPOC does; slow trend removed\n"
+                         "  by orbit-averaged means (PDC distorted every sector).",
+        "QLP_SAP": "QLP SAP-like flux: no CBV co-trending, no crowding correction.",
+    }.get(flux_source, flux_source)
     axes[1].plot(clean_lc.time.value, clean_lc.flux.value, "b.", ms=1.5, alpha=0.6,
-                 label="PDCSAP Flux")
+                 label=f"{flux_source} flux")
     axes[1].axhline(1.0, color="r", lw=1.2, ls="--")
     axes[1].set_ylabel("Normalised Flux")
     axes[1].set_xlabel("Time (BTJD)")
-    axes[1].set_title("(b) PDCSAP — Mission-Corrected Science Product", loc="left",
+    axes[1].set_title(f"(b) {flux_source} — Science Flux Used Downstream", loc="left",
                       fontsize=13, fontweight="bold")
     axes[1].text(
         0.015, 0.05,
-        "• PDCSAP: Pre-search Data Conditioning SAP.\n"
-        "• Detrending: Instrumental noise removed via SPOC CBVs.\n"
-        "• Eclipse depths preserved for inverse-problem accuracy.",
+        f"• {flux_note}\n"
+        f"• Selection: {selection.get('reason', '')}.\n"
+        f"• PDC/SAP amplitude-scatter ratio: {selection.get('pdc_sap_ratio', float('nan')):.2f}.",
         transform=axes[1].transAxes, fontsize=10, linespacing=1.4,
         bbox=dict(boxstyle="round,pad=0.5", facecolor="lightcyan",
                   edgecolor="gray", alpha=0.85),
     )
 
-    # Panel (c): Phase-folded product — the direct input to PHOEBE 2 modeling.
+    # Panel (c): Quick-look fold at the CATALOGUE period. Diagnostic only: 04 folds
+    # with Script 03's refined ephemeris, not with this.
     axes[2].plot(folded_lc.time.value, folded_lc.flux.value, "r.", ms=2.0, alpha=0.5)
     axes[2].set_ylabel("Normalised Flux")
     axes[2].set_xlabel("Orbital Phase (φ)")
@@ -385,7 +599,7 @@ for target in target_list:
     axes[2].text(
         0.015, 0.05,
         f"• Folded on Kreiner (2004) period P = {orbital_period:.5f} d.\n"
-        "• Depth preserved by PDCSAP; safe for geometric modeling.",
+        "• Diagnostic only; Script 04 folds with Script 03's ephemeris.",
         transform=axes[2].transAxes, fontsize=10, linespacing=1.4,
         bbox=dict(boxstyle="round,pad=0.5", facecolor="honeydew",
                   edgecolor="gray", alpha=0.85),
