@@ -199,6 +199,41 @@ MCMC_BURN_IN_STEPS: int = int(os.environ.get("MCMC_BURNIN", 350))   # steps disc
 
 # Nelder-Mead pre-wash iteration cap (Stage 1). Lower it for trial runs.
 NM_MAXITER: int = int(os.environ.get("NM_MAXITER", 200))
+# Pre-scaled uncertainties (Entry 91). The TESS per-bin sigmas ignore spots,
+# blends and model error, so a typical best fit has chi2_red of 5-150. Sampling
+# against sigmas that small makes the likelihood far too sharp for emcee's
+# stretch move: acceptance collapses, walkers freeze, and the posterior widths
+# are never actually measured (Entries 46-50: GQ Cnc acceptance 0.085 -> 0.42
+# when sigma was multiplied by sqrt(chi2_red) before sampling; published widths
+# understated 2-10x for the fill-out). With SIGMA_PRESCALE on, the dataset
+# sigmas are multiplied by max(1, sqrt(chi2_red at the Nelder-Mead solution))
+# before the sampler starts. The post-hoc err_scale then only mops up what is
+# left (about 1). SIGMA_PRESCALE=0 restores sampling against the raw sigmas.
+SIGMA_PRESCALE: bool = os.environ.get("SIGMA_PRESCALE", "1") != "0"
+
+# Multi-start pre-wash for non-contact stars (Entry 89): each start gets a short
+# "scout" Nelder-Mead, and the best one is polished with the full NM_MAXITER.
+NM_SCOUT_MAXITER: int = min(NM_MAXITER, int(os.environ.get("NM_SCOUT_MAXITER", 80)))
+
+# Mesh-noise gate (Entry 94). PHOEBE's surface mesh changes in steps when a
+# parameter moves by a hair, and chi-squared jumps with it: at 2000 triangles the
+# scatter about a smooth curve exceeds the 1-sigma level (a chi-squared change of
+# 1, after pre-scaling) for 28 of 41 contact stars, and reaches 16 for V1044 Her
+# (Audits/audit_mesh_noise.py). Walkers that land on a lucky spike cannot leave
+# it. The gate measures the scatter at the scouted solution and raises the mesh
+# until it is below the threshold. Per model, 3000 triangles cost 1.7-2.1x and
+# 4000 cost 2.6-3.7x the time of 2000. MESH_NOISE_THRESHOLD=0 turns the gate off.
+MESH_NOISE_THRESHOLD: float = float(os.environ.get("MESH_NOISE_THRESHOLD", 2.0))
+MESH_LADDER: tuple = (2000, 3000, 4000)
+# Lower T2 prior bound for non-contact stars, as a fraction of T1 (was 0.70 until
+# Entry 89: both calibrators, RZ Dra and GW Gem, sat exactly on 0.70 T1 in the
+# right basin; Algol secondaries commonly have T2/T1 of 0.5-0.7).
+T2_FLOOR_NONCONTACT: float = 0.50
+T2_FLOOR_K: float = 3000.0
+# Semi-detached q prior upper bound (was 1.0 until Entry 89). q > 1 means the
+# lobe-filling secondary is the more massive star (pre-reversal "SD1" stage); the
+# result is flagged. Detached stars keep q <= 1.
+Q_MAX_SEMIDETACHED: float = 3.0
 
 # Checkpoint cadence: the MCMC runs in chunks of this many iterations, saving the
 # bundle (chains included) to disk after each chunk. This lets a long run be
@@ -263,13 +298,21 @@ ROCHE_LOBE_CAP: float = float(os.environ.get("ROCHE_LOBE_CAP", 1.0))
 # For EB (detached) systems the inclination floor is set to 60° and radii
 # are capped at 1.0 to prevent ghost-star collapse (requiv → 0 or → overflow).
 
+from morphology import CONTACT_FILLOUT_CEIL                 # noqa: E402  (needed just below)
+
 FREE_PARAMS_CONTACT: dict[str, tuple[float, float, str]] = {
     "teff@secondary":                   (3000, 10000, "Secondary effective temperature (K)"),
     "incl@binary":                      (40.0,  90.0, "Orbital inclination (degrees)"),
     # incl floor lowered 50 -> 40: FI Boo (shallow eclipses) railed exactly at 50°, and
     # contact systems can still eclipse at moderate inclinations. Widening only helps
     # low-i systems; every other completed star sits at i >= 54°, so none are affected.
-    "fillout_factor@contact_envelope":  (FILLOUT_FLOOR, 0.50, "Contact fill-out factor f"),
+    "fillout_factor@contact_envelope":  (FILLOUT_FLOOR, CONTACT_FILLOUT_CEIL,
+                                         "Contact fill-out factor f"),
+    # Upper bound 0.50 -> CONTACT_FILLOUT_CEIL (0.95) in Entry 90: published fill-outs
+    # reach 0.84-0.88, and the old cap was binding (FN Cam, V857 Her, TV Mus). A mesh
+    # probe at 2000 triangles computed every model up to 0.95 for q 0.08-10. Low
+    # fill-outs still fail the mesh at extreme q (e.g. f < 0.1 at q = 0.08); those
+    # proposals are simply rejected.
     # Bounds tightened at BOTH ends to keep walkers out of the mesh-collapse regime
     # (extreme overcontact and the f→0 neck pinch both gave "Mesh failed / Projections
     # failing", lnprob=-inf). Upper 0.70 -> 0.50 covers essentially all W UMa systems;
@@ -293,6 +336,8 @@ FREE_PARAMS_DETACHED: dict[str, tuple[float, float, str]] = {
 FREE_PARAMS_SEMIDETACHED: dict[str, tuple[float, float, str]] = {
     k: v for k, v in FREE_PARAMS_DETACHED.items() if k != "requiv@secondary"
 }
+FREE_PARAMS_SEMIDETACHED["q@binary"] = (0.1, Q_MAX_SEMIDETACHED,
+                                        "Mass ratio m₂/m₁ (q > 1: lobe-filler more massive)")
 
 
 # =============================================================================
@@ -306,7 +351,14 @@ FREE_PARAMS_SEMIDETACHED: dict[str, tuple[float, float, str]] = {
 from morphology import (                                    # noqa: E402
     CONTACT, DETACHED, SEMIDETACHED, MORPHOLOGY_OVERRIDE,
     is_contact_morphology, resolve_morphology, resolve_morphology_kind, morphology_source,
+    CONTACT_FILLOUT_CEIL, read_q_adopted, read_third_light,
 )
+
+# Early warning (Entry 85): preflight, post-NM and per-chunk checks that PARK a
+# wrongly set-up star (and move on) instead of sampling it for days.
+import earlywarn                                            # noqa: E402
+import gravdark                                             # noqa: E402
+HEALTH_CSV = os.path.join(runstats.RUN_STATS_DIR, "05Optimization_health.csv")
 
 
 def free_params_for(kind: str) -> dict:
@@ -339,6 +391,60 @@ def steps_first(chains: np.ndarray) -> np.ndarray:
     if chains.ndim == 3 and chains.shape[0] == MCMC_N_WALKERS and chains.shape[1] != MCMC_N_WALKERS:
         chains = np.swapaxes(chains, 0, 1)
     return chains
+
+
+# Fewer live walkers than this and the gate refuses to declare convergence: τ and
+# R̂ from a handful of walkers are not trustworthy (Entry 84).
+MIN_LIVE_WALKERS: int = max(2, MCMC_N_WALKERS // 2)
+
+
+def lnprob_steps_first(lnprob: np.ndarray, n_steps: int) -> np.ndarray:
+    """Orient PHOEBE's lnprobabilities as (n_steps, n_walkers)."""
+    lnprob = np.asarray(lnprob, dtype=float)
+    if lnprob.ndim == 2 and lnprob.shape[0] != n_steps and lnprob.shape[1] == n_steps:
+        lnprob = lnprob.T
+    return lnprob
+
+
+def live_walkers(lnprob_sf: np.ndarray, start: int) -> list[int]:
+    """
+    Walkers whose lnprob is finite at EVERY step from `start` on.
+
+    A walker that sits at lnprob = −inf has never been at a valid model: emcee
+    never accepts a move to −inf, so once a walker is finite it stays finite. The
+    −inf walkers are the ones initialised outside the valid region (OT Cep: 4 of
+    14 started beyond the Roche lobe and never made one accepted move, Entry 84).
+    They are frozen at an invalid point, so they must not enter τ, R̂ or the
+    posterior. PHOEBE's own adopt_solution already drops −inf samples
+    (lnprob_cutoff = −inf with a strict ">" test), which this matches.
+    """
+    if lnprob_sf.ndim != 2 or lnprob_sf.shape[0] == 0:
+        return []
+    start = min(max(0, start), lnprob_sf.shape[0] - 1)
+    ok = np.all(np.isfinite(lnprob_sf[start:]), axis=0)
+    return [int(w) for w in np.flatnonzero(ok)]
+
+
+def live_chain(bundle: object, solution: str = "best_solution"):
+    """
+    (chains steps-first, burn-in, live walker indices) for the gate and the
+    diagnostics. Burn-in is measured on the walkers live after the fixed floor,
+    then the live set is re-taken after that burn-in (a superset, since burn-in
+    ≥ floor). Falls back to all walkers if lnprobabilities cannot be read.
+    """
+    chains = steps_first(bundle.get_value("samples", solution=solution))
+    n_steps, n_walk = chains.shape[0], chains.shape[1]
+    try:
+        lnp = lnprob_steps_first(
+            bundle.get_value("lnprobabilities", solution=solution), n_steps)
+        floor = min(MCMC_BURN_IN_STEPS, max(0, n_steps - 2))
+        live0 = live_walkers(lnp, floor) or list(range(n_walk))
+        burn  = adaptive_burn_in(chains[:, live0])
+        live  = live_walkers(lnp, burn) or live0
+    except Exception:
+        burn = adaptive_burn_in(chains)
+        live = list(range(n_walk))
+    return chains, burn, live
 
 
 def prior_bounds(bundle: object, twig: str, fallback: tuple) -> tuple[float, float]:
@@ -500,7 +606,7 @@ def assess_autocorrelation_convergence(mcmc_chains: np.ndarray) -> np.ndarray:
         return np.full(mcmc_chains.shape[-1], np.inf)
 
 
-def gelman_rubin_rhat(mcmc_chains: np.ndarray) -> np.ndarray:
+def gelman_rubin_rhat(mcmc_chains: np.ndarray, is_steps_first: bool = False) -> np.ndarray:
     """
     Gelman-Rubin potential scale reduction factor R̂ per parameter (Gelman &
     Rubin 1992; Brooks & Gelman 1998). R̂ → 1 as the between-walker variance
@@ -508,10 +614,12 @@ def gelman_rubin_rhat(mcmc_chains: np.ndarray) -> np.ndarray:
 
     Accepts emcee-native (n_steps, n_walkers, n_params) or the swapped
     (n_walkers, n_steps, n_params); returns np.inf per parameter on failure.
+    The layout is guessed from the full walker count, so a chain restricted to
+    a SUBSET of walkers must pass is_steps_first=True (Entry 84).
     """
     try:
         chains = np.asarray(mcmc_chains)
-        if chains.ndim == 3 and chains.shape[1] == MCMC_N_WALKERS:
+        if chains.ndim == 3 and (is_steps_first or chains.shape[1] == MCMC_N_WALKERS):
             chains = np.swapaxes(chains, 0, 1)          # -> (n_walkers, n_steps, n_params)
         n_w, n_s, n_p = chains.shape
         rhats = np.full(n_p, np.inf)
@@ -547,16 +655,18 @@ def chains_meet_convergence(bundle: object, done: int,
     both variants per star, and Pipeline_Log Entry 47.
     """
     try:
-        chains = np.asarray(bundle.get_value("samples", solution=solution))
+        # Steps-first chain, adaptive burn-in (2·τ_max, floor MCMC_BURN_IN_STEPS) and
+        # the walkers that are at valid models throughout the post-burn-in chain.
+        # Walkers stuck at lnprob = −inf are left out (Entry 84): a frozen walker
+        # makes R̂ meaningless (OT Cep: 11-304 with them, 2.0-2.9 without).
+        tau_chains, trim, live = live_chain(bundle, solution)
     except Exception:
         return False
-    # τ estimator wants time on axis 0 (emcee-native); guard a transposed layout.
-    tau_chains = steps_first(chains)
-    # Adaptive burn-in (2·τ_max, floor MCMC_BURN_IN_STEPS); τ and R̂ are both
-    # measured on the POST-burn-in chain the posterior is drawn from.
-    trim = adaptive_burn_in(tau_chains)
-    tau  = np.atleast_1d(assess_autocorrelation_convergence(tau_chains[trim:]))
-    rhat = np.atleast_1d(gelman_rubin_rhat(tau_chains[trim:]))
+    if len(live) < MIN_LIVE_WALKERS:
+        return False
+    post = tau_chains[trim:, live]
+    tau  = np.atleast_1d(assess_autocorrelation_convergence(post))
+    rhat = np.atleast_1d(gelman_rubin_rhat(post, is_steps_first=True))
     if not (np.all(np.isfinite(tau)) and np.all(np.isfinite(rhat))):
         return False
     tau_ok  = bool(np.all(done > CONVERGENCE_MULTIPLIER * tau))
@@ -612,6 +722,19 @@ def compute_posterior_summary(
     n_steps = samples.shape[0]
     cut     = min(max(0, burnin), max(0, n_steps - 1))
     flat    = samples[cut:, :, :].reshape(-1, samples.shape[2])
+    # Drop samples at lnprob = −inf (walkers frozen at an invalid model, Entry 84).
+    # This is exactly PHOEBE's adopt_solution rule (lnprob > lnprob_cutoff = −inf),
+    # so the σ here and the adopted medians come from the same sample set. Before
+    # this, OT Cep's 4 dead walkers would have widened σ₋(q) from 0.001 to 0.204.
+    try:
+        lnp = lnprob_steps_first(
+            bundle.get_value("lnprobabilities", solution=solution), n_steps)
+        if lnp.shape == samples.shape[:2]:
+            keep = np.isfinite(lnp[cut:, :]).reshape(-1)
+            if keep.any():
+                flat = flat[keep]
+    except Exception:
+        pass
 
     p16, p50, p84 = np.percentile(flat, [16, 50, 84], axis=0)
     for i, twig in enumerate(fitted_twigs):
@@ -681,6 +804,14 @@ def extract_best_fit_parameters(
         "incl_deg":   (incl, incl_m, incl_p),
         "q":          (q, q_m, q_p),
     }
+
+    try:
+        if bundle.get_value("l3_mode", dataset="lc01") == "fraction":
+            l3_val = float(bundle.get_value("l3_frac", dataset="lc01", context="dataset"))
+            l3_m, l3_p = unc("l3_frac") if "l3_frac@lc01" in free_params else (np.nan, np.nan)
+            results["l3_frac"] = (l3_val, l3_m, l3_p)
+    except Exception:
+        pass
 
     if "fillout_factor@contact_envelope" in free_params:
         try:
@@ -768,7 +899,404 @@ def derive_free_params_meta(
     free_params = free_params_for(kind)
     if star_name == "BD And":
         free_params["l3_frac@lc01"] = (0.0, 0.20, "Third-light contamination fraction")
+    _l3 = read_third_light(paths.TARGETS_DIR).get(star_name)
+    if _l3 and _l3["mode"] == "free":
+        free_params["l3_frac@lc01"] = (0.0, _l3["prior_max"], "Third-light fraction")
     return free_params, is_contact, len(free_params)
+
+
+# Winning Nelder-Mead start of the current star and the scout table, for the
+# results provenance rows (Entry 89). ("single", "") for contact stars.
+last_nm_start: tuple = ("", "")
+# Factor the current star's dataset sigmas were multiplied by before sampling.
+last_sigma_prescale: float = 1.0
+# (triangles used, scaled noise there, "2000:3.6; 3000:0.8") from the mesh gate
+last_mesh_info: tuple = (0, float("nan"), "")
+
+# Twig order for applying a start: q first (the Roche-lobe limits depend on it).
+_NM_SET_ORDER = ("q@binary", "requiv@primary", "requiv@secondary", "teff@secondary",
+                 "incl@binary", "fillout_factor@contact_envelope", "l3_frac@lc01")
+
+
+def run_nelder_mead(bundle: object, free_params: dict, maxiter: int, label: str) -> tuple:
+    """
+    One Nelder-Mead run from the bundle's CURRENT values, adopted into the bundle.
+
+    Returns (fitted_lnprobability, {twig: adopted value}, success, message);
+    lnprobability is −inf if the run raised. The simplex is bounded by the same
+    uniform priors as the MCMC (the solver folds them into its merit function).
+    """
+    try:
+        bundle.add_solver("optimizer.nelder_mead", solver="nm_solver", overwrite=True)
+        # The optimiser MUST be told which parameters to fit via `fit_parameters`;
+        # this was previously unset, so the pre-wash optimised nothing.
+        bundle.set_value("fit_parameters", solver="nm_solver", value=list(free_params.keys()))
+        bundle.set_value("priors", solver="nm_solver", value=["my_priors"])
+        bundle.set_value("maxiter", solver="nm_solver", value=int(maxiter))
+        # Starts are ranked by the final lnprobability, which PHOEBE only stores on
+        # request (2 extra forward models). The contact single start does not need it.
+        bundle.set_value("expose_lnprobabilities", solver="nm_solver", value=(label != "single"))
+        bundle.run_solver("nm_solver", solution="nm_solution", overwrite=True)
+        bundle.adopt_solution("nm_solution", adopt_values=True)
+        try:
+            ok  = bool(bundle.get_value("success", solution="nm_solution"))
+            msg = str(bundle.get_value("message", solution="nm_solution"))
+        except Exception:
+            ok, msg = None, "status unavailable"
+        try:
+            lnp = float(bundle.get_value("fitted_lnprobability", solution="nm_solution"))
+        except Exception:
+            lnp = float("nan")
+        values = {t: float(bundle.get_value(t, context=["component", "dataset"]))
+                  for t in free_params}
+        return lnp, values, ok, msg
+    except Exception as nm_error:
+        master_print(f"  [NM warning] {label}: Nelder-Mead failed: {nm_error}")
+        return float("-inf"), {}, False, str(nm_error)
+
+
+def nm_start_labels(kind: str) -> list:
+    """Start points tried for a non-contact star (see apply_nm_start)."""
+    if kind == SEMIDETACHED:
+        return ["prod", "bigP", "bigP_q0.4", "bigP_q1.5"]
+    if kind == CONTACT:
+        return ["seed", "shallow", "deep"]
+    return ["prod", "swap", "bigP", "bigS"]
+
+
+def apply_nm_start(bundle: object, kind: str, label: str, seeds: dict, sma: float) -> None:
+    """
+    Put the bundle at one Nelder-Mead start. T2 and i are reset to the Script-04
+    seed; q is set first because the Roche-lobe limits depend on it.
+
+      prod        the historical seed: r1 = 0.17 a (r2 = 0.24 a if free). On RZ Dra
+                  (q_sp 0.40) this start rails to q = 1 with χ²ν 84 (Entry 87).
+      bigP        big hot primary: r1 = 0.9 (0.8 detached) × its Roche lobe. RZ Dra
+                  from here: q 0.40, χ²ν 1.1 — the literature solution.
+      bigP_q0.4 / bigP_q1.5   the same at another q (semi-detached only), because
+                  the lobe-filling r2 follows q and NM is local.
+      swap        detached: r1 = 0.24 a, r2 = 0.17 a.
+      bigS        detached: big secondary, r2 = 0.8 × its Roche lobe.
+    """
+    def put(twig, value):
+        bundle.set_value(twig, context="component", value=float(value))
+
+    if "l3_frac@lc01" in seeds:
+        bundle.set_value("l3_frac", dataset="lc01", context="dataset",
+                         value=float(seeds["l3_frac@lc01"]))
+
+    if kind == CONTACT:
+        # q is fixed (the adopted value in the bundle). Starts differ in fill-out and
+        # inclination: FN Cam fits started at f = 0.15 stalled near f 0.16 with
+        # chi2r 11-12 where a deeper start reached 0.7-1.6 (Entry 89).
+        #   seed     Script 04's seed (the q-search's own best i, f when available)
+        #   shallow  f = 0.15, i = 82  (the historical start)
+        #   deep     f = 0.70, i = 70
+        put("teff@secondary", seeds["teff@secondary"])
+        f, incl = {"shallow": (0.15, 82.0), "deep": (0.70, 70.0)}.get(
+            label, (seeds["fillout_factor@contact_envelope"], seeds["incl@binary"]))
+        put("incl@binary", incl)
+        put("fillout_factor@contact_envelope", f)
+        return
+
+    q = seeds["q@binary"]
+    if label.startswith("bigP_q"):
+        q = float(label.split("_q")[1])
+    put("q@binary", q)
+    put("teff@secondary", seeds["teff@secondary"])
+    put("incl@binary", seeds["incl@binary"])
+    lobe1 = float(bundle.get_value("requiv_max", component="primary", context="component"))
+    r1 = 0.17 * sma
+    if label.startswith("bigP"):
+        r1 = (0.9 if kind == SEMIDETACHED else 0.8) * lobe1
+    elif label == "swap":
+        r1 = 0.24 * sma
+    put("requiv@primary", min(r1, 0.95 * lobe1))
+    if kind != SEMIDETACHED:
+        lobe2 = float(bundle.get_value("requiv_max", component="secondary", context="component"))
+        r2 = {"swap": 0.17 * sma, "bigP": 0.17 * sma, "bigS": 0.8 * lobe2}.get(label, 0.24 * sma)
+        put("requiv@secondary", min(r2, 0.95 * lobe2))
+
+
+def refresh_secondary_envelope(bundle: object, kind: str, quiet: bool = False) -> None:
+    """
+    Non-contact stars (Entry 93): set the secondary's gravity darkening and albedo
+    from its CURRENT temperature (ramp over 6600-8000 K, gravdark.py). Script 04
+    seeds T2 at 0.95 T1, which for a hot primary puts a cool secondary in the
+    wrong part of the ramp; the values are therefore refreshed at every
+    Nelder-Mead start, before the polish and before sampling, and stay fixed
+    while the sampler runs. Contact stars are left alone (rule unchanged).
+    """
+    if kind == CONTACT:
+        return
+    t2 = float(bundle.get_value("teff", component="secondary", context="component"))
+    beta, albedo = gravdark.coeffs_for(kind, t2)
+    old = float(bundle.get_value("gravb_bol", component="secondary", context="component"))
+    bundle.set_value("gravb_bol@secondary", beta)
+    bundle.set_value("irrad_frac_refl_bol@secondary", albedo)
+    if not quiet:
+        master_print(f"  [physics] secondary for sampling: gravity darkening {beta:.2f} "
+                     f"(was {old:.2f}), albedo {albedo:.2f} at T2 = {t2:.0f} K")
+
+
+def current_mesh_size(bundle: object) -> int:
+    try:
+        return int(max(p.get_value() for p in bundle.filter(qualifier="ntriangles").to_list()))
+    except Exception:
+        return 0
+
+
+def reset_mesh_info(bundle: object) -> None:
+    """Start each star with its own record (the gate may not run: fallback start)."""
+    global last_mesh_info
+    last_mesh_info = (current_mesh_size(bundle), float("nan"), "not probed")
+
+
+def probe_mesh_noise(bundle: object, free_params: dict, kind: str) -> tuple:
+    """
+    Numerical noise of the model at the bundle's current solution and mesh.
+
+    Two scans of 11 forward models, in steps far below any error bar: the
+    inclination over 0.1 degree, and the fill-out (contact) or primary radius
+    (otherwise) over 0.004 (in units of the orbit size for a radius). A smooth
+    model gives a parabola; the rms about a fitted parabola is the noise.
+    Returns (noise / max(1, reduced chi2), reduced chi2 at the centre, failed
+    models). The division is what the sampler sees after the uncertainties are
+    pre-scaled. The bundle's values are restored.
+    """
+    obs = bundle.get_value("fluxes", dataset="lc01", context="dataset")
+    sig = bundle.get_value("sigmas", dataset="lc01", context="dataset")
+
+    def chi2_now() -> float:
+        try:
+            bundle.run_compute(model="mesh_probe", overwrite=True)
+            syn = bundle.get_value("fluxes", dataset="lc01", model="mesh_probe")
+            return float(np.sum(((obs - syn) / sig) ** 2))
+        except Exception:
+            return float("nan")
+
+    sma = float(bundle.get_value("sma", component="binary", context="component"))
+    if kind == CONTACT:
+        third, half3 = "fillout_factor@contact_envelope", 0.002
+    else:
+        third, half3 = "requiv@primary", 0.002 * sma
+    centre_chi2 = chi2_now()
+    worst, failed = 0.0, (0 if np.isfinite(centre_chi2) else 1)
+    for twig, half in (("incl@binary", 0.05), (third, half3)):
+        centre = float(bundle.get_value(twig, context="component"))
+        lo, hi = (free_params[twig][0], free_params[twig][1]) if twig in free_params \
+            else (-np.inf, np.inf)
+        if twig == "requiv@primary":
+            try:        # the prior's upper end is the largest lobe over q, not this q's
+                hi = min(hi, 0.999 * float(bundle.get_value("requiv_max", component="primary",
+                                                            context="component")))
+            except Exception:
+                pass
+        a, b_ = centre - half, centre + half
+        if a < lo:
+            a, b_ = lo, lo + 2 * half
+        if b_ > hi:
+            a, b_ = hi - 2 * half, hi
+        steps = np.linspace(a, b_, 11)
+        vals = []
+        for value in steps:
+            try:
+                bundle.set_value(twig, context="component", value=float(value))
+                vals.append(chi2_now())
+            except Exception:
+                vals.append(float("nan"))
+        bundle.set_value(twig, context="component", value=centre)
+        vals = np.asarray(vals, float)
+        ok = np.isfinite(vals)
+        failed += int((~ok).sum())
+        if ok.sum() >= 5:
+            x = steps[ok] - steps.mean()
+            resid = vals[ok] - np.polyval(np.polyfit(x, vals[ok], 2), x)
+            worst = max(worst, float(np.sqrt(np.mean(resid ** 2))))
+    try:
+        bundle.remove_model("mesh_probe")
+    except Exception:
+        pass
+    red = centre_chi2 / max(1, len(obs) - len(free_params)) if np.isfinite(centre_chi2) else float("nan")
+    scaled = worst / max(1.0, red) if np.isfinite(red) else float("inf")
+    return scaled, red, failed
+
+
+def mesh_noise_gate(bundle: object, free_params: dict, kind: str, star_name: str) -> None:
+    """
+    Choose the mesh for this star (Entry 94): the smallest of MESH_LADDER at which
+    the scaled noise is below MESH_NOISE_THRESHOLD and no model of the scan fails.
+    Called on the best scouted solution, before the polish, so the polish and the
+    sampler run on the chosen mesh. Records the outcome in last_mesh_info.
+    """
+    global last_mesh_info
+    start = current_mesh_size(bundle)
+    if MESH_NOISE_THRESHOLD <= 0:
+        last_mesh_info = (start, float("nan"), "gate off")
+        master_print("  [mesh] gate off (MESH_NOISE_THRESHOLD=0).")
+        return
+    history, tried, n, scaled, failed = [], [], start, float("nan"), 0
+    for n in [m for m in MESH_LADDER if m >= start] or [start]:
+        if n != current_mesh_size(bundle):
+            bundle.set_value_all("ntriangles", n)
+        try:
+            scaled, red, failed = probe_mesh_noise(bundle, free_params, kind)
+        except Exception as probe_error:
+            master_print(f"  [mesh] noise probe unavailable ({probe_error}); mesh left at {n}.")
+            last_mesh_info = (n, float("nan"), "probe unavailable")
+            return
+        history.append(f"{n}:{scaled:.2f}" + (f"(failed {failed})" if failed else ""))
+        tried.append((failed > 0, scaled, n))
+        master_print(f"  [mesh] {n} triangles: noise {scaled:.2f} of a 1-sigma step"
+                     + (f", {failed} of 23 models failed" if failed else "")
+                     + f"  (chi2_red {red:.2f}; limit {MESH_NOISE_THRESHOLD:g})")
+        if scaled < MESH_NOISE_THRESHOLD and failed == 0:
+            break
+    quiet_enough = scaled < MESH_NOISE_THRESHOLD and failed == 0
+    if not quiet_enough and len(tried) > 1:
+        # No mesh passed. The noise does not always fall with the mesh (survey:
+        # IV Dra 3.9 / 7.6 / 4.1 at 2000 / 3000 / 4000), so take the quietest one
+        # tried instead of paying for the largest.
+        _bad, scaled, _best_n = min(tried)
+        failed = int(_bad)
+        if _best_n != n:
+            n = _best_n
+            bundle.set_value_all("ntriangles", n)
+        history.append(f"none below the limit: quietest is {n}")
+    last_mesh_info = (n, scaled, "; ".join(history))
+    if not quiet_enough:
+        master_print(f"  [mesh WARN] no mesh is below the limit; using {n} triangles "
+                     f"(noise {scaled:.2f}); continuing.")
+    if n > start:
+        master_print(f"  [mesh] raised from {start} to {n} triangles for the polish and the sampler.")
+    if mpi_rank == 0:
+        earlywarn.health_event(HEALTH_CSV, run_tracker.run_id, star_name, "post-NM",
+                               "INFO" if quiet_enough else "WARN",
+                               "mesh" if quiet_enough else "mesh_noise_high",
+                               f"{n} triangles | {last_mesh_info[2]}")
+
+
+def multistart_nelder_mead(bundle: object, free_params: dict, kind: str, star_name: str) -> None:
+    """
+    Scout every start with a short NM, then polish the best one (Entry 89).
+    Leaves the bundle at the polished solution and records the winner in
+    last_nm_start. Falls back to the historical single start if every scout fails.
+    """
+    global last_nm_start
+    sma   = float(bundle.get_value("sma", component="binary", context="component"))
+    seeds = {t: float(bundle.get_value(t, context=["component", "dataset"])) for t in free_params}
+    labels = nm_start_labels(kind)
+    master_print(f"  [multi-start] {len(labels)} starts × {NM_SCOUT_MAXITER} scout iterations, "
+                 f"then {NM_MAXITER} from the best (Entry 89; adds roughly "
+                 f"{len(labels) * NM_SCOUT_MAXITER / max(1, NM_MAXITER):.1f}× one pre-wash).")
+    scouts = []
+    for label in labels:
+        try:
+            apply_nm_start(bundle, kind, label, seeds, sma)
+        except Exception as start_error:
+            master_print(f"  [multi-start] {label:<10} could not be set: {start_error}")
+            continue
+        refresh_secondary_envelope(bundle, kind, quiet=True)
+        lnp, values, _ok, _msg = run_nelder_mead(bundle, free_params, NM_SCOUT_MAXITER, label)
+        if values and np.isfinite(lnp):
+            scouts.append((lnp, label, values))
+            r1 = float(bundle.get_value("requiv", component="primary", context="component"))
+            r2 = float(bundle.get_value("requiv", component="secondary", context="component"))
+            q_now = float(bundle.get_value("q", component="binary", context="component"))
+            extra = (f"  f {values['fillout_factor@contact_envelope']:.3f}"
+                     if "fillout_factor@contact_envelope" in values else "")
+            master_print(f"  [multi-start] {label:<10} lnp {lnp:12.1f}  q {q_now:.3f}  "
+                         f"r1/a {r1 / sma:.3f}  r2/a {r2 / sma:.3f}  "
+                         f"i {values['incl@binary']:.2f}  T2 {values['teff@secondary']:.0f}{extra}")
+        else:
+            master_print(f"  [multi-start] {label:<10} failed")
+    if not scouts:
+        master_print("  [multi-start] every scout failed — falling back to the single "
+                     "historical start.")
+        _first = nm_start_labels(kind)[0]
+        apply_nm_start(bundle, kind, _first, seeds, sma)
+        refresh_secondary_envelope(bundle, kind, quiet=True)
+        run_nelder_mead(bundle, free_params, NM_MAXITER, _first)
+        refresh_secondary_envelope(bundle, kind)
+        last_nm_start = (f"{_first}(fallback)", "")
+        return
+    scouts.sort(key=lambda s: -s[0])
+    best_lnp, best_label, best_values = scouts[0]
+    for twig in _NM_SET_ORDER:
+        if twig in best_values:
+            bundle.set_value(twig, context=["component", "dataset"], value=best_values[twig])
+    refresh_secondary_envelope(bundle, kind, quiet=True)
+    _mesh_before = current_mesh_size(bundle)
+    mesh_noise_gate(bundle, free_params, kind, star_name)
+    # A scout's lnp was computed on the starting mesh; after a mesh change it is
+    # not comparable with the polish's (first smoke, ES UMa: a valid polish at
+    # 3000 triangles was discarded against the 2000-triangle scout value).
+    _mesh_changed = current_mesh_size(bundle) != _mesh_before
+    master_print(f"  [multi-start] best start: {best_label} (lnp {best_lnp:.1f}; runner-up "
+                 + (f"{scouts[1][1]} {scouts[1][0]:.1f}" if len(scouts) > 1 else "none")
+                 + f") — polishing with {NM_MAXITER} iterations.")
+    lnp, values, ok, msg = run_nelder_mead(bundle, free_params, NM_MAXITER, f"polish:{best_label}")
+    if not values or not np.isfinite(lnp) or (lnp < best_lnp and not _mesh_changed):
+        # The polish must never end worse than the scout it started from.
+        for twig in _NM_SET_ORDER:
+            if twig in best_values:
+                bundle.set_value(twig, context=["component", "dataset"], value=best_values[twig])
+        master_print(f"  [multi-start] polish did not improve on the scout — keeping the scout "
+                     f"solution ({best_label}, lnp {best_lnp:.1f}).")
+    else:
+        _state = {True: "converged", False: "did NOT converge", None: "finished"}[ok]
+        master_print(f"  Nelder-Mead polish {_state} ({msg}); lnp {lnp:.1f} — adopted as MCMC "
+                     "starting point.")
+    last_nm_start = (best_label, "; ".join(f"{lab}:{lp:.1f}" for lp, lab, _v in scouts))
+    # the values the sampler will use: from the fitted temperature of the secondary
+    refresh_secondary_envelope(bundle, kind)
+    if mpi_rank == 0:
+        earlywarn.health_event(HEALTH_CSV, run_tracker.run_id, star_name, "post-NM", "INFO",
+                               "nm_start", f"{best_label} | {last_nm_start[1]}")
+
+
+# Stars whose PARK findings were overridden with IGNORE_PARK in this run; their
+# results carry a park_overridden flag (Entry 85).
+PARK_OVERRIDDEN: set = set()
+
+
+def report_findings(star_name: str, stage: str, parks: list, warns: list,
+                    values: Optional[dict] = None) -> None:
+    """
+    Print and log early-warning findings; raise earlywarn.StarParked for PARK
+    findings unless the star is named in IGNORE_PARK (then they are downgraded to
+    warnings and the star's results get a park_overridden flag).
+
+    parks: [(code, detail, fix)], warns: [(code, detail)].
+    """
+    overridden = star_name in earlywarn.ignored_stars()
+    _event = earlywarn.health_event if mpi_rank == 0 else (lambda *a: None)
+    for code, detail in warns:
+        master_print(f"  [{stage} WARN] {code}: {detail}")
+        _event(HEALTH_CSV, run_tracker.run_id, star_name, stage, "WARN", code, detail)
+    for code, detail, fix in parks:
+        level = "OVERRIDDEN" if overridden else "PARK"
+        master_print(f"  [{stage} {level}] {code}: {detail}\n      fix: {fix}")
+        _event(HEALTH_CSV, run_tracker.run_id, star_name, stage, level, code, detail)
+    if parks and overridden:
+        PARK_OVERRIDDEN.add(star_name)
+        master_print(f"  [{stage}] IGNORE_PARK names {star_name}: continuing anyway.")
+    elif parks:
+        raise earlywarn.StarParked(stage, parks, values)
+
+
+def park_star(star_name: str, safe_name: str, input_sha: str, park,
+              checkpoint: Optional[str] = None) -> None:
+    """Write data/results/parked_<star>.txt and close the star as 'parked'."""
+    path = earlywarn.parked_path(paths.RESULTS_DIR, safe_name)
+    if mpi_rank == 0:
+        earlywarn.write_parked(path, star_name, run_tracker.run_id, input_sha, park.stage,
+                               park.findings, park.values,
+                               checkpoint if checkpoint and os.path.exists(checkpoint) else None)
+    master_print(f"  [parked] {star_name} at {park.stage}: "
+                 f"{'; '.join(c for c, _, _ in park.findings)} — see {path}. Moving on.")
+    run_tracker.star_end(star_name, "parked",
+                         reason=f"{park.stage}: {'; '.join(c for c, _, _ in park.findings)}")
 
 
 def prepare_bundle_for_mcmc(
@@ -794,9 +1322,19 @@ def prepare_bundle_for_mcmc(
     # ── 5A: RADIATIVE PHYSICS ─────────────────────────────────────────────────
     # Re-apply physics coefficients here in case the bundle was saved with
     # default values or the temperature was adjusted since Script 04.
+    _kind = resolve_morphology_kind(star_name, variable_type)
     for component in ["primary", "secondary"]:
         teff = bundle.get_value(f"teff@{component}")
-        if teff >= RADIATIVE_CONVECTIVE_BOUNDARY_K:
+        if _kind != CONTACT:
+            # Entry 93: non-contact stars follow a ramp over 6600-8000 K at their
+            # own temperature (gravdark.py). The secondary's values are refreshed
+            # from its fitted temperature during the Nelder-Mead stage.
+            _beta, _albedo = gravdark.coeffs_for(_kind, teff)
+            bundle.set_value(f"gravb_bol@{component}", _beta)
+            bundle.set_value(f"irrad_frac_refl_bol@{component}", _albedo)
+            master_print(f"  [physics] {component}: gravity darkening {_beta:.2f}, albedo "
+                         f"{_albedo:.2f}  ({teff:.0f} K; ramp 6600-8000 K)")
+        elif teff >= RADIATIVE_CONVECTIVE_BOUNDARY_K:
             bundle.set_value(f"gravb_bol@{component}", 1.0)
             bundle.set_value(f"irrad_frac_refl_bol@{component}", 1.0)
             master_print(f"  [physics] {component}: radiative  β₁=1.0, A=1.0  ({teff:.0f} K)")
@@ -809,7 +1347,6 @@ def prepare_bundle_for_mcmc(
     # compute use the same model (contact = Wilson, otherwise Horvat). Script 04
     # stores it since 2026-10; set here too so an older bundle cannot sample with
     # PHOEBE's default (Horvat) and report with Wilson (Entry 76).
-    _kind = resolve_morphology_kind(star_name, variable_type)
     bundle.set_value("irrad_method", compute="phoebe01",
                      value="wilson" if _kind == CONTACT else "horvat")
 
@@ -888,6 +1425,21 @@ def prepare_bundle_for_mcmc(
         except Exception as ld_error:
             master_print(f"  [LD warning] {comp}: {ld_error}")
 
+    # ── 5C-b: PREFLIGHT (Entry 85) ───────────────────────────────────────────
+    # Seconds, before the Nelder-Mead hour: geometry vs routing, stale bundle,
+    # period, data order/finiteness, exposure integration, irradiation. Each
+    # past incident of this kind (fti reset, unsorted stitching, new routing on
+    # an old bundle) cost a run; now it parks the star with the fix named.
+    _safe = star_name.replace(" ", "_")
+    _findings = (earlywarn.preflight_file_checks(_safe, bundle_path, paths.LIGHTCURVE_DIR,
+                                                 paths.TIMING_DIR)
+                 + earlywarn.preflight_bundle_checks(
+                     bundle, _kind, earlywarn.read_ephem_period(paths.TIMING_DIR, _safe),
+                     q_adopted=read_q_adopted(paths.QSEARCH_DIR, star_name),
+                     q_required=True))
+    report_findings(star_name, "preflight", _findings, [])
+    master_print(f"  [preflight] {'OK' if not _findings else f'{len(_findings)} finding(s)'}")
+
     # ── 5D: FREE PARAMETERS & PRIORS ─────────────────────────────────────────
     morphology_kind   = resolve_morphology_kind(star_name, variable_type)
     is_contact_binary = morphology_kind == CONTACT
@@ -908,7 +1460,8 @@ def prepare_bundle_for_mcmc(
         # W-type W UMa systems can have T2 > T1; allow up to 25% above T1.
         t2_lower, t2_upper = 0.80 * t1_current, 1.25 * t1_current
     else:
-        t2_lower, t2_upper = 0.70 * t1_current, 1.10 * t1_current
+        t2_lower = max(T2_FLOOR_K, T2_FLOOR_NONCONTACT * t1_current)
+        t2_upper = 1.10 * t1_current
 
     # --- β₁ regime lock (fixes the frozen-gravity-darkening bug) -------------
     # gravb_bol / irrad_frac_refl_bol are set once (5A) from the current
@@ -919,9 +1472,16 @@ def prepare_bundle_for_mcmc(
     # so the coefficient assigned in 5A is valid for the entire chain. The hard
     # discontinuity at 8000 K (Lucy 1967 ↔ von Zeipel 1924) makes sampling across
     # it ill-defined anyway; locking to one regime is the self-consistent choice.
+    # Entry 93: the lock applies to CONTACT stars only. A non-contact star's
+    # coefficients follow a continuous ramp and are refreshed from the fitted T2,
+    # so there is no boundary to straddle. The lock had also forced T2 >= 8000 K
+    # for V1034 Cyg, RU UMi and GK Cep (seed T2 = 0.95 T1 above 8000 K), whatever
+    # the real temperature of their secondaries.
     t2_current = bundle.get_value("teff@secondary", context="component")
     boundary   = RADIATIVE_CONVECTIVE_BOUNDARY_K
-    if t2_current >= boundary and t2_lower < boundary < t2_upper:
+    if not is_contact_binary:
+        regime_note = "no regime lock: gravity darkening follows a ramp"
+    elif t2_current >= boundary and t2_lower < boundary < t2_upper:
         t2_lower    = boundary
         regime_note = "locked ≥8000 K (radiative β₁=1.0)"
     elif t2_current < boundary and t2_lower < boundary < t2_upper:
@@ -1003,6 +1563,25 @@ def prepare_bundle_for_mcmc(
         free_params["l3_frac@lc01"] = (0.0, 0.20, "Third-light contamination fraction")
         master_print("  [physics] BD And: third-light fraction l3 enabled (0–20%).")
 
+    # Known multiple systems (Targets/third_light.csv, Entry 91): a companion's
+    # constant light dilutes the eclipses, and a model without it compensates with
+    # a lower inclination. `free` fits the fraction; `fixed` holds the published one.
+    _l3 = read_third_light(paths.TARGETS_DIR).get(star_name)
+    if _l3:
+        bundle.set_value("l3_mode", dataset="lc01", value="fraction")
+        if _l3["mode"] == "free":
+            _seed = min(_l3["l3_published"] if _l3["l3_published"] is not None else 0.2,
+                        0.9 * _l3["prior_max"])
+            bundle.set_value("l3_frac", dataset="lc01", context="dataset", value=_seed)
+            free_params["l3_frac@lc01"] = (0.0, _l3["prior_max"], "Third-light fraction")
+            master_print(f"  [physics] third light FREE in [0, {_l3['prior_max']}] "
+                         f"(seed {_seed:.2f}; published {_l3['l3_published']}; {_l3['reference']})")
+        else:
+            bundle.set_value("l3_frac", dataset="lc01", context="dataset",
+                             value=_l3["l3_published"])
+            master_print(f"  [physics] third light FIXED at {_l3['l3_published']} "
+                         f"({_l3['reference']})")
+
     n_free_params = len(free_params)
 
     master_print(f"\n  [5D] Configuring {n_free_params} free parameters and priors...")
@@ -1023,34 +1602,53 @@ def prepare_bundle_for_mcmc(
     # every step — see 5B.)
 
     # ── 5E: STAGE 1 — NELDER-MEAD PRE-WASH ──────────────────────────────────
-    master_print(f"\n  [Stage 1] Nelder-Mead simplex pre-wash (max {NM_MAXITER} iterations)...")
-    try:
-        bundle.add_solver("optimizer.nelder_mead", solver="nm_solver", overwrite=True)
-        # The optimiser MUST be told which parameters to fit via `fit_parameters`;
-        # this was previously unset, so the pre-wash optimised nothing (and an
-        # earlier attempt to bound it via ParameterSet.set_limits raised and skipped
-        # NM entirely). Bound the simplex with the SAME uniform priors as the MCMC
-        # (the nelder_mead solver folds the prior into its merit function), so it
-        # stays inside the physical ranges — including the Eggleton requiv caps.
-        bundle.set_value("fit_parameters", solver="nm_solver",
-                         value=list(free_params.keys()))
-        bundle.set_value("priors", solver="nm_solver", value=["my_priors"])
-        bundle.set_value("maxiter", solver="nm_solver", value=NM_MAXITER)
+    # Contact stars: one NM from the Script-04 seed, as before. Non-contact stars:
+    # multi-start (Entry 89). A single start at r1 = 0.17 a trapped NM in a
+    # "small hot star / big cool star" basin where only a larger q widens the
+    # eclipses, so q railed at its bound — RZ Dra (q_sp 0.40) reproduced it, and
+    # recovered its literature solution from a big-primary start (Entry 87).
+    global last_nm_seconds, last_nm_start
+    _nm_t0 = time.time()
+    master_print("\n  [Stage 1] Nelder-Mead multi-start pre-wash...")
+    reset_mesh_info(bundle)
+    multistart_nelder_mead(bundle, free_params, morphology_kind, star_name)
+    last_nm_seconds = time.time() - _nm_t0
 
-        global last_nm_seconds
-        _nm_t0 = time.time()
-        bundle.run_solver("nm_solver", solution="nm_solution", overwrite=True)
-        last_nm_seconds = time.time() - _nm_t0
-        bundle.adopt_solution("nm_solution", adopt_values=True)
+    # ── 5E-b: POST-NM GATE (Entry 85) ────────────────────────────────────────
+    # A DETACHED star whose NM solution fills a Roche lobe is the V358 Cep / OT Cep
+    # signature: the MCMC would sit against the lobe for days. Park it now, with
+    # the NM values recorded so the decision needs no re-run. Railed values only warn.
+    _parks, _warns, _nm_values = earlywarn.post_nm_assess(
+        bundle, {t: (lo, hi) for t, (lo, hi, _d) in free_params.items()}, morphology_kind)
+    report_findings(star_name, "post-NM", _parks, _warns, _nm_values)
+    _lobe = ", ".join(f"{k.split('@')[1]} {v:.3f}" for k, v in _nm_values.items()
+                      if k.startswith("requiv/requiv_max"))
+    master_print(f"  [post-NM] {'OK' if not (_parks or _warns) else 'see above'}"
+                 + (f"  (r/requiv_max: {_lobe})" if _lobe else ""))
+
+    # ── 5E-c: PRE-SCALED UNCERTAINTIES (Entry 91) ────────────────────────────
+    # One forward model at the Nelder-Mead solution gives chi2_red against the raw
+    # sigmas; the sigmas are then inflated so the sampler sees chi2_red ~ 1.
+    global last_sigma_prescale
+    last_sigma_prescale = 1.0
+    if SIGMA_PRESCALE:
         try:
-            _nm_ok  = bool(bundle.get_value("success", solution="nm_solution"))
-            _nm_msg = str(bundle.get_value("message", solution="nm_solution"))
-        except Exception:
-            _nm_ok, _nm_msg = None, "status unavailable"
-        _nm_state = {True: "converged", False: "did NOT converge", None: "finished"}[_nm_ok]
-        master_print(f"  Nelder-Mead {_nm_state} ({_nm_msg}) — adopted as MCMC starting point.")
-    except Exception as nm_error:
-        master_print(f"  [NM warning] Pre-wash failed: {nm_error}. Using initial guess.")
+            bundle.run_compute(model="nm_model", overwrite=True)
+            _obs = bundle.get_value("fluxes", dataset="lc01", context="dataset")
+            _sig = bundle.get_value("sigmas", dataset="lc01", context="dataset")
+            _syn = bundle.get_value("fluxes", dataset="lc01", model="nm_model")
+            _chi2r_nm = float(np.sum(((_obs - _syn) / _sig) ** 2)
+                              / max(1, len(_obs) - n_free_params))
+            if np.isfinite(_chi2r_nm) and _chi2r_nm > 1.0:
+                last_sigma_prescale = float(np.sqrt(_chi2r_nm))
+                bundle.set_value("sigmas", dataset="lc01", context="dataset",
+                                 value=_sig * last_sigma_prescale)
+            master_print(f"  [prescale] χ²ν at the Nelder-Mead solution = {_chi2r_nm:.2f}; "
+                         f"sampling with σ × {last_sigma_prescale:.3f}")
+        except Exception as prescale_error:
+            master_print(f"  [prescale] unavailable ({prescale_error}); sampling with raw σ.")
+    else:
+        master_print("  [prescale] off (SIGMA_PRESCALE=0): sampling with raw σ.")
 
     # ── 5D-b: emcee INITIALISATION BALL (must follow the 5E adoption) ────────
     # This block reads `bundle.get_value(twig)`, so it MUST run AFTER
@@ -1099,6 +1697,13 @@ def prepare_bundle_for_mcmc(
         "sampler.emcee",
         solver="mcmc_sampler",
         init_from="my_init",
+        # PHOEBE's default (limits, priors) lets a starting walker sit outside the
+        # Roche lobe: OT Cep's NM solution touched the lobe, 7 of 14 walkers started
+        # at lnprob = −inf and 4 never moved (Entry 84). "checks" redraws any start
+        # that fails run_checks (overflow included) — no forward model, so cheap;
+        # PHOEBE retries 25 times per walker, then raises. Fresh starts only: a
+        # resumed chain (continue_from) keeps its walkers.
+        init_from_requires=["limits", "priors", "checks"],
         priors="my_priors",
         nwalkers=MCMC_N_WALKERS,
         niters=MCMC_N_ITERATIONS,
@@ -1122,11 +1727,10 @@ VARIABLE_BLENDS: dict[str, str] = {
 # them < 3 % of light-curve amplitude (Audits/kept_results_caveats.csv), so they
 # are documented rather than refitted. Without this list the Entry-77 skip rule
 # would supersede and refit them, because they carry no input_bundle_sha row.
-KEEP_PRE_AUDIT_RESULTS: frozenset = frozenset({
-    "BO CVn", "DF Hya", "EF Cep", "EF Dra", "FP Boo", "FU Dra", "GQ Cnc", "HI Pup",
-    "II UMa", "NU Cyg", "RT Hyi", "RW Dor", "TY Men", "TY UMa", "V1044 Her",
-    "V1055 Her", "V1128 Tau", "V1918 Cyg", "V776 Cas", "V842 Her", "VW Cep", "Y Sex",
-})
+KEEP_PRE_AUDIT_RESULTS: frozenset = frozenset()
+# Emptied in Entry 90: the 22 results kept in Entry 78 were all contact stars fitted
+# with q fixed at 0.5, which biases i by 5-16 degrees; the user chose to refit them
+# with the adopted q. The mechanism stays for any future "keep" decision.
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1236,6 +1840,7 @@ PARAM_DISPLAY_LABELS: dict[str, tuple[str, str]] = {
     "r1_frac":          ("Primary fractional radius r₁ = R₁/a",   "—"),
     "r2_frac":          ("Secondary fractional radius r₂ = R₂/a", "—"),
     "fillout_factor":   ("Contact fill-out factor f",  "—"),
+    "l3_frac":          ("Third-light fraction l₃",    "—"),
 }
 
 # Provenance row in Runs/run_stats/runs.csv: code fingerprint (this script, the chain
@@ -1248,6 +1853,7 @@ run_tracker.record_provenance(
         "MCMC_CHECKPOINT_NITERS": MCMC_CHECKPOINT_NITERS,
         "MCMC_MIN_NITERS": MCMC_MIN_NITERS, "MCMC_MAX_NITERS": MCMC_MAX_NITERS,
         "MCMC_FIXED_MODE": MCMC_FIXED_MODE, "MCMC_BURN_IN_STEPS": MCMC_BURN_IN_STEPS,
+        "SIGMA_PRESCALE": SIGMA_PRESCALE, "NM_SCOUT_MAXITER": NM_SCOUT_MAXITER,
         "NM_MAXITER": NM_MAXITER, "CONVERGENCE_MULTIPLIER": CONVERGENCE_MULTIPLIER,
         "RHAT_CONVERGENCE_THRESHOLD": RHAT_CONVERGENCE_THRESHOLD,
         "FILLOUT_FLOOR": FILLOUT_FLOOR, "ROCHE_LOBE_CAP": ROCHE_LOBE_CAP,
@@ -1255,6 +1861,7 @@ run_tracker.record_provenance(
     },
     code_files=[os.path.abspath(__file__), runstats.__file__, paths.__file__,
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "morphology.py"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "earlywarn.py"),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "Audits",
                              "audit_mcmc_chains.py")],
 )
@@ -1274,7 +1881,16 @@ def _is_complete(name: str) -> bool:
     return bool(recorded) and recorded == file_sha(os.path.join(paths.BUNDLE_DIR, f"bundle_{safe}.phoebe"))
 
 
-target_pending = [not _is_complete(t["name"]) for t in target_list]
+def _is_parked(name: str) -> bool:
+    """Parked (Entry 85) for the CURRENT bundle and not overridden: skipped this run."""
+    safe = name.replace(" ", "_")
+    meta = earlywarn.read_parked(earlywarn.parked_path(paths.RESULTS_DIR, safe))
+    return (bool(meta) and name not in earlywarn.ignored_stars()
+            and meta.get("input_bundle_sha", "") == file_sha(
+                os.path.join(paths.BUNDLE_DIR, f"bundle_{safe}.phoebe")))
+
+
+target_pending = [not (_is_complete(t["name"]) or _is_parked(t["name"])) for t in target_list]
 
 # Per-star locks (see acquire_star_lock): the lock held for the current star is
 # released when the loop moves on, and at exit whatever the exit path.
@@ -1329,6 +1945,30 @@ for target_index, target in enumerate(target_list):
         _held_lock.append(safe_name)
 
     input_sha = file_sha(bundle_path)
+
+    # Parked (Entry 85): skip while the park's bundle sha is the current one; a
+    # rebuilt bundle resolves the park (renamed *_resolved_<date>.txt) and the star
+    # is fitted. Checked before the supersede logic, so parking never touches old
+    # results. IGNORE_PARK="<star>" fits it anyway.
+    _park_file = earlywarn.parked_path(paths.RESULTS_DIR, safe_name)
+    _park_meta = earlywarn.read_parked(_park_file)
+    if _park_meta:
+        if star_name in earlywarn.ignored_stars():
+            master_print(f"  [parked] {star_name} is parked ({_park_meta.get('reason', '?')}) "
+                         "but named in IGNORE_PARK — fitting anyway.")
+            PARK_OVERRIDDEN.add(star_name)
+        elif _park_meta.get("input_bundle_sha", "") == input_sha:
+            master_print(f"  [parked] {star_name} was parked at {_park_meta.get('stage', '?')} "
+                         f"({_park_meta.get('reason', '?')}) for this bundle — skipped. "
+                         f"See {_park_file}.")
+            run_tracker.star_end(star_name, "skipped",
+                                 reason=f"parked: {_park_meta.get('reason', '?')}")
+            continue
+        else:
+            _resolved = earlywarn.resolve_parked(_park_file) if mpi_rank == 0 else _park_file
+            master_print(f"  [parked] bundle rebuilt since the park ({_park_meta.get('input_bundle_sha')} "
+                         f"→ {input_sha}); park resolved ({_resolved}). Fitting.")
+
     if os.path.exists(results_path):
         recorded = read_results_meta(results_path).get("input_bundle_sha", "")
         if recorded and recorded == input_sha:
@@ -1358,6 +1998,9 @@ for target_index, target in enumerate(target_list):
     # (sidecar <checkpoint>.input_sha written at the fresh start); otherwise it is
     # set aside and the star starts fresh.
     sidecar = mcmc_checkpoint + ".input_sha"
+    nm_sidecar = mcmc_checkpoint + ".nm_start"      # winning Nelder-Mead start (Entry 89)
+    mesh_sidecar = mcmc_checkpoint + ".mesh"        # mesh chosen by the noise gate (Entry 94)
+    ps_sidecar = mcmc_checkpoint + ".sigma_prescale"  # sigma factor applied before sampling
     if os.path.exists(mcmc_checkpoint):
         try:
             started_from = open(sidecar, encoding="utf-8").read().strip()
@@ -1381,21 +2024,61 @@ for target_index, target in enumerate(target_list):
         free_params, is_contact_binary, n_free_params = derive_free_params_meta(
             star_name, variable_type,
         )
+        # Preflight on resume (Entry 85): upstream staleness and geometry only; the
+        # data and compute options were checked when this chain was started.
+        _kind_now = resolve_morphology_kind(star_name, variable_type)
+        _findings = (earlywarn.preflight_file_checks(safe_name, bundle_path,
+                                                     paths.LIGHTCURVE_DIR, paths.TIMING_DIR)
+                     + [f for f in earlywarn.preflight_bundle_checks(bundle, _kind_now, None,
+                                                                     check_data=False)
+                        if f[0] == "morphology_mismatch"])
+        try:
+            report_findings(star_name, "preflight", _findings, [])
+        except earlywarn.StarParked as park:
+            park_star(star_name, safe_name, input_sha, park, mcmc_checkpoint)
+            continue
         already = completed_iterations(bundle, "best_solution")
         master_print(f"  [resume] Loaded {mcmc_checkpoint} — {already}/{MCMC_MAX_NITERS} "
                      "iterations already complete.")
+        try:
+            _label, _, _table = open(nm_sidecar, encoding="utf-8").read().strip().partition(" | ")
+            nm_info = (_label, _table)
+        except OSError:
+            nm_info = ("unrecorded (chain started before Entry 89)", "")
+        try:
+            _n, _s, _h = open(mesh_sidecar, encoding="utf-8").read().strip().split(" | ", 2)
+            mesh_info = (int(_n), float(_s), _h)
+        except (OSError, ValueError):
+            mesh_info = (current_mesh_size(bundle), float("nan"), "unrecorded")
+        try:
+            sigma_prescale = float(open(ps_sidecar, encoding="utf-8").read().strip())
+        except (OSError, ValueError):
+            sigma_prescale = 1.0          # chain started before Entry 91: raw sigmas
     else:
         already   = 0
         _setup_t0 = time.time()
-        prepared  = prepare_bundle_for_mcmc(star_name, variable_type, bundle_path)
+        try:
+            prepared  = prepare_bundle_for_mcmc(star_name, variable_type, bundle_path)
+        except earlywarn.StarParked as park:
+            park_star(star_name, safe_name, input_sha, park)
+            continue
         setup_seconds = time.time() - _setup_t0
         if prepared is None:
             run_tracker.star_end(star_name, "skipped", reason="bundle not found")
             continue
         bundle, free_params, is_contact_binary, n_free_params = prepared
+        nm_info = last_nm_start
+        sigma_prescale = last_sigma_prescale
+        mesh_info = last_mesh_info
         if mpi_rank == 0:
+            with open(mesh_sidecar, "w", encoding="utf-8") as fh:
+                fh.write(f"{mesh_info[0]} | {mesh_info[1]:.4g} | {mesh_info[2]}\n")
+            with open(ps_sidecar, "w", encoding="utf-8") as fh:
+                fh.write(f"{sigma_prescale:.9g}\n")
             with open(sidecar, "w", encoding="utf-8") as fh:
                 fh.write(input_sha + "\n")
+            with open(nm_sidecar, "w", encoding="utf-8") as fh:
+                fh.write(f"{nm_info[0]} | {nm_info[1]}\n")
 
     # ── 5F: STAGE 2 — CHUNKED MCMC WITH CHECKPOINTING ────────────────────────
     # Run the sampler in MCMC_CHECKPOINT_NITERS-sized chunks, saving the bundle
@@ -1429,6 +2112,17 @@ for target_index, target in enumerate(target_list):
     # Failed-model baseline: carried over on a resume; 0 on a fresh star (no solution
     # exists yet, so reading it would return "unavailable").
     failed_before = read_failed_models(bundle)[0] if done else 0
+    # Per-reason baseline for the chunk tripwires (Entry 85), same carry-over rule.
+    try:
+        reasons_before = (earlywarn.failed_by_reason(
+            bundle.get_value("failed_samples", solution="best_solution")) if done else {})
+    except Exception:
+        reasons_before = {}
+    health_bounds = {t: prior_bounds(bundle, t, (lo, hi))
+                     for t, (lo, hi, _d) in free_params.items()}
+    health_kind   = resolve_morphology_kind(star_name, variable_type)
+    last_warn_codes: tuple = ()
+    parked_mid = False
     while done < MCMC_MAX_NITERS:
         prev_done = done
         # +1 compensates for the continue_from overlap (a resumed chunk re-uses the
@@ -1513,6 +2207,37 @@ for target_index, target in enumerate(target_list):
         except Exception as stats_error:
             master_print(f"  [eta] chunk statistics unavailable: {stats_error}")
 
+        # ── 5F-c: chunk tripwires (Entry 85) ─────────────────────────────────
+        # Live walkers, Roche-overflow share of this chunk, walkers pinned at the
+        # lobe (detached), frozen walkers, acceptance, railing. A PARK finding ends
+        # this star here (checkpoint kept, resumable) and the queue moves on. The
+        # check itself must never stop a healthy run, so only StarParked escapes.
+        try:
+            _chain = steps_first(bundle.get_value("samples", solution="best_solution"))
+            _lnp   = lnprob_steps_first(
+                bundle.get_value("lnprobabilities", solution="best_solution"), _chain.shape[0])
+            _reasons = earlywarn.failed_by_reason(
+                bundle.get_value("failed_samples", solution="best_solution"))
+            _parks, _warns, _hsum = earlywarn.chunk_assess(
+                _chain, _lnp, list(bundle.get_value("fitted_twigs", solution="best_solution")),
+                health_bounds, health_kind,
+                float(bundle.get_value("sma", component="binary", context="component")),
+                prev_done, done, _reasons, reasons_before, MIN_LIVE_WALKERS)
+            reasons_before = _reasons
+            master_print(earlywarn.summary_line(_hsum, _parks, _warns))
+            # Log warnings only when the set changes (railing would repeat every chunk).
+            _codes = tuple(sorted({c for c, _ in _warns}))
+            report_findings(star_name, f"chunk {done}", _parks,
+                            _warns if _codes != last_warn_codes else [],
+                            dict(_hsum, step=done))
+            last_warn_codes = _codes
+        except earlywarn.StarParked as park:
+            park_star(star_name, safe_name, input_sha, park, mcmc_checkpoint)
+            parked_mid = True
+            break
+        except Exception as health_error:
+            master_print(f"  [health] chunk check unavailable: {health_error}")
+
         if done <= prev_done:
             # No forward progress (continue_from overlap at the tail): stop here and
             # treat the chain as complete rather than spinning forever.
@@ -1530,6 +2255,8 @@ for target_index, target in enumerate(target_list):
             converged_early = True
             break
 
+    if parked_mid:
+        continue
     if mcmc_failed and done == 0:
         master_print("  No usable samples produced — skipping target.")
         run_tracker.star_end(star_name, "failed", reason="MCMC produced no samples",
@@ -1546,14 +2273,22 @@ for target_index, target in enumerate(target_list):
 
     # ── 5G: AUTOCORRELATION CONVERGENCE DIAGNOSTICS ───────────────────────────
     master_print("\n  [5G] Convergence diagnostics — Integrated Autocorrelation Time τ...")
+    live_idx: list | None = None      # None = all walkers (helper failed below)
+    dead_idx: list = []
     try:
         # emcee.autocorr.integrated_time wants time on axis 0 (PHOEBE's native
         # (n_steps, n_walkers, n_params) layout); steps_first guards a transposed one.
-        raw_chains = steps_first(bundle.get_value("samples", solution="best_solution"))
-        burn_used  = adaptive_burn_in(raw_chains)
-        tau_values = assess_autocorrelation_convergence(raw_chains[burn_used:])
+        # Same helper as the gate: burn-in and τ on the walkers that stay at valid
+        # models after burn-in; −inf (dead) walkers are listed and left out.
+        raw_chains, burn_used, live_idx = live_chain(bundle, "best_solution")
+        dead_idx   = [w for w in range(raw_chains.shape[1]) if w not in live_idx]
+        tau_values = assess_autocorrelation_convergence(raw_chains[burn_used:, live_idx])
         master_print(f"  burn-in used: {burn_used} steps "
                      f"(max({MCMC_BURN_IN_STEPS}, 2·τ_max)); τ measured after it")
+        if dead_idx:
+            master_print(f"  [dead walkers] {len(dead_idx)}/{raw_chains.shape[1]} at "
+                         f"lnprob = −inf after burn-in (walkers {dead_idx}) — excluded "
+                         f"from τ, R̂ and the posterior")
 
         master_print(f"  {'Parameter':<40} {'τ (steps)':>12}  {'Status'}")
         master_print("  " + "─" * 70)
@@ -1610,6 +2345,11 @@ for target_index, target in enumerate(target_list):
     chi2, chi2_red, n_obs = compute_reduced_chi2(bundle, n_free_params)
     master_print(f"\n  Final reduced χ² = {chi2_red:.4f}  at the marginal medians  "
                  f"(N = {n_obs}, dof = {n_obs - n_free_params})")
+    if last_sigma_prescale != 1.0:
+        # Patch 14: this line is relative to the PRE-SCALED σ; the results file
+        # reports χ² against the original ones.
+        master_print(f"  (relative to the pre-scaled σ; against the ORIGINAL σ it is "
+                     f"{chi2_red * last_sigma_prescale ** 2:.4f}, as in the results file)")
 
     # χ² at the maximum-posterior SAMPLE as well: for correlated or railed
     # parameters the vector of marginal medians can sit off the posterior ridge
@@ -1637,6 +2377,16 @@ for target_index, target in enumerate(target_list):
         master_print(f"  Reduced χ² at the maximum-posterior sample = {chi2_red_map:.4f}")
     except Exception as map_error:
         master_print(f"  [χ² MAP] unavailable: {map_error}")
+
+    # The two values above are against the sigmas the sampler used (pre-scaled by
+    # sigma_prescale, Entry 91): they drive err_scale. The goodness of fit that is
+    # REPORTED stays relative to the original TESS sigmas.
+    chi2_red_scaled, chi2_red_map_scaled = chi2_red, chi2_red_map
+    chi2_red     = chi2_red * sigma_prescale ** 2
+    chi2_red_map = chi2_red_map * sigma_prescale ** 2
+    if sigma_prescale != 1.0:
+        master_print(f"  Against the original σ (pre-scale × {sigma_prescale:.3f}): "
+                     f"χ²ν = {chi2_red:.2f} (medians), {chi2_red_map:.2f} (best sample)")
 
     # ── 5I: GELMAN-RUBIN R̂ CONVERGENCE CHECK ─────────────────────────────────
     # The stop REASON is already printed above ("converged at N" vs "reached
@@ -1669,9 +2419,12 @@ for target_index, target in enumerate(target_list):
 
         # Both variants are reported: R̂_full is what this pipeline printed through
         # batch 4 (keeping older run logs comparable), R̂_trim is the honest figure
-        # the gate now decides on. See Pipeline_Log Entry 47.
-        r_hats_full = gelman_rubin_rhat(oriented)
-        r_hats      = gelman_rubin_rhat(oriented[trim:])
+        # the gate now decides on. See Pipeline_Log Entry 47. Both use the live
+        # walkers only, like the gate (Entry 84).
+        if live_idx is not None:
+            oriented = oriented[:, live_idx]
+        r_hats_full = gelman_rubin_rhat(oriented, is_steps_first=True)
+        r_hats      = gelman_rubin_rhat(oriented[trim:], is_steps_first=True)
 
         master_print(f"  {'Parameter':<40} {'R̂_full':>8} {'R̂_trim':>8}  {'Status (R̂ only)'}")
         master_print("  " + "─" * 70)
@@ -1709,7 +2462,7 @@ for target_index, target in enumerate(target_list):
                 lnprob,
                 bundle.get_value("fitted_twigs", solution="best_solution"),
                 burn=burn_used,
-                chi2_red=chi2_red,
+                chi2_red=chi2_red_scaled,     # the sharpness the sampler actually faced
             )
             star_audit = audit
             master_print(f"  verdict: {' + '.join(audit['verdicts'])}")
@@ -1743,6 +2496,7 @@ for target_index, target in enumerate(target_list):
                                ("incl_deg", "incl@binary", 1.0),
                                ("q", "q@binary", 1.0),
                                ("fillout_factor", "fillout_factor@contact_envelope", 1.0),
+                               ("l3_frac", "l3_frac@lc01", 1.0),
                                ("r1_frac", "requiv@primary", 1.0 / _sma),
                                ("r2_frac", "requiv@secondary", 1.0 / _sma)):
         if _twig in free_params and _key in results:
@@ -1878,7 +2632,9 @@ for target_index, target in enumerate(target_list):
             # correction (Kallrath & Milone 2009). Only inflates (never shrinks).
             # χ²_red here is the BEST-FIT value (maximum-posterior sample when
             # available, else the marginal-median model).
-            _chi2_for_scale = chi2_red_map if np.isfinite(chi2_red_map) else chi2_red
+            # Residual factor on top of the pre-scaling (≈ 1 when it was applied).
+            _chi2_for_scale = (chi2_red_map_scaled if np.isfinite(chi2_red_map_scaled)
+                               else chi2_red_scaled)
             err_scale = (max(1.0, float(np.sqrt(_chi2_for_scale)))
                          if np.isfinite(_chi2_for_scale) else 1.0)
             flags = list(railed)
@@ -1890,6 +2646,44 @@ for target_index, target in enumerate(target_list):
             flags += _hdr.get("flags", [])
             if morphology_kind == SEMIDETACHED:
                 flags.append("r2_constrained_to_roche_lobe")
+            # Entry 89 flags, from the adopted (median) bundle values.
+            try:
+                if morphology_kind == SEMIDETACHED and float(
+                        bundle.get_value("q", component="binary", context="component")) > 1.0:
+                    # The lobe-filling secondary is the MORE massive star (allowed since
+                    # the q prior was widened to 3): report it as such, not as an Algol.
+                    flags.append("q_gt_1_lobe_filler_more_massive")
+                if morphology_kind != CONTACT:
+                    _lobe_frac = (float(bundle.get_value("requiv", component="primary", context="component"))
+                                  / float(bundle.get_value("requiv_max", component="primary",
+                                                           context="component")))
+                    if _lobe_frac >= earlywarn.LOBE_FILL_PARK:
+                        flags.append(f"primary_near_roche_lobe:{_lobe_frac:.3f}")
+            except Exception:
+                pass
+            if star_name in PARK_OVERRIDDEN:
+                # An early-warning PARK was overridden with IGNORE_PARK (Entry 85).
+                flags.append("park_overridden")
+            if mesh_info[0] and mesh_info[0] > MESH_LADDER[0]:
+                flags.append(f"mesh_raised:{mesh_info[0]}")
+            if MESH_NOISE_THRESHOLD > 0 and np.isfinite(mesh_info[1]) \
+                    and mesh_info[1] >= MESH_NOISE_THRESHOLD:
+                flags.append(f"mesh_noise_high:{mesh_info[1]:.1f}")
+            _l3_row = read_third_light(paths.TARGETS_DIR).get(star_name)
+            if _l3_row:
+                flags.append("third_light_fitted" if _l3_row["mode"] == "free"
+                             else "third_light_fixed")
+            # Contact stars: where the FIXED mass ratio came from (Entry 90).
+            q_info = read_q_adopted(paths.QSEARCH_DIR, star_name) if morphology_kind == CONTACT else {}
+            if q_info.get("q_source") == "literature_spectroscopic":
+                flags.append("q_from_literature")
+            elif q_info:
+                flags.append("q_from_qsearch")
+                if q_info.get("q_weak"):
+                    flags.append("q_weak_photometric")
+            if dead_idx:
+                # Walkers at lnprob = −inf after burn-in, excluded from τ/R̂/posterior.
+                flags.append("dead_walkers_excluded:" + ",".join(f"w{w}" for w in dead_idx))
             with open(results_path, "w", newline="", encoding="utf-8") as results_file:
                 writer = csv.writer(results_file)
                 writer.writerow(["Parameter", "Symbol", "Value", "Sigma_minus", "Sigma_plus", "Unit"])
@@ -1915,6 +2709,22 @@ for target_index, target in enumerate(target_list):
                                  chi2_red_map, "", "", "—"])
                 writer.writerow(["Error scale (sqrt best-fit reduced chi2)", "err_scale",
                                  err_scale, "", "", "—"])
+                for _comp in ("primary", "secondary"):
+                    try:
+                        writer.writerow([f"Gravity-darkening exponent, {_comp}", f"gravb_bol_{_comp}",
+                                         float(bundle.get_value("gravb_bol", component=_comp,
+                                                                context="component")), "", "", "—"])
+                        writer.writerow([f"Bolometric albedo, {_comp}", f"albedo_{_comp}",
+                                         float(bundle.get_value("irrad_frac_refl_bol", component=_comp,
+                                                                context="component")), "", "", "—"])
+                    except Exception:
+                        pass
+                writer.writerow(["Gravity-darkening rule", "gd_rule",
+                                 gravdark.rule_for(morphology_kind), "", "", "—"])
+                writer.writerow(["Sigma pre-scale applied before sampling", "sigma_prescale",
+                                 sigma_prescale, "", "", "—"])
+                writer.writerow(["Total error inflation vs original sigma", "sigma_total_scale",
+                                 sigma_prescale * err_scale, "", "", "—"])
                 writer.writerow(["Morphology flag", "morphology_flag", morphology_flag, "", "", "—"])
                 writer.writerow(["Morphology source", "morphology_source", morphology_src, "", "", "—"])
                 writer.writerow(["Morphology", "morphology", morphology_kind, "", "", "—"])
@@ -1925,6 +2735,20 @@ for target_index, target in enumerate(target_list):
                 writer.writerow(["Chain steps", "steps", done, "", "", "—"])
                 writer.writerow(["Burn-in steps", "burn_in", burn_used, "", "", "—"])
                 writer.writerow(["Stop reason", "stop_reason", _stop_reason, "", "", "—"])
+                if q_info:
+                    writer.writerow(["Mass-ratio source", "q_source", q_info.get("q_source", ""), "", "", "—"])
+                    writer.writerow(["Mass-ratio reference", "q_reference", q_info.get("reference", ""), "", "", "—"])
+                    writer.writerow(["q-search minimum", "q_search_min", q_info.get("q_search_min", ""),
+                                     "", "", "—"])
+                    writer.writerow(["q-search interval", "q_search_interval",
+                                     f"{q_info.get('q_search_lo', '')}-{q_info.get('q_search_hi', '')}",
+                                     "", "", "—"])
+                writer.writerow(["Mesh triangles per star", "ntriangles", mesh_info[0], "", "", "—"])
+                writer.writerow(["Model noise at that mesh (1 = a 1-sigma step)", "mesh_noise_scaled",
+                                 mesh_info[1], "", "", "—"])
+                writer.writerow(["Mesh gate history", "mesh_noise_history", mesh_info[2], "", "", "—"])
+                writer.writerow(["Nelder-Mead start", "nm_start", nm_info[0], "", "", "—"])
+                writer.writerow(["Nelder-Mead scouts (lnp)", "nm_scouts", nm_info[1], "", "", "—"])
                 writer.writerow(["Flux source", "flux_source", _hdr.get("FLUXSRC", ""), "", "", "—"])
                 writer.writerow(["Flags", "flags", "; ".join(flags), "", "", "—"])
             master_print(f"\n  Results saved: {results_path}"
@@ -1932,7 +2756,7 @@ for target_index, target in enumerate(target_list):
 
             # Target finished — drop the mid-run checkpoint (and its sidecar) so a
             # future relaunch is recognised as complete rather than resumed.
-            for _f in (mcmc_checkpoint, sidecar):
+            for _f in (mcmc_checkpoint, sidecar, nm_sidecar, ps_sidecar, mesh_sidecar):
                 if os.path.exists(_f):
                     os.remove(_f)
         else:

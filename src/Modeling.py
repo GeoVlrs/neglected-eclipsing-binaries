@@ -93,6 +93,7 @@ TESS_BTJD_TO_BJD_OFFSET: float = 2_457_000.0
 # Temperature boundary between convective (Lucy 1967) and radiative
 # (von Zeipel 1924) envelope physics, corresponding to the A-type transition.
 RADIATIVE_CONVECTIVE_BOUNDARY_K: float = 8_000.0
+import gravdark                                             # noqa: E402
 
 # Number of phase bins used to reduce the light curve before attaching to
 # PHOEBE 2. ~150 bins balance ingress/egress resolution against compute cost.
@@ -310,6 +311,7 @@ GAIA_TEFF_OVERRIDE_K: dict[str, float] = {
 from morphology import (                                    # noqa: E402
     CONTACT, DETACHED, SEMIDETACHED, MORPHOLOGY_OVERRIDE,
     is_contact_morphology, resolve_morphology, resolve_morphology_kind,
+    read_q_adopted,
 )
 
 
@@ -368,6 +370,25 @@ def resolve_initial_params(
     if resolve_morphology(star_name, gcvs_type):
         params = dict(DEFAULT_CONTACT_PARAMS)
         params["spectral_type"] = estimate_contact_spectral_type(period_days)
+        # Contact stars: the mass ratio is FIXED in Script 05, so it must be the
+        # adopted one (ContactQSearch.py: a published spectroscopic q, else the
+        # photometric q-search minimum). q = 0.5 for every star biased the fitted
+        # inclination by 5-16 degrees (Entry 90). The q-search's own best i and f
+        # at that q seed the bundle.
+        adopted = read_q_adopted(paths.QSEARCH_DIR, star_name)
+        if adopted:
+            params["q_init"] = adopted["q_adopted"]
+            if "incl_at_adopted" in adopted:
+                params["incl_init"] = adopted["incl_at_adopted"]
+            if "fillout_at_adopted" in adopted:
+                params["fillout_init"] = adopted["fillout_at_adopted"]
+            print(f"  [q] adopted q = {adopted['q_adopted']:.4f} ({adopted.get('q_source', '?')}"
+                  f"{', weak' if adopted.get('q_weak') else ''}); seeds i = "
+                  f"{params['incl_init']:.1f}, f = {params['fillout_init']:.2f}")
+        else:
+            print("  [q] WARNING: no adopted q for this contact star — using the placeholder "
+                  "q = 0.5. Run ContactQSearch.py, then re-run Script 04 (Script 05 parks it "
+                  "until then).")
         return params
 
     return dict(DEFAULT_DETACHED_PARAMS)
@@ -469,7 +490,8 @@ def load_refined_ephemeris(safe_star_name: str) -> dict[str, float]:
     return params
 
 
-def apply_radiative_physics(bundle: object, component: str, teff_k: float) -> None:
+def apply_radiative_physics(bundle: object, component: str, teff_k: float,
+                            kind: str = "contact") -> None:
     """
     Set gravity-darkening (β₁) and reflection (A) coefficients for one component.
 
@@ -487,6 +509,16 @@ def apply_radiative_physics(bundle: object, component: str, teff_k: float) -> No
     teff_k:
         Current effective temperature of the component (K).
     """
+    if kind != "contact":
+        # Non-contact stars: a ramp over 6600-8000 K at the star's own temperature
+        # (gravdark.py, Entry 93). Script 05 re-applies it, and refreshes the
+        # secondary's values once its temperature has been fitted.
+        beta, albedo = gravdark.coeffs_for(kind, teff_k)
+        bundle.set_value(f"gravb_bol@{component}", beta)
+        bundle.set_value(f"irrad_frac_refl_bol@{component}", albedo)
+        print(f"    {component.capitalize()} ({teff_k:.0f} K): gravity darkening "
+              f"{beta:.2f}, albedo {albedo:.2f}  (ramp 6600-8000 K)")
+        return
     if teff_k >= RADIATIVE_CONVECTIVE_BOUNDARY_K:
         bundle.set_value(f"gravb_bol@{component}", 1.0)
         bundle.set_value(f"irrad_frac_refl_bol@{component}", 1.0)
@@ -733,7 +765,8 @@ for target in target_list:
     # ── 5H: DYNAMIC RADIATIVE PHYSICS ─────────────────────────────────────────
     print("\n  [5H] Setting radiative physics coefficients...")
     for component in ["primary", "secondary"]:
-        apply_radiative_physics(bundle, component, bundle.get_value(f"teff@{component}"))
+        apply_radiative_physics(bundle, component, bundle.get_value(f"teff@{component}"),
+                                kind=morphology_kind)
 
     # ── 5I: MESH RESOLUTION ───────────────────────────────────────────────────
     # 2000 triangles balances flux accuracy (~10⁻⁴) against compute time and

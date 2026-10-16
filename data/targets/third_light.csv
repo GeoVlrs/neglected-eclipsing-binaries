@@ -1,0 +1,7 @@
+name,mode,prior_max,l3_published,band,reference,url,note
+V899 Her,free,0.90,0.68,optical,"Ozdemir et al. 2002 (A&A 387, 240)",https://www.aanda.org/10.1051/0004-6361:20020367,"The contact pair is the FAINTER component of a triple or quadruple system (Lu et al. 2001). The published solution exists only with this large third light."
+II UMa,free,0.60,0.275,V,"Zhou et al. 2016 (AJ 151, 67)",https://arxiv.org/pdf/1608.01042,"About 0.30 in B and 0.27 in Rc. Close-in tertiary plus a distant visual companion."
+V776 Cas,free,0.60,0.15,optical,"Zhou et al. 2016 (arXiv 1608.01050); Djurasevic et al. 2004 (0.09-0.14)",https://arxiv.org/pdf/1608.01050,"Quadruple system; tertiary about G0 V."
+BO CVn,free,0.60,0.22,optical,"Zola et al. 2012",https://arxiv.org/pdf/1204.3584,"Published range 0.20-0.24."
+EF Dra,free,0.60,,,"Pribulla et al. 2001 (CAOSP 31, 26)",https://ftp.ta3.sk/caosp/Eedition/FullTexts/vol31no1/pp26-42.pdf,"Third light detected; third body about 0.75 solar masses, K1-K2. Fraction not retrieved."
+V857 Her,free,0.60,,,"Pribulla et al. 2009 (DDO XV)",https://arxiv.org/pdf/0812.1313,"Suspected only: an early-type component seen in spectra."

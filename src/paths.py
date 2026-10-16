@@ -31,6 +31,7 @@ LIGHTCURVE_DIR = os.path.join(DATA_DIR, "lightcurves")     # lc_*_clean/folded.f
 TIMING_DIR     = os.path.join(DATA_DIR, "timing")          # tominima_*.csv, ephem_*.txt            (03)
 BUNDLE_DIR     = os.path.join(DATA_DIR, "bundles")         # bundle_*.phoebe (+ _mcmc, _final)      (04/05)
 RESULTS_DIR    = os.path.join(DATA_DIR, "results")         # results_*.csv                          (05)
+QSEARCH_DIR    = os.path.join(DATA_DIR, "qsearch")         # q_adopted_*.txt, qsearch_*.csv/png     (ContactQSearch)
 
 # --- Plots (typed) ----------------------------------------------------------
 PLOT_DIR        = os.path.join(DATA_DIR, "plots")
@@ -46,7 +47,7 @@ PLOT_MCMC_DIR   = os.path.join(PLOT_DIR, "mcmc_diag")      # mcmc_chains_*.png  
 THESIS_FIGURES_DIR = os.path.join("..", "Text", "Figures")  # from Code/ (was ../../ from the old data folder)
 
 _ALL_DIRS = (
-    LIGHTCURVE_DIR, TIMING_DIR, BUNDLE_DIR, RESULTS_DIR,
+    LIGHTCURVE_DIR, TIMING_DIR, BUNDLE_DIR, RESULTS_DIR, QSEARCH_DIR,
     PLOT_LC_DIR, PLOT_OC_DIR, PLOT_INIT_DIR, PLOT_FINAL_DIR, PLOT_MESH_DIR, PLOT_THESIS_DIR,
     PLOT_MCMC_DIR,
 )

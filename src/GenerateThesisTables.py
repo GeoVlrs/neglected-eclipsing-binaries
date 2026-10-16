@@ -164,6 +164,12 @@ NOTE_LETTERS = {
     "blend":      ("d", "blended with a variable neighbour (BW/BV Dra, 16\\arcsec)"),
     "sap":        ("e", "SAP flux (PDCSAP distorted every sector)"),
     "clipped":    ("f", "error-scaled interval clipped at a prior bound"),
+    # Entry 89 (multi-start Nelder-Mead, wider semi-detached q prior).
+    "q_gt_1":     ("g", "$q > 1$: the lobe-filling secondary is the more massive star"),
+    "near_lobe":  ("h", "primary within 3\\,\\% of its Roche lobe (near-contact)"),
+    # Entry 90 (adopted mass ratio for contact stars).
+    "q_weak":     ("i", "flat $q$-search curve: the photometric $q$ is poorly constrained"),
+    "q_half":     ("j", "fitted with the former placeholder $q = 0.5$ (superseded)"),
 }
 MORPH_SHORT = {"contact": "C", "detached": "D", "semidetached": "SD"}
 
@@ -185,6 +191,14 @@ def notes_for(data: dict) -> list[str]:
         keys.append("sap")
     if "interval_clipped_at_bound" in flags:
         keys.append("clipped")
+    if "q_gt_1_lobe_filler_more_massive" in flags:
+        keys.append("q_gt_1")
+    if "primary_near_roche_lobe" in flags:
+        keys.append("near_lobe")
+    if "q_weak_photometric" in flags:
+        keys.append("q_weak")
+    if "fillout_factor" in data and not text.get("q_source"):
+        keys.append("q_half")
     return keys
 
 
@@ -196,8 +210,8 @@ def render_latex_results_table(target_names: list[str]) -> None:
         Target | Model | T₁ (K, fixed) | T₂ (K) | i (°) | q | f  or  r₁, r₂ | χ²ν | Notes
 
     Values carry their asymmetric 1σ MCMC uncertainties (already multiplied by
-    err_scale in the results file). q is FIXED at 0.5 for contact stars and is
-    printed with a dagger; T₁ is always fixed (Gaia DR3 or the period-colour
+err_scale in the results file). q is FIXED for contact stars at the adopted
+    value (dagger: published spectroscopic; section mark: q-search); T₁ is always fixed (Gaia DR3 or the period-colour
     estimate). A "[Pending Optimization]" placeholder spans the data columns
     for any target whose Script 05 results file does not yet exist.
     """
@@ -219,7 +233,13 @@ def render_latex_results_table(target_names: list[str]) -> None:
         q_fixed   = q_entry is not None and (math.isnan(q_entry[1]) or q_entry[1] == 0.0)
         q_cell    = format_with_uncertainty(q_entry, decimals=3)
         if q_fixed and q_cell != "--":
-            q_cell = q_cell[:-1] + r"^{\dagger}$"
+            # Fixed (contact) q: a dagger for a published spectroscopic value, a
+            # section mark for the photometric q-search minimum (Entry 90).
+            # Pre-Entry-90 rows (no q_source) carry note j instead of a mark.
+            mark = {"literature_spectroscopic": r"\dagger", "qsearch": r"\S"}.get(
+                text.get("q_source", ""), "")
+            if mark:
+                q_cell = q_cell[:-1] + "^{" + mark + "}$"
         if morph == "contact":
             geom_cell = format_with_uncertainty(parameter_data.get("fillout_factor"), decimals=3)
         else:
@@ -245,7 +265,10 @@ def render_latex_results_table(target_names: list[str]) -> None:
     print(r"\centering")
     print(r"\sffamily\scriptsize")
     print(r"\caption{Derived parameters. Model: C contact, D detached, SD semi-detached. "
-          r"$T_1$ is held fixed; $^{\dagger}$\,fixed (contact $q = 0.5$); "
+          r"$T_1$ is held fixed. Contact $q$ is held fixed at the adopted value: "
+          r"$^{\dagger}$\,published spectroscopic mass ratio, $^{\S}$\,photometric "
+          r"$q$-search minimum; $q = m_2/m_1$ with star 1 the hotter component, so "
+          r"$q > 1$ marks a W-type system. "
           r"$^{\ddagger}$\,set by the Roche-lobe constraint. Uncertainties are 1$\sigma$ "
           r"MCMC intervals scaled by $\sqrt{\chi^2_\nu}$. Geometry: fill-out $f$ (C) or "
           r"fractional radii $r_1, r_2$ (D, SD). "

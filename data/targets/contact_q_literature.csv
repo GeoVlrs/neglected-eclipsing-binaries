@@ -1,0 +1,42 @@
+name,q_lit,q_err,method,subtype,i_lit,fillout_lit,reference,url,note
+FN Cam,0.222,,spectroscopic,A,71.2,0.88,"Rucinski et al. 2001 (DDO V); Pribulla & Vanko 2002",https://wumadog.aob.rs/Stars/Details/226,"Catalogue lists q 0.22 as spectroscopic; DDO V text confirms A-type. Exact q value to check in the DDO V table."
+BW Dra,0.280,,spectroscopic,W,,,"Kaluzny & Rucinski 1986",https://arxiv.org/pdf/astro-ph/0311081,"Another catalogue lists 0.25. Light curve blended with BV Dra (16 arcsec)."
+BV Dra,0.411,,spectroscopic,W,,,"Kaluzny & Rucinski 1986",https://wumadog.aob.rs/Stars/Details/123,"Light curve blended with BW Dra (16 arcsec)."
+EF Boo,0.512,0.008,spectroscopic,W,,,"Rucinski et al. 2001 (DDO V)",https://ar5iv.labs.arxiv.org/html/astro-ph/0106160,"Confirmed in the paper text."
+V899 Her,0.566,0.004,unverified,?,,,"Lu, Rucinski & Ogloza 2001 (DDO IV)",https://arxiv.org/abs/astro-ph/0104065,"Value recalled, not confirmed this session. Triple-lined: third light dominates, so q and i from a no-third-light model stay suspect."
+TZ Boo,0.207,,spectroscopic,?,,,"Radial Velocity Studies XIV (arXiv 0810.1658); Christopoulou et al. 2011",https://arxiv.org/pdf/0810.1658,"Catalogue: 0.21 spectroscopic. Strongly variable light curve."
+GM Dra,0.180,0.007,spectroscopic,?,,,"Rucinski et al. 2002 (DDO VI)",https://arxiv.org/pdf/astro-ph/0201213,"Confirmed in the paper table snippet."
+DN Cam,0.421,,unverified,W,,,"Rucinski et al. 2001 (DDO V); Baran et al. 2004",https://ar5iv.labs.arxiv.org/html/astro-ph/0106160,"Value recalled, not confirmed this session. W-type per the paper text."
+FI Boo,0.373,,spectroscopic,W,38,,"Lu et al. 2001 (DDO IV); Papageorgiou & Christopoulou 2015",https://arxiv.org/pdf/2510.22278,"Low inclination (38 deg): photometric q is weak for this star."
+VY Sex,0.313,0.005,spectroscopic,W,,,"Rucinski et al. 2003 (DDO VIII)",https://wumacat.aob.rs/Stars/Details/669,"From a secondary citation of the DDO paper."
+TV Mus,0.166,,photometric,A,,0.74,"Qian et al. 2005",https://arxiv.org/pdf/2202.12835,"One compilation labels it spectroscopic, but the source paper is photometric."
+V857 Her,0.065,,photometric,A,,0.84,"Qian et al. 2005",https://arxiv.org/pdf/0812.1313,"No spectroscopic q. An early-type third component is suspected (Pribulla et al. 2009), which puts the low q in doubt."
+ES UMa,0.25,,photometric,?,,,"proceedings light-curve solution",https://adsabs.harvard.edu/pdf/2010ASPC..424..198K,"Photometric only."
+WZ Cyg,0.631,0.036,spectroscopic,?,83.2,0.05,"Rucinski et al. 2008 (DDO XIII); Lee et al. 2011",https://arxiv.org/pdf/1104.3603,"Marginal contact, temperature difference 1447 K (T2/T1 about 0.78, below the contact prior floor 0.80)."
+V836 Cyg,,,none,?,,,"Yakut et al. 2005",https://caleb.eastern.edu/star_summary.php?star_id=20,"Literature: near-contact, not contact. Routing doubtful."
+BE Dra,,,none,?,,,,,No published light-curve solution found.
+RZ UMi,,,none,?,,,"Grozdanovic & Djurasevic 2025",,Photometric solution exists; q not retrieved.
+V608 Cas,,,none,?,,,"J. Phys. Conf. Ser. 1144 (2018)",,Photometric solution exists; q not retrieved.
+IV Dra,,,none,?,,,,,No published solution found.
+BO CVn,0.340,,spectroscopic,A,,0.88,"Zola et al. 2012",https://arxiv.org/pdf/1204.3584,"q from the paper's masses (0.39/1.16). Third light 20-24 % reported. Earlier photometric q-search: 0.205."
+DF Hya,,,none,?,,,,,Not retrieved.
+EF Cep,,,none,?,,,,,No published solution found.
+EF Dra,0.160,,spectroscopic,A,,,"Lu & Rucinski 1999 (DDO I); Pribulla et al. 2001",https://arxiv.org/pdf/astro-ph/9902168,"q from published masses (0.29/1.81). Triple system (third light). Photometric q 0.125."
+FP Boo,0.106,0.005,spectroscopic,A,68.8,0.39,"Rucinski et al. 2005 (DDO X); Gazeas et al. 2006",https://arxiv.org/pdf/astro-ph/0503041,"Confirmed in the paper text."
+FU Dra,0.251,0.03,spectroscopic,W,,,"Rucinski et al. 2000 (DDO III)",https://arxiv.org/pdf/0903.1365,"Confirmed (0.25 +- 0.03, W-type)."
+GQ Cnc,,,none,?,,,"JAAVSO BVRI study",https://app.aavso.org/media/jaavso/3305_4noh1p6.pdf,"Literature title: high mass ratio, detached, pre-contact. Contact routing doubtful."
+HI Pup,0.19,,spectroscopic,?,,,"Duerbeck & Rucinski 2007",https://arxiv.org/pdf/1402.5959,"Confirmed (0.19)."
+II UMa,0.172,,spectroscopic,A,77.7,0.87,"Rucinski et al. 2003 (DDO VIII); Zhou et al. 2016",https://arxiv.org/pdf/1608.01042,"Catalogue labels 0.17 spectroscopic. Close tertiary (third light)."
+NU Cyg,,,none,?,,,,,Not retrieved.
+RT Hyi,,,none,?,,,,,Not retrieved.
+RW Dor,0.63,,spectroscopic,W,,,"Duerbeck & Rucinski 2007; Hilditch et al. 1992 (0.68)",https://arxiv.org/pdf/1804.00384,"Confirmed (0.63; earlier 0.68)."
+TY Men,,,none,?,,,,,Not retrieved.
+TY UMa,0.396,,spectroscopic,W,84.9,0.13,"Li et al. 2015",https://wumadog.aob.rs/Stars/Details/466,"Catalogue: 0.4 spectroscopic."
+V1044 Her,,,none,?,,0.03,"Lu et al. 2016",https://dc.g-vo.org/rr/q/lp/custom/CDS.VizieR/J/other/NewA/48.58,Photometric solution exists; q not retrieved.
+V1055 Her,,,none,?,,,,,No published solution found.
+V1128 Tau,0.534,,spectroscopic,W,,,"Rucinski et al. 2008 (DDO XIII)",https://arxiv.org/pdf/1410.2449,"Confirmed (0.534, W-type). Photometric 0.48."
+V1918 Cyg,0.278,,spectroscopic,A,,,"Gurol 2016",https://avesis.ankara.edu.tr/yayin/d0571f7d-8575-4808-836b-21595a5f3942/absolute-and-geometric-parameters-of-contact-binary-v1918-cyg,"q from the paper's masses (0.362/1.302), a simultaneous light + radial-velocity solution."
+V776 Cas,0.130,0.004,spectroscopic,A,55.4,0.65,"Rucinski et al. 2001 (DDO V); Zhou et al. 2016",https://arxiv.org/pdf/1608.01050,"Confirmed. Quadruple system (third light)."
+V842 Her,0.26,,spectroscopic,W,,,"Rucinski & Lu 1999 (DDO II)",https://ar5iv.labs.arxiv.org/html/astro-ph/9906314,"Confirmed in the paper text (0.26, W-type)."
+VW Cep,0.302,0.007,unverified,W,65,,"Mitnyan et al. 2018; Hill 1989 (0.277); Hendry & Mochnacki 2000 (0.395)",https://arxiv.org/pdf/1801.06036,"Published spectroscopic values range 0.28-0.41. The 0.302 value is recalled, not confirmed this session. Heavily spotted."
+Y Sex,0.18,0.03,spectroscopic,W,76.8,,"McLean & Hilditch 1983; Hill 1979",https://wumadog.aob.rs/Stars/Details/683,"Confirmed (0.18 +- 0.03)."

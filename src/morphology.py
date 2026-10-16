@@ -38,9 +38,86 @@ MORPHOLOGY_OVERRIDE: dict[str, str] = {
     # far wider than the model (Pipeline_Log Entries 75-76). Cool, lobe-filling
     # secondary beside a hotter primary — the semi-detached (Algol) configuration.
     "V358 Cep": SEMIDETACHED,
+    # Same signature (Entry 84): live walkers pinned at r2 = 1.002 × Eggleton lobe
+    # with q driven to 0.988 (prior edge 1.0) to enlarge the lobe; the pre-audit run
+    # also ended lobe-filling (r2/a 0.3598 at q 0.795). T2 ≈ 4340 K vs T1 6060 K,
+    # r1/a ≈ 0.14, i ≈ 88.5° — cool lobe-filling secondary, Algol configuration.
+    "OT Cep": SEMIDETACHED,
     # "FI Boo": DETACHED,   # DETECTOR FALSE POSITIVE — light curve is clearly EW/contact
     #                       # (continuous variation + O'Connell); kept CONTACT. See log.
 }
+
+# Upper prior bound on the contact fill-out factor. 0.50 until Entry 90; published
+# fill-outs reach 0.84-0.88 (II UMa, FN Cam, V857 Her). A mesh probe at 2000
+# triangles computed every model up to 0.95 for q from 0.08 to 10.
+CONTACT_FILLOUT_CEIL: float = 0.95
+
+
+def read_q_adopted(qsearch_dir: str, star_name: str) -> dict:
+    """
+    The mass ratio adopted for a contact star by ContactQSearch.py, from
+    <qsearch_dir>/q_adopted_<star>.txt ("key = value" lines). {} if there is none.
+
+    Scripts 04 (seed), 05 (preflight, provenance) and the thesis table read it
+    through this one function. q_adopted is the MODEL ratio m2/m1 with star 1 the
+    hotter star eclipsed at phase 0, so a W-type system has q_adopted > 1.
+    """
+    import os
+    path = os.path.join(qsearch_dir, f"q_adopted_{star_name.replace(' ', '_')}.txt")
+    out: dict = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                out[key.strip()] = value.strip()
+    except OSError:
+        return {}
+    for key in ("q_adopted", "q_search_min", "q_search_lo", "q_search_hi",
+                "incl_at_adopted", "fillout_at_adopted", "T2_over_T1_at_adopted"):
+        if key in out:
+            try:
+                out[key] = float(out[key])
+            except ValueError:
+                out.pop(key)
+    out["q_weak"] = str(out.get("q_weak", "")).lower() == "true"
+    return out if "q_adopted" in out else {}
+
+
+def read_third_light(targets_dir: str) -> dict:
+    """
+    Stars modelled with third light, from <targets_dir>/third_light.csv
+    (Entry 91): {star: {"mode": "free"|"fixed", "prior_max": float,
+    "l3_published": float|None, "reference": str}}. {} if the file is absent.
+
+    A third star's constant light dilutes the eclipses; a model without it
+    compensates with a lower inclination. `free` fits the fraction with a
+    uniform prior [0, prior_max]; `fixed` holds it at the published value.
+    """
+    import csv
+    import os
+    path = os.path.join(targets_dir, "third_light.csv")
+    out: dict = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                mode = (row.get("mode") or "").strip().lower()
+                if mode not in ("free", "fixed"):
+                    continue
+                try:
+                    published = float(row["l3_published"])
+                except (KeyError, TypeError, ValueError):
+                    published = None
+                if mode == "fixed" and published is None:
+                    continue
+                out[row["name"]] = {"mode": mode, "prior_max": float(row.get("prior_max") or 0.6),
+                                    "l3_published": published,
+                                    "reference": row.get("reference", "")}
+    except OSError:
+        return {}
+    return out
+
 
 _CONTACT_CLASSES = {"KE", "KW", "K"}
 _DETACHED_CLASSES = {"DW", "DM", "DS", "D"}

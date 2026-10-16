@@ -206,6 +206,8 @@ def keep_list_from_05() -> set:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(getattr(t, "id", "") == "KEEP_PRE_AUDIT_RESULTS" for t in targets):
                 call = node.value
+                if isinstance(call, ast.Call) and not call.args:
+                    return set()          # frozenset(): the keep list is empty (Entry 90)
                 return set(ast.literal_eval(call.args[0] if isinstance(call, ast.Call) else call))
     return set()
 

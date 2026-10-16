@@ -124,6 +124,10 @@ variable to `TRUE` only to download a new passband.
   *Never* (on mains power) for the duration of a run.
 - **Windows Update restarts** end the run. Set active hours or pause updates. The
   run resumes afterwards (§6.3), losing at most one chunk.
+- **WSL updates itself.** On 13 Oct 2026 Windows upgraded WSL in the middle of a
+  run and killed every process in it, without a reboot. The wrapper cannot
+  survive that; the queue stays down until it is relaunched by hand. Pause
+  Windows and Microsoft Store updates for the length of a campaign.
 
 ---
 
@@ -201,6 +205,10 @@ python 03OCAnalysis.py      Targets/neglected_targets_batch1.csv
 python Audits/audit_period_fold.py          # check: drift < 0.01 cycle for every star
 
 # Linux / WSL — model and fit
+python3 04Modeling.py Targets/neglected_targets_batch1.csv
+# contact stars only: fix the mass ratio (§5.4b, heavy), then rebuild their bundles
+bash Runs/qsearch/run_qsearch.sh Targets/neglected_targets_batch1.csv "coarse refine literature" batch1
+python3 ContactQSearch.py adopt Targets/neglected_targets_batch1.csv
 python3 04Modeling.py Targets/neglected_targets_batch1.csv
 bash run_05_autorestart.sh Targets/neglected_targets_batch1.csv Runs/batch1_05.log "BATCH 1"
 
@@ -300,7 +308,12 @@ Stage 01 is only needed to rebuild the target selection from scratch (§5.1).
     fill-out drives the Roche potential. Semi-detached uses PHOEBE's
     `semidetached` constraint: the secondary's radius equals its Roche lobe.
   - **Atmospheres and physics:** blackbody atmospheres; gravity darkening and
-    reflection switched at 8000 K.
+    reflection by model type (`gravdark.py`, §5.10): contact stars switch at
+    8000 K, other stars follow a ramp over 6600–8000 K.
+  - **Contact stars: the adopted mass ratio.** q, and the starting inclination
+    and fill-out, come from `data/qsearch/q_adopted_<star>.txt` (§5.4b). Without
+    that file the bundle gets the placeholder q = 0.5 and stage 05 parks the
+    star.
   - **Data:** the light curve folded with stage 03's ephemeris and binned to **151**
     phase bins (odd, so one bin is centred on phase 0), with a 0.003 systematic
     error floor.
@@ -320,12 +333,60 @@ Stage 01 is only needed to rebuild the target selection from scratch (§5.1).
   `Constraint 'requiv@…' raised` during the double flip are a known, harmless
   transient.
 
+### 5.4b `ContactQSearch.py`: the mass ratio of contact stars
+
+Single-band photometry of a partially eclipsing contact binary constrains q
+poorly, and q fixed at 0.5 for every star biased the inclination by 5–16°. This
+stage fixes q per star.
+
+- **What it does.** For each contact star, Nelder–Mead fits of (T₂, i, fill-out)
+  at fixed q on a grid (q = 0.08 … 12; q > 1 means W-type: star 1 is the hotter
+  star), from two fill-out starts, on the star's own stage-04 bundle.
+- **Adoption** (`adopt`): the published **spectroscopic** q from
+  `Targets/contact_q_literature.csv` where there is one, on the better of the two
+  branches q and 1/q; otherwise the q-search minimum.
+- **How far to trust it.** Against 22 spectroscopic values the q-search minimum
+  was within about 15 % for 13 stars and well off for 9. A finer mesh does not
+  change that (Entry 94). Every q taken from the q-search is therefore marked
+  weak (`q_weak_photometric`).
+- **Run (Linux/WSL, heavy: about 36 fits per star, 15–30 min each).**
+  ```bash
+  bash Runs/qsearch/run_qsearch.sh Targets/<cat>.csv "coarse refine literature" <tag>
+  python3 ContactQSearch.py adopt Targets/<cat>.csv
+  ```
+  Finished fits are skipped on a relaunch. Then re-run stage 04 for those stars.
+- **Writes:** `data/qsearch/jobs/<star>/*.json`, `q_adopted_<star>.txt`,
+  `qsearch_<star>.csv|png`, `Audits/contact_q_validation.csv`.
+- **Traps.** PHOEBE cannot build the contact model near q = 10.0–10.35; fits that
+  never left their start are dropped at adoption. `QSEARCH_NTRIANGLES=4000`
+  repeats fits on a finer mesh into `data/qsearch/jobs_n4000/`.
+
 ### 5.5 `05Optimization.py`: posterior sampling
 
 The expensive stage; see **§6** for operations. In short:
 
-- **Nelder–Mead** pre-wash (up to `NM_MAXITER` iterations), then **emcee** with
-  `MCMC_NWALKERS` walkers, in checkpointed chunks of `MCMC_CHECKPOINT` steps.
+- **Nelder–Mead** pre-wash, then **emcee** with `MCMC_NWALKERS` walkers, in
+  checkpointed chunks of `MCMC_CHECKPOINT` steps.
+  - **Every star: multi-start.** Several starting points each get a short scout
+    run (`NM_SCOUT_MAXITER` iterations); the best is polished with the full
+    `NM_MAXITER`. The log shows one `[multi-start]` line per start.
+  - **Contact starts:** `seed` (the q-search solution), `shallow` (fill-out 0.15,
+    i 82°), `deep` (fill-out 0.70, i 70°).
+  - **Mesh gate.** PHOEBE's surface mesh changes in steps when a parameter moves
+    by a hair, and χ² jumps with it. After the scouts, the scatter of χ² about a
+    smooth curve is measured at the best start (23 models). If it exceeds
+    `MESH_NOISE_THRESHOLD` (2 = twice a 1σ step, after pre-scaling), the mesh is
+    raised from 2000 to 3000 and then 4000 triangles; if none passes, the
+    quietest is used and the star is flagged. A finer mesh costs 1.7–2.1× (3000)
+    or 2.6–3.7× (4000) per model. Log lines start with `[mesh]`.
+  - **Why several starts.** A single start (small hot star) trapped semi-detached
+    fits in a wrong basin where q runs to its limit: RZ Dra, whose spectroscopic
+    q is 0.40, railed at q = 1 from that start and lands on q ≈ 0.40–0.42 with
+    the multi-start.
+    - Semi-detached starts: `prod` (r1 = 0.17 a), `bigP` (r1 = 0.9 × its Roche
+      lobe), `bigP_q0.4`, `bigP_q1.5`.
+    - Detached starts: `prod` (r1 0.17 a, r2 0.24 a), `swap`, `bigP`, `bigS`.
+    - Cost: about 1.6 extra pre-washes (tens of minutes; ~2–3 h for a 600 s star).
 - **Convergence gate.** Stops early only when every parameter has chain length
   > 50 τ **and** post-burn-in R̂ < 1.1; otherwise it runs to `MCMC_MAX_NITERS`.
 - **Burn-in** = max(`MCMC_BURNIN`, 2 τ_max), capped at half the chain.
@@ -333,15 +394,32 @@ The expensive stage; see **§6** for operations. In short:
 
   | Morphology | Free | Fixed |
   |---|---|---|
-  | contact | T₂, i, fill-out | q = 0.5 (degenerate in single-band photometry) |
-  | detached | T₂, i, q, r₁, r₂ | — |
-  | semi-detached | T₂, i, q, r₁ | r₂ = Roche lobe |
+  | contact | T₂, i, fill-out (0.03–0.95) | q = the adopted value (§5.4b) |
+  | detached | T₂, i, q (0.1–1), r₁, r₂ | — |
+  | semi-detached | T₂, i, q (0.1–3), r₁ | r₂ = Roche lobe |
+
+  For non-contact stars T₂ may range over 0.50–1.10 T₁ (contact: 0.80–1.25 T₁).
+  A semi-detached q above 1 means the lobe-filling star is the more massive one;
+  the result is flagged.
 
   T₁ is always fixed. Flux is scaled to the data at every step
   (`pblum_mode="dataset-scaled"`).
-- **Uncertainties** are the 16/50/84 % posterior percentiles, multiplied by
-  `err_scale = max(1, √χ²ν)` of the best-fit (maximum-posterior) model, and clipped
-  at the prior bounds.
+- **Surface physics.** Limb darkening: linear, 0.6 for every star. This is an
+  effective value: it fits better than the Claret (2017) table values, linear or
+  two-coefficient, on every star tested, and a freed coefficient lands at
+  0.59–0.60 (Entry 93). Gravity darkening and albedo: contact stars 0.32 / 0.6
+  below 8000 K; other stars a ramp over 6600–8000 K at each star's own
+  temperature, with the secondary's values set from its fitted temperature before
+  sampling. For non-contact stars the T₂ prior is no longer locked to one side of
+  8000 K.
+- **Third light.** Stars listed in `Targets/third_light.csv` get a third-light
+  fraction, fitted (`free`) or held (`fixed`).
+- **Uncertainties.** After the polish, one model gives χ²ν; the data
+  uncertainties are multiplied by max(1, √χ²ν) **before** sampling
+  (`SIGMA_PRESCALE`; tested: same medians, 2.5× the acceptance). The quoted
+  errors are the 16/50/84 % posterior percentiles, times a residual
+  `err_scale` (≈ 1), clipped at the prior bounds. χ²ν in the results is always
+  against the original uncertainties.
 - **Run (Linux/WSL, always under MPI).** Use the wrapper:
   `bash run_05_autorestart.sh Targets/<cat>.csv Runs/<log>.log "<label>"`.
   Directly: `mpirun --use-hwthread-cpus -n 8 python3 -u 05Optimization.py Targets/<cat>.csv`.
@@ -355,7 +433,10 @@ Environment variables (all optional):
 | `MCMC_MIN_NITERS` / `MCMC_MAX_NITERS` | 1500 / 6000 | Gate floor / ceiling. |
 | `MCMC_CHECKPOINT` | 100 | Steps per chunk (= checkpoint interval). |
 | `MCMC_BURNIN` | 350 | Burn-in floor. |
-| `NM_MAXITER` | 200 | Nelder–Mead iteration cap. |
+| `NM_MAXITER` | 200 | Nelder–Mead iteration cap of the polish run. |
+| `NM_SCOUT_MAXITER` | 80 | Iterations of each multi-start scout run. |
+| `SIGMA_PRESCALE` | 1 | 0 samples against the raw uncertainties (comparison only). |
+| `MESH_NOISE_THRESHOLD` | 2 | Mesh gate limit; 0 turns the gate off (mesh stays at 2000). |
 | `FILLOUT_FLOOR` | 0.03 | Lower prior bound on contact fill-out. |
 | `ROCHE_LOBE_CAP` | 1.0 | Detached radius cap, as a fraction of the largest Roche lobe the q prior allows. |
 | `PHOEBE_ENABLE_ONLINE_PASSBANDS` | FALSE | §2.3. |
@@ -427,11 +508,24 @@ Analytic Roche equipotentials, Lagrange points and critical surfaces for q = 0.5
   | none: `EW` | contact |
   | none: `EA`, `EB` | detached |
 
+  Plain `EB` (β Lyrae type, no physical class) is often really semi-detached:
+  V358 Cep and OT Cep both turned out lobe-filling. Stage 05's post-NM check parks
+  such a star before any MCMC (§6.11).
+
   `MORPHOLOGY_OVERRIDE` sets a star explicitly. **Workflow to change a star's
   model:**
   1. edit the override;
   2. re-run 04 for that star;
   3. re-run 05; it notices the new bundle and refits (§6.6).
+- **`earlywarn.py`**: Stage 05's early-warning checks (preflight, post-NM, per
+  chunk) and the parking files (§6.11). Pure Python/numpy, so its decisions can be
+  tested on saved chains without PHOEBE or MPI.
+- **`limbdark.py`**: the Claret (2017) TESS limb-darkening tables, linear and
+  two-coefficient, by temperature. Used by the test tools only: the pipeline keeps
+  the single linear coefficient 0.6 (§5.5).
+- **`gravdark.py`**: gravity-darkening exponent and albedo by temperature and
+  model type. `rule_for(kind)` is the pipeline's rule (contact: 8000 K step;
+  others: ramp over 6600–8000 K); 04 and 05 both call `coeffs_for`.
 
 ---
 
@@ -526,7 +620,7 @@ ALLOW_CONCURRENT=1 bash run_05_autorestart.sh Targets/<catalogue>.csv Runs/<name
 Rules:
 - one log per queue (enforced);
 - stop the second queue with Ctrl-C; its star resumes later from its checkpoint;
-- the gain is modest (§6.9), and the machine is fully loaded. Run a second queue
+- the gain is ~1.1–1.4× (§6.9), and the machine is fully loaded. Run a second queue
   only when the computer is not otherwise in use.
 
 ### 6.6 Which stars are skipped, refitted or resumed
@@ -538,22 +632,37 @@ For each star in the catalogue, in order:
    their caveats are in `Audits/kept_results_caveats.csv`.
 2. **Lock:** if another live queue holds `bundle_<star>.lock`, it is skipped. A lock
    whose process is dead is taken over.
-3. **Current results:** if `results_<star>.csv` exists **and** its
+3. **Parked:** if `data/results/parked_<star>.txt` exists for the **current**
+   bundle, it is skipped (§6.11). If the bundle was rebuilt since, the park is
+   renamed `…_resolved_<date>.txt` and the star is fitted. `IGNORE_PARK` overrides.
+4. **Current results:** if `results_<star>.csv` exists **and** its
    `input_bundle_sha` equals the checksum of the current `bundle_<star>.phoebe`, it
    is skipped (done).
-4. **Outdated results** (older bundle, or no checksum row): the old results, final
+5. **Outdated results** (older bundle, or no checksum row): the old results, final
    bundle and final plot are renamed `…_superseded_<date>…` (**never deleted**) and
    the star is refitted.
-5. **Checkpoint:** it is resumed only if its sidecar
+6. **Checkpoint:** it is resumed only if its sidecar
    `bundle_<star>_mcmc.phoebe.input_sha` matches the current bundle. Otherwise it is
    set aside as `…_mcmc_stale_<date>.phoebe` and the star starts fresh.
 
 So **rebuilding a bundle with 04 is enough to make the next 05 run refit that
-star**. Do not rebuild bundles you do not want refitted.
+star**, and to clear its park. Do not rebuild bundles you do not want refitted.
 
 ### 6.7 Checking progress
 
+The quickest overview is the **health board** (read-only, seconds, safe beside a
+live run): one row per catalogue star with its state (done / kept /
+running(A|B) / paused / PARKED / pending), steps, s/step, acceptance, failure rate
+and any early-warning codes. It exits with 1 if a star is parked.
+
 ```bash
+python Audits/run_health.py Targets/<catalogue>.csv
+```
+
+Details from the logs:
+
+```bash
+grep "\[health\]" Runs/<name>.log | tail -1       # live walkers, overflow, lobe, OK/WARN/PARK
 grep "\[eta\]" Runs/<name>.log | tail -1          # steps done, s/step, ETA
 grep "\[checkpoint\]" Runs/<name>.log | tail -1   # last save
 pgrep -fa "python3 -u 05Optimization.py" | wc -l  # 8 per running queue
@@ -587,6 +696,26 @@ mpirun --use-hwthread-cpus -n 8 -x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN
   `morphology.py` do not carry over to a new name.
 - With the wrapper, pass the same command through `RUN_CMD="mpirun … -x …"`.
 
+**Smoke test after every code change.** `smoke_05.sh` does all of the above in one
+step for the scratch star `ZZ Smoke`. It copies the bundle, runs NM 20 + 30 MCMC
+steps, and prints the preflight / post-NM / `[health]` / park lines. It is required
+after any change to `05Optimization.py`, `earlywarn.py` or `morphology.py`, before
+a queue is relaunched. It costs about 20–40 min at `-n 8` beside a live queue.
+
+```bash
+bash smoke_05.sh <bundle.phoebe> <gcvs_type> [label] [scratch name]
+bash smoke_05.sh data/bundles/bundle_V358_Cep.phoebe EB/SD sd-check
+IGNORE_PARK= bash smoke_05.sh <bundle> EB park-check   # let a park happen (default overrides it)
+Q_FROM="TY UMa" bash smoke_05.sh data/bundles/bundle_TY_UMa.phoebe EW ty "ZZ Smoke T"
+SCRIPT=05Optimization_staged.py bash smoke_05.sh <bundle> <type>   # test a staged copy
+```
+
+A **contact** scratch star needs an adopted q: `Q_FROM="<star>"` copies that
+star's `q_adopted` file to the scratch name. Several smokes can run side by side
+if each has its own scratch name (it must start with `ZZ `).
+
+The previous `ZZ_Smoke` products are moved into `Runs/smoke/` rather than deleted.
+
 ### 6.9 Throughput facts (measured on an 8-core / 16-thread desktop)
 
 - **One star uses at most 8 MPI processes.** emcee's stretch move evaluates half the
@@ -599,8 +728,13 @@ mpirun --use-hwthread-cpus -n 8 -x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN
   | `-n 14` | 20.0 |
   | `-n 8` | 13.6 |
 
-- **Two queues at `-n 8`** run each star at about the `-n 14` speed. That is about
-  1.1–1.2× the throughput of one `-n 8` queue.
+- **Two queues at `-n 8`** slow each star down. The throughput gain over one `-n 8`
+  queue was measured twice:
+  - contact scratch star (Phase D): 1.1–1.2×;
+  - V358 Cep, 600 s cadence (Phase E): 103 s/step alone vs 144 s/step beside a
+    second queue, i.e. ~1.4×.
+
+  The machine is fully loaded either way.
 - **Exposure integration ×5** (600 s cadence) costs about 3.3× per step. Such a
   star needs ~1 week at the 6000-step ceiling.
 - **Typical star lengths:** contact stars take hours to ~1 day; detached and
@@ -614,16 +748,70 @@ mpirun --use-hwthread-cpus -n 8 -x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN
 | `data/bundles/bundle_<star>_final.phoebe` | The fitted bundle with the full chain. Written **before** the results file. |
 | `data/plots/models_final/phoebe_final_<star>.png` | Data, model, residuals. |
 | `data/plots/mcmc_diag/mcmc_chains_<star>.png` | Walker traces and chain-health verdict. |
-| `bundle_<star>_mcmc.phoebe` + `.input_sha` | Checkpoint (deleted on success). |
+| `bundle_<star>_mcmc.phoebe` + `.input_sha`, `.nm_start`, `.sigma_prescale`, `.mesh` | Checkpoint and its notes: input checksum, winning start, error-bar factor, mesh chosen (all deleted on success). |
 | `bundle_<star>.lock` | `host:pid` of the queue fitting the star. |
-| `…_superseded_<date>…`, `…_mcmc_stale_<date>.phoebe` | Retired versions (§6.6). Never deleted automatically. |
+| `data/results/parked_<star>.txt` | Why the star was parked, values at that point, the fix, how to un-park (§6.11). |
+| `Runs/run_stats/05Optimization_health.csv` | One row per early-warning event (WARN / PARK / OVERRIDDEN). |
+| `…_superseded_<date>…`, `…_mcmc_stale_<date>.phoebe`, `parked_…_resolved_<date>.txt` | Retired versions (§6.6). Never deleted automatically. |
 
 `flags` lists:
 - `<parameter>@low` / `@high` (railed at a prior bound: report as a limit);
 - `interval_clipped_at_bound`;
 - `r2_constrained_to_roche_lobe`;
 - `blended_with_variable_neighbour`;
-- `SAP_flux_PDC_distorted`.
+- `SAP_flux_PDC_distorted`;
+- `dead_walkers_excluded:w0,…` (walkers stuck at an invalid model, left out of
+  τ, R̂ and the posterior);
+- `park_overridden` (an early-warning park was overridden with `IGNORE_PARK`);
+- `q_gt_1_lobe_filler_more_massive` (semi-detached fit with q > 1);
+- `primary_near_roche_lobe:<fraction>` (non-contact: the hot star is within 3 %
+  of its Roche lobe, i.e. near-contact).
+
+- `q_from_literature` / `q_from_qsearch`, `q_weak_photometric` (contact: where
+  the fixed q came from; every q-search value is weak);
+- `third_light_fitted` / `third_light_fixed`;
+- `mesh_raised:<triangles>` (the mesh gate chose a finer mesh);
+- `mesh_noise_high:<value>` (no mesh brought the noise under the limit).
+
+Further rows:
+- `nm_start`, `nm_scouts`: which Nelder–Mead start won and the log-probability
+  each scout reached;
+- `q_source`, `q_reference`, `q_search_min`, `q_search_interval` (contact);
+- `sigma_prescale`, `sigma_total_scale`: the factor applied to the uncertainties
+  before sampling, and the total inflation;
+- `gravb_bol_<component>`, `albedo_<component>`, `gd_rule`;
+- `ntriangles`, `mesh_noise_scaled`, `mesh_noise_history`;
+- `l3_frac` for third-light stars.
+
+### 6.11 Early warning and parked stars
+
+05 checks every star three times, so that a wrong setup costs at most one
+Nelder–Mead run or one chunk, never days. A **PARK** finding stops only that star:
+- 05 writes `data/results/parked_<star>.txt`;
+- any checkpoint is kept;
+- the queue moves on to the next star.
+
+A **WARN** finding is printed and logged but changes nothing.
+
+| When | Cost | PARK if | WARN if |
+|---|---|---|---|
+| **Preflight**, before NM; the file and geometry part also on resume | seconds | bundle geometry ≠ routing (`morphology.py` changed, 04 not re-run); light curve or ephemeris newer than the bundle; bundle period ≠ Script 03 `P_new`; times not increasing; NaN data or σ ≤ 0; exposure ≥ 300 s without `fti_method = oversample`; wrong irradiation method | — |
+| **Post-NM**, before the emcee ball | none | **detached** star with r / `requiv_max` ≥ 0.97 after Nelder–Mead (a lobe-filling secondary: likely semi-detached; a lobe-filling primary: needs a decision) | an NM value within 2 % of a prior bound; **semi-detached** primary ≥ 0.97 of its lobe (near-contact; RZ Dra's correct solution has 0.98) |
+| **Each chunk** (`[health]` line) | none | fewer than 7 live walkers; **detached**: Roche-overflow failures ≥ 25 % of the chunk's evaluations, or a median walker ≥ 0.985 of its Eggleton lobe | walkers at −∞ (but ≥ 7 live); a walker frozen for the whole chunk; acceptance < 0.05; a walker median at a prior bound; Roche-overflow failures ≥ 25 % for a semi-detached or contact star |
+
+The thresholds and their calibration are in `earlywarn.py`. They are set so that
+both known lobe-filling cases (V358 Cep and OT Cep, run detached) park, while
+semi-detached and contact stars and the 38-star queue's preflight do not.
+
+**When a star is parked:**
+1. read `data/results/parked_<star>.txt`: the reason, the parameter values and the
+   suggested fix;
+2. usually: add the star to `MORPHOLOGY_OVERRIDE`, re-run 04 for it (one-star
+   catalogue), and relaunch. The rebuilt bundle clears the park automatically;
+3. if it is a false positive: run it anyway with `IGNORE_PARK="<star>"`. Forward
+   it under `mpirun` with `-x IGNORE_PARK`, e.g. through the wrapper's `RUN_CMD`.
+   Its results then carry `park_overridden`. A park at a chunk resumes from the
+   kept checkpoint.
 
 ---
 
@@ -651,11 +839,30 @@ All audits run from `Code/` and write their CSV next to themselves in `Audits/`.
   It loads every final bundle (moderate cost) and writes `mcmc_chain_audit.csv` and
   optionally `mcmc_chain_walkers.csv`. Stage 05 already runs the same check per
   star.
+- **`run_health.py <catalogue.csv> [--all-warnings]`** is the run health board
+  (§6.7). It is read-only and light, so it can run at any time.
 - **`audit_bundle_phase_alignment.py <catalogue.csv> …`** checks that each bundle's
   own period and t0 put the primary eclipse at phase 0. Prints verdicts.
 - **`audit_fillout_identifiability.py ["Star" …]`** profiles χ² against the contact
   fill-out with ~40 forward models per star. This is **real compute: do not run it
   beside a live MCMC.**
+- **`audit_model_tests.py`** fits one star under one chosen setting, so two fits
+  that differ in a single setting can be compared: geometry (`contact`, `sd2`,
+  `sd1`, `detached`), limb darkening (`--ld legacy|table|quad|free`), gravity
+  darkening (`--gd step8000|ramp|step6600`), third light, one spot. `--check`
+  proves the rebuilt bundle equals the stage-04 bundle; `--start-from` continues
+  an earlier fit; `--skip-existing` resumes a batch. About 150–500 models per
+  fit: **heavy**.
+  ```bash
+  python3 Audits/audit_model_tests.py fit --star "RZ Dra" --geometry sd2 --free-q --gd ramp --label test
+  python3 Audits/audit_model_tests.py collect --label test
+  ```
+- **`audit_mesh_noise.py`** measures the model's numerical noise for a star (the
+  same measurement as stage 05's mesh gate): `probe --star S --kind contact
+  [--ntriangles N]`, then `collect` → `Audits/mesh_noise.csv`. 23 models per
+  probe.
+- **`audit_oconnell.py`** measures the difference between the two light maxima,
+  cycle by cycle, on the clean light curves → `Audits/oconnell.csv`. Light.
 
 ### 7.3 Legacy audits
 
@@ -678,6 +885,7 @@ Every script records itself in `Runs/run_stats/` (via `runstats.py`):
 | `runs.csv` | One row per invocation, written at **start**: `run_id`, script, catalogue, host, Python, `code_sha` (hash of the code files), command, settings (05: walkers, gate, priors, PHOEBE/emcee versions, process count). |
 | `<script>_stars.csv` | One row per star: status, wall time, plus script-specific columns (05: steps, s/step, stop reason, χ²ν, acceptance, failed models). |
 | `05Optimization_chunks.csv` | One row per 05 chunk: step range, s/step, acceptance (from the chain), failed models, ETA. |
+| `05Optimization_health.csv` | One row per early-warning event: time, `run_id`, star, stage (`preflight`, `post-NM`, `chunk <step>`), level (WARN / PARK / OVERRIDDEN), code, detail (§6.11). |
 | `run_summary.txt` | A summary block per run (also printed at exit). |
 
 A results file's `run_id` and `code_sha` join to `runs.csv`, which answers "which
@@ -709,11 +917,11 @@ python neglected-eclipsing-binaries/tools/sync_from_working_tree.py
 | Working tree | Published repository |
 |---|---|
 | `01TargetSelection.py` … `06Visualization.py` | `src/TargetSelection.py` … `src/Visualization.py` |
-| `GenerateThesisTables.py`, `Schematic*.py`, `paths.py`, `runstats.py`, `morphology.py` | `src/` (same names) |
-| `run_05_autorestart.sh` | `src/run_05_autorestart.sh` (calls `Optimization.py`) |
+| `GenerateThesisTables.py`, `Schematic*.py`, `paths.py`, `runstats.py`, `morphology.py`, `earlywarn.py`, `limbdark.py`, `gravdark.py`, `ContactQSearch.py` | `src/` (same names) |
+| `run_05_autorestart.sh`, `smoke_05.sh` | `src/` (both call `Optimization.py`) |
 | `Audits/*.py` | `audits/*.py` |
 | `Notes/*.txt` | `docs/*.txt` |
-| `Targets/neglected_targets*.csv`, `triage_*.csv` | `data/targets/` |
+| `Targets/neglected_targets*.csv`, `triage_*.csv`, `contact_q_literature.csv`, `third_light.csv` | `data/targets/` |
 | `HOW_TO.md` | `HOW_TO.md` |
 
 ### 9.3 Running from a clone
@@ -745,7 +953,18 @@ rest.
       `Targets/trial_*.csv`.
 - [ ] Rebuild with 04 **only** the bundles you want refitted (§6.6).
 - [ ] **Never launch between a code change and the rebuild it needs.** A new 05
-      against old bundles fits the wrong model.
+      against old bundles fits the wrong model. (The preflight now parks a
+      morphology mismatch or a stale bundle, but do not rely on it.)
+- [ ] After any change to `05Optimization.py`, `earlywarn.py`, `morphology.py` or
+      `gravdark.py`: a **smoke pass** (`smoke_05.sh`, §6.8) before relaunching a
+      queue. A file that only compiles has not been tested: the first run of a
+      staged 05 crashed at import.
+- [ ] **Contact stars need an adopted q** (§5.4b) and a bundle rebuilt with it.
+- [ ] Do not edit `ContactQSearch.py` while its jobs run.
+- [ ] **Pause Windows and Microsoft Store updates** before a campaign: a WSL
+      self-update kills every run in it (§2.4).
+- [ ] Check the health board (`python Audits/run_health.py Targets/<catalogue>.csv`)
+      when you check in. A parked star waits for you; the queue does not.
 - [ ] After any change to 03, run `Audits/audit_period_fold.py` (drift < 0.01).
 - [ ] Keep the launching terminal open (or use tmux). Disable Windows sleep and
       update restarts during runs.
@@ -770,7 +989,10 @@ rest.
 | `[skip] <star> is being fitted by another queue (host:pid)` | Normal with two queues. If no other queue runs, the lock is stale and is taken over on the next pass. |
 | `Segmentation fault` inside `solve_radiosity_equation_Horvat_nbody` | A rare crash in PHOEBE's reflection solver, seen near the Roche lobe. The wrapper restarts from the last checkpoint. |
 | A burst of `target_volume … slightly over critical value, likely due to numerics` | Semi-detached stars: rounding puts the lobe-filling volume ~1e-16 over the limit and PHOEBE clamps it. Harmless; shown once per process, then suppressed. |
-| Many `secondary is overflowing at periastron` / `lnprobability=-inf` | Proposals beyond the Roche lobe are rejected. Normal for lobe-filling or near-contact systems. |
+| Many `secondary is overflowing at periastron` / `lnprobability=-inf` | Proposals beyond the Roche lobe are rejected. A few are normal near the lobe. If they dominate a **detached** star, the star wants to be semi-detached; the chunk check parks it (§6.11). |
+| `[parked] <star> at <stage>: <codes> — see …parked_<star>.txt` | An early-warning check stopped that star; the queue went on. Follow the fix in the file (§6.11). |
+| `[parked] … was parked … for this bundle — skipped` | The star is still parked; rebuild its bundle or set `IGNORE_PARK`. |
+| `[health] chunk check unavailable: …` | The per-chunk check itself failed (it never stops the run). Report it; sampling continues normally. |
 | `Nelder-Mead did NOT converge (Maximum number of iterations…)` | The pre-fit reached `NM_MAXITER`. The MCMC continues from there; usually harmless. |
 | `[refit] … was fitted from an unrecorded bundle` | Expected after 04 rebuilt the bundle (§6.6). Old files are kept as `_superseded_<date>`. |
 | `[resume] checkpoint was started from … set aside` | The bundle changed since the checkpoint; the star restarts fresh. |

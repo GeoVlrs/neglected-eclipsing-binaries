@@ -40,6 +40,15 @@ SCRIPTS: list[tuple[Path, Path]] = [
     (CODE / "runstats.py",             REPO / "src" / "runstats.py"),
     # Contact / detached / semi-detached routing shared by 04, 05 and 06 (Entry 76).
     (CODE / "morphology.py",           REPO / "src" / "morphology.py"),
+    # Stage-05 early-warning checks and parking (Entry 85); 05 imports it.
+    (CODE / "earlywarn.py",            REPO / "src" / "earlywarn.py"),
+    # Surface physics shared by 04, 05 and the audits: the limb-darkening tables
+    # (Claret 2017) and the gravity-darkening rule by model type (Entry 93).
+    (CODE / "limbdark.py",             REPO / "src" / "limbdark.py"),
+    (CODE / "gravdark.py",             REPO / "src" / "gravdark.py"),
+    # Stage between 04 and 05 for contact stars: the fixed-q search and the adopted
+    # mass ratio (Entries 90, 92).
+    (CODE / "ContactQSearch.py",       REPO / "src" / "ContactQSearch.py"),
     (CODE / "01TargetSelection.py",    REPO / "src" / "TargetSelection.py"),
     (CODE / "02DataAcquisition.py",    REPO / "src" / "DataAcquisition.py"),
     (CODE / "03OCAnalysis.py",         REPO / "src" / "OCAnalysis.py"),
@@ -62,6 +71,8 @@ SCRIPTS: list[tuple[Path, Path]] = [
 TRANSLATED: list[tuple[Path, Path, list[tuple[str, str]]]] = [
     (CODE / "run_05_autorestart.sh", REPO / "src" / "run_05_autorestart.sh",
      [("05Optimization.py", "Optimization.py")]),
+    (CODE / "smoke_05.sh",           REPO / "src" / "smoke_05.sh",
+     [("05Optimization.py", "Optimization.py")]),
 ]
 
 # (source_dir, glob_pattern, destination_dir)
@@ -70,6 +81,10 @@ GLOBS: list[tuple[Path, str, Path]] = [
     (CODE / "Notes",   "*.txt",                   REPO / "docs"),
     (CODE / "Targets", "neglected_targets*.csv",  REPO / "data" / "targets"),
     (CODE / "Targets", "triage_*.csv",            REPO / "data" / "targets"),
+    # Published inputs of the contact-star stage: literature mass ratios and the
+    # third-light table (references only; no pipeline products).
+    (CODE / "Targets", "contact_q_literature.csv", REPO / "data" / "targets"),
+    (CODE / "Targets", "third_light.csv",          REPO / "data" / "targets"),
 ]
 
 # Hard guard: never publish these, whatever a pattern might match.
