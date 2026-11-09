@@ -254,9 +254,11 @@ RHAT_CONVERGENCE_THRESHOLD: float = 1.1
 # --- Adaptive convergence gate (v1) -----------------------------------------
 # Instead of a fixed step budget, the sampler runs in MCMC_CHECKPOINT_NITERS-sized
 # chunks between a floor and a ceiling and stops as soon as EVERY sampled parameter
-# satisfies both the 50τ autocorrelation criterion (Sokal 1997; Goodman & Weare
-# 2010; Foreman-Mackey et al. 2013) and R̂ < 1.1 (Gelman & Rubin 1992; Brooks &
-# Gelman 1998). The floor keeps the τ/R̂ estimates stable before the first test;
+# satisfies both the 50τ autocorrelation criterion (the run length the emcee
+# documentation, "Autocorrelation analysis & convergence", recommends for a reliable
+# τ; τ by Sokal's 1997 automatic windowing as implemented in emcee 3) and R̂ < 1.1
+# (Gelman & Rubin 1992; Brooks & Gelman 1998).
+# The floor keeps the τ/R̂ estimates stable before the first test;
 # the ceiling bounds the worst case (multimodal / prior-railed fill-out, which no
 # number of steps resolves). Setting MCMC_NITERS explicitly forces the legacy
 # fixed-length run (MIN = MAX = MCMC_NITERS) for trials and reproductions.
@@ -641,8 +643,9 @@ def assess_autocorrelation_convergence(mcmc_chains: np.ndarray) -> np.ndarray:
     Compute the integrated autocorrelation time τ for each free parameter.
 
     A chain is converged when its length N satisfies N > CONVERGENCE_MULTIPLIER × τ.
-    The emcee autocorr module uses the Goodman & Weare (2010) windowing function
-    and returns the median τ across all walkers for each parameter dimension.
+    emcee.autocorr.integrated_time averages the autocorrelation function over the
+    walkers and picks the window with Sokal's (1997) automatic windowing (c = 5),
+    returning one τ per parameter dimension.
 
     Parameters
     ----------
