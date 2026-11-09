@@ -12,6 +12,10 @@ __pycache__/
 !tominima_*.csv
 !neglected_targets*.csv
 !triage_*.csv
+!contact_q_literature.csv
+!third_light.csv
+!star_priors.csv
+!phaseF_queue.csv
 
 # Per-target MCMC results stay PRIVATE (unpublished thesis data)
 results_*.csv

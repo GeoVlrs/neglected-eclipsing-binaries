@@ -225,6 +225,10 @@ NM_SCOUT_MAXITER: int = min(NM_MAXITER, int(os.environ.get("NM_SCOUT_MAXITER", 8
 # 4000 cost 2.6-3.7x the time of 2000. MESH_NOISE_THRESHOLD=0 turns the gate off.
 MESH_NOISE_THRESHOLD: float = float(os.environ.get("MESH_NOISE_THRESHOLD", 2.0))
 MESH_LADDER: tuple = (2000, 3000, 4000)
+
+# Fresh starts of one star that may die before its first checkpoint before the
+# star is parked (Entry 105).
+SETUP_CRASH_LIMIT: int = int(os.environ.get("SETUP_CRASH_LIMIT", 2))
 # Lower T2 prior bound for non-contact stars, as a fraction of T1 (was 0.70 until
 # Entry 89: both calibrators, RZ Dra and GW Gem, sat exactly on 0.70 T1 in the
 # right basin; Algol secondaries commonly have T2/T1 of 0.5-0.7).
@@ -298,12 +302,13 @@ ROCHE_LOBE_CAP: float = float(os.environ.get("ROCHE_LOBE_CAP", 1.0))
 # For EB (detached) systems the inclination floor is set to 60° and radii
 # are capped at 1.0 to prevent ghost-star collapse (requiv → 0 or → overflow).
 
-from morphology import CONTACT_FILLOUT_CEIL                 # noqa: E402  (needed just below)
+from morphology import (CONTACT_FILLOUT_CEIL, CONTACT_T2_FLOOR_FRAC, CONTACT_T2_FLAG_FRAC,  # noqa: E402
+                        CONTACT_INCL_FLOOR_DEG)
 
 FREE_PARAMS_CONTACT: dict[str, tuple[float, float, str]] = {
     "teff@secondary":                   (3000, 10000, "Secondary effective temperature (K)"),
-    "incl@binary":                      (40.0,  90.0, "Orbital inclination (degrees)"),
-    # incl floor lowered 50 -> 40: FI Boo (shallow eclipses) railed exactly at 50°, and
+    "incl@binary":                      (CONTACT_INCL_FLOOR_DEG, 90.0, "Orbital inclination (degrees)"),
+    # incl floor 50 -> 40 -> 30 (Entry 106; FI Boo, published i = 38 deg). Before: FI Boo (shallow eclipses) railed exactly at 50°, and
     # contact systems can still eclipse at moderate inclinations. Widening only helps
     # low-i systems; every other completed star sits at i >= 54°, so none are affected.
     "fillout_factor@contact_envelope":  (FILLOUT_FLOOR, CONTACT_FILLOUT_CEIL,
@@ -351,7 +356,7 @@ FREE_PARAMS_SEMIDETACHED["q@binary"] = (0.1, Q_MAX_SEMIDETACHED,
 from morphology import (                                    # noqa: E402
     CONTACT, DETACHED, SEMIDETACHED, MORPHOLOGY_OVERRIDE,
     is_contact_morphology, resolve_morphology, resolve_morphology_kind, morphology_source,
-    CONTACT_FILLOUT_CEIL, read_q_adopted, read_third_light,
+    CONTACT_FILLOUT_CEIL, read_q_adopted, read_third_light, read_star_priors,
 )
 
 # Early warning (Entry 85): preflight, post-NM and per-chunk checks that PARK a
@@ -459,6 +464,58 @@ def prior_bounds(bundle: object, twig: str, fallback: tuple) -> tuple[float, flo
         return float(dist.low), float(dist.high)
     except Exception:
         return float(fallback[0]), float(fallback[1])
+
+
+# ── THIRD-LIGHT SCALING (Pipeline_Log Entries 136-139) ───────────────────────
+# With pblum_mode='dataset-scaled' PHOEBE 2.4.22 adds l3_frac/(1-l3_frac) *
+# sum(pblum_abs) [W] to the unscaled fluxes [W/m^2] (frontend/bundle.py ~12106):
+# no 1/(4 pi), and for contact systems the sum also holds a 'contact_envelope'
+# entry equal to primary + secondary. The model is still pure dilution, but the
+# share of the light that a given l3_frac puts in the model obeys
+#     share/(1-share) = k * l3_frac/(1-l3_frac),   k ~ 4 pi (x2 for contact).
+# Targets/third_light.csv gives shares (prior_max, l3_published); 05 measures k
+# on the star's bundle and converts them into l3_frac.
+L3_K_TEST = 0.05                       # l3_frac of the second probe model
+L3_K_TYPICAL = {True: 27.5, False: 13.2}   # contact / non-contact; fallback only
+last_l3_k: tuple = (float("nan"), "")      # (k at start-up, "measured" | "assumed")
+
+
+def l3_share_of(l3_frac: float, k: float) -> float:
+    """Share of the mean model light that a set l3_frac puts into the model."""
+    x = k * l3_frac / (1.0 - l3_frac)
+    return x / (1.0 + x)
+
+
+def l3_frac_for_share(share: float, k: float) -> float:
+    """l3_frac that puts `share` of the mean model light into the model."""
+    x = share / (1.0 - share) / k
+    return x / (1.0 + x)
+
+
+def measure_l3_k(bundle: object, **compute_kw) -> float:
+    """k on this bundle, from two forward models (l3_frac 0 and L3_K_TEST): a
+    least-squares fit m(test) = a*m(0) + c, k = (c/a/mean m(0)) / (test/(1-test)).
+    The bundle's l3_frac is restored and the probe model removed. Same method as
+    Audits/audit_l3_scaling.py."""
+    saved = float(bundle.get_value("l3_frac", dataset="lc01", context="dataset"))
+    m = []
+    try:
+        for v in (0.0, L3_K_TEST):
+            bundle.set_value("l3_frac", dataset="lc01", context="dataset", value=v)
+            bundle.run_compute(model="l3k_probe", overwrite=True, **compute_kw)
+            m.append(np.asarray(bundle.get_value("fluxes", dataset="lc01",
+                                                 model="l3k_probe"), float))
+    finally:
+        bundle.set_value("l3_frac", dataset="lc01", context="dataset", value=saved)
+        try:
+            bundle.remove_model("l3k_probe")
+        except Exception:
+            pass
+    a, c = np.linalg.lstsq(np.vstack([m[0], np.ones_like(m[0])]).T, m[1], rcond=None)[0]
+    k = float((c / a / m[0].mean()) / (L3_K_TEST / (1.0 - L3_K_TEST)))
+    if not (np.isfinite(k) and k > 0):
+        raise ValueError(f"k = {k}")
+    return k
 
 
 def file_sha(path: str) -> str:
@@ -882,6 +939,39 @@ def read_failed_models(bundle: object, solution: str = "best_solution") -> tuple
         return "", f"unavailable: {failed_error}"[:120]
 
 
+def apply_star_priors(star_name: str, free_params: dict, bundle: object = None) -> list:
+    """
+    Narrow free-parameter bounds to Targets/star_priors.csv for this star (the
+    intersection, never a widening). The priors, Nelder-Mead, the starts and the
+    emcee ball all read free_params, so this one change bounds all of them. With a
+    bundle, a seed outside the new bounds is moved inside. Returns the twigs
+    changed (Entry 106).
+    """
+    changed = []
+    for twig, (lo, hi, reason) in read_star_priors(paths.TARGETS_DIR).get(star_name, {}).items():
+        if twig not in free_params:
+            continue
+        old_lo, old_hi, desc = free_params[twig]
+        new_lo, new_hi = max(old_lo, lo), min(old_hi, hi)
+        if new_hi <= new_lo:
+            master_print(f"  [prior WARN] {twig}: star_priors.csv bounds [{lo}, {hi}] do not "
+                         f"overlap [{old_lo}, {old_hi}]; ignored.")
+            continue
+        free_params[twig] = (new_lo, new_hi, desc)
+        changed.append(twig)
+        master_print(f"  [prior] {star_name}: {twig} narrowed to [{new_lo:g}, {new_hi:g}] "
+                     f"(star_priors.csv: {reason[:90]})")
+        if bundle is not None:
+            try:
+                ctx = ["component", "dataset"]
+                v = float(bundle.get_value(twig, context=ctx))
+                if not new_lo <= v <= new_hi:
+                    bundle.set_value(twig, context=ctx, value=float(min(max(v, new_lo), new_hi)))
+            except Exception:
+                pass
+    return changed
+
+
 def derive_free_params_meta(
     star_name: str,
     variable_type: str,
@@ -901,7 +991,11 @@ def derive_free_params_meta(
         free_params["l3_frac@lc01"] = (0.0, 0.20, "Third-light contamination fraction")
     _l3 = read_third_light(paths.TARGETS_DIR).get(star_name)
     if _l3 and _l3["mode"] == "free":
+        # Membership only. The real l3_frac bounds (the table's share converted with
+        # k, Entry 139) live in the checkpoint's my_priors, which prior_bounds()
+        # reads; this (0, share) pair is only its fallback.
         free_params["l3_frac@lc01"] = (0.0, _l3["prior_max"], "Third-light fraction")
+    apply_star_priors(star_name, free_params)
     return free_params, is_contact, len(free_params)
 
 
@@ -964,7 +1058,8 @@ def nm_start_labels(kind: str) -> list:
     return ["prod", "swap", "bigP", "bigS"]
 
 
-def apply_nm_start(bundle: object, kind: str, label: str, seeds: dict, sma: float) -> None:
+def apply_nm_start(bundle: object, kind: str, label: str, seeds: dict, sma: float,
+                   bounds: Optional[dict] = None) -> None:
     """
     Put the bundle at one Nelder-Mead start. T2 and i are reset to the Script-04
     seed; q is set first because the Roche-lobe limits depend on it.
@@ -995,6 +1090,11 @@ def apply_nm_start(bundle: object, kind: str, label: str, seeds: dict, sma: floa
         put("teff@secondary", seeds["teff@secondary"])
         f, incl = {"shallow": (0.15, 82.0), "deep": (0.70, 70.0)}.get(
             label, (seeds["fillout_factor@contact_envelope"], seeds["incl@binary"]))
+        if bounds:                 # a start outside a (per-star) prior is moved inside
+            lo, hi = bounds.get("fillout_factor@contact_envelope", (f, f))
+            f = min(max(f, lo + 0.02 * (hi - lo)), hi - 0.02 * (hi - lo))
+            lo, hi = bounds.get("incl@binary", (incl, incl))
+            incl = min(max(incl, lo + 0.5), hi - 0.5)
         put("incl@binary", incl)
         put("fillout_factor@contact_envelope", f)
         return
@@ -1192,7 +1292,8 @@ def multistart_nelder_mead(bundle: object, free_params: dict, kind: str, star_na
     scouts = []
     for label in labels:
         try:
-            apply_nm_start(bundle, kind, label, seeds, sma)
+            apply_nm_start(bundle, kind, label, seeds, sma,
+                           {t: (lo, hi) for t, (lo, hi, _d) in free_params.items()})
         except Exception as start_error:
             master_print(f"  [multi-start] {label:<10} could not be set: {start_error}")
             continue
@@ -1214,7 +1315,8 @@ def multistart_nelder_mead(bundle: object, free_params: dict, kind: str, star_na
         master_print("  [multi-start] every scout failed — falling back to the single "
                      "historical start.")
         _first = nm_start_labels(kind)[0]
-        apply_nm_start(bundle, kind, _first, seeds, sma)
+        apply_nm_start(bundle, kind, _first, seeds, sma,
+                       {t: (lo, hi) for t, (lo, hi, _d) in free_params.items()})
         refresh_secondary_envelope(bundle, kind, quiet=True)
         run_nelder_mead(bundle, free_params, NM_MAXITER, _first)
         refresh_secondary_envelope(bundle, kind)
@@ -1458,7 +1560,8 @@ def prepare_bundle_for_mcmc(
     t1_current = bundle.get_value("teff@primary", context="component")
     if is_contact_binary:
         # W-type W UMa systems can have T2 > T1; allow up to 25% above T1.
-        t2_lower, t2_upper = 0.80 * t1_current, 1.25 * t1_current
+        # Lower end CONTACT_T2_FLOOR_FRAC (0.70; was 0.80, Entry 104).
+        t2_lower, t2_upper = CONTACT_T2_FLOOR_FRAC * t1_current, 1.25 * t1_current
     else:
         t2_lower = max(T2_FLOOR_K, T2_FLOOR_NONCONTACT * t1_current)
         t2_upper = 1.10 * t1_current
@@ -1566,22 +1669,40 @@ def prepare_bundle_for_mcmc(
     # Known multiple systems (Targets/third_light.csv, Entry 91): a companion's
     # constant light dilutes the eclipses, and a model without it compensates with
     # a lower inclination. `free` fits the fraction; `fixed` holds the published one.
+    # The table gives SHARES of the light; they are converted into PHOEBE's l3_frac
+    # with k measured on this bundle (Entries 136-139: before this, the raw table
+    # values went in, which put k times more third light into the model).
+    global last_l3_k
+    last_l3_k = (float("nan"), "")
     _l3 = read_third_light(paths.TARGETS_DIR).get(star_name)
     if _l3:
         bundle.set_value("l3_mode", dataset="lc01", value="fraction")
+        try:
+            _k = measure_l3_k(bundle)
+            last_l3_k = (_k, "measured")
+        except Exception as k_error:
+            _k = L3_K_TYPICAL[bool(is_contact_binary)]
+            last_l3_k = (_k, "assumed")
+            master_print(f"  [physics] third-light k measurement failed ({k_error}); "
+                         f"using the typical k {_k}")
         if _l3["mode"] == "free":
-            _seed = min(_l3["l3_published"] if _l3["l3_published"] is not None else 0.2,
-                        0.9 * _l3["prior_max"])
+            _seed_share = min(_l3["l3_published"] if _l3["l3_published"] is not None else 0.2,
+                              0.9 * _l3["prior_max"])
+            _seed = l3_frac_for_share(_seed_share, _k)
+            _hi = l3_frac_for_share(_l3["prior_max"], _k)
             bundle.set_value("l3_frac", dataset="lc01", context="dataset", value=_seed)
-            free_params["l3_frac@lc01"] = (0.0, _l3["prior_max"], "Third-light fraction")
-            master_print(f"  [physics] third light FREE in [0, {_l3['prior_max']}] "
-                         f"(seed {_seed:.2f}; published {_l3['l3_published']}; {_l3['reference']})")
+            free_params["l3_frac@lc01"] = (0.0, _hi, "Third-light fraction")
+            master_print(f"  [physics] third light FREE: share of the light in [0, {_l3['prior_max']}] "
+                         f"-> l3_frac in [0, {_hi:.5f}] (k {_k:.3f}, {last_l3_k[1]}); "
+                         f"seed share {_seed_share:.3f} -> l3_frac {_seed:.5f}; "
+                         f"published {_l3['l3_published']}; {_l3['reference']}")
         else:
-            bundle.set_value("l3_frac", dataset="lc01", context="dataset",
-                             value=_l3["l3_published"])
-            master_print(f"  [physics] third light FIXED at {_l3['l3_published']} "
-                         f"({_l3['reference']})")
+            _fixed = l3_frac_for_share(_l3["l3_published"], _k)
+            bundle.set_value("l3_frac", dataset="lc01", context="dataset", value=_fixed)
+            master_print(f"  [physics] third light FIXED: share {_l3['l3_published']} -> "
+                         f"l3_frac {_fixed:.5f} (k {_k:.3f}, {last_l3_k[1]}; {_l3['reference']})")
 
+    apply_star_priors(star_name, free_params, bundle)
     n_free_params = len(free_params)
 
     master_print(f"\n  [5D] Configuring {n_free_params} free parameters and priors...")
@@ -1675,10 +1796,28 @@ def prepare_bundle_for_mcmc(
         # every other free parameter lives in the component context.
         current_val  = bundle.get_value(twig, context=["component", "dataset"])
         param_range  = hi - lo
+        # Effective bounds (Entry 105): a radius cannot exceed its Roche lobe at the
+        # adopted q, which is often well below the prior's upper end (the widest
+        # lobe the q prior allows). GQ Cnc (smoke, 20 Oct): r2 at its lobe, the
+        # ball centred there, about half the walkers past the lobe, and emcee
+        # refused the start ("large condition number").
+        lo_eff, hi_eff = lo, hi
+        if twig in ("requiv@primary", "requiv@secondary"):
+            try:
+                _lobe = float(bundle.get_value("requiv_max", component=twig.split("@")[1],
+                                               context="component"))
+                hi_eff = min(hi, 0.999 * _lobe)
+            except Exception:
+                pass
         # 2% Gaussian ball: tight enough to keep walkers out of Roche-lobe
         # overflow, wide enough to give emcee's stretch move something to work with.
         init_sigma   = 0.02 * param_range
-        clipped_val  = float(np.clip(current_val, lo + init_sigma, hi - init_sigma))
+        if hi_eff - lo_eff > 4 * init_sigma:
+            clipped_val = float(np.clip(current_val, lo_eff + 2 * init_sigma,
+                                        hi_eff - 2 * init_sigma))
+        else:                                  # a very narrow window: centre, shrink
+            clipped_val = 0.5 * (lo_eff + hi_eff)
+            init_sigma = max(0.25 * (hi_eff - lo_eff), 1e-4 * param_range)
         init_distributions[twig] = phoebe.normal(clipped_val, init_sigma)
         # Printed per parameter because the absence of exactly this line is what
         # let the ordering bug survive 29 stars unnoticed.
@@ -1841,6 +1980,8 @@ PARAM_DISPLAY_LABELS: dict[str, tuple[str, str]] = {
     "r2_frac":          ("Secondary fractional radius r₂ = R₂/a", "—"),
     "fillout_factor":   ("Contact fill-out factor f",  "—"),
     "l3_frac":          ("Third-light fraction l₃",    "—"),
+    "l3_share":         ("Third light, share of the mean light", "—"),
+    "l3_k":             ("Third-light scaling k (final bundle)",  "—"),
 }
 
 # Provenance row in Runs/run_stats/runs.csv: code fingerprint (this script, the chain
@@ -2001,6 +2142,7 @@ for target_index, target in enumerate(target_list):
     nm_sidecar = mcmc_checkpoint + ".nm_start"      # winning Nelder-Mead start (Entry 89)
     mesh_sidecar = mcmc_checkpoint + ".mesh"        # mesh chosen by the noise gate (Entry 94)
     ps_sidecar = mcmc_checkpoint + ".sigma_prescale"  # sigma factor applied before sampling
+    l3k_sidecar = mcmc_checkpoint + ".l3_k"         # third-light k used for the priors (Entry 139)
     if os.path.exists(mcmc_checkpoint):
         try:
             started_from = open(sidecar, encoding="utf-8").read().strip()
@@ -2054,9 +2196,37 @@ for target_index, target in enumerate(target_list):
             sigma_prescale = float(open(ps_sidecar, encoding="utf-8").read().strip())
         except (OSError, ValueError):
             sigma_prescale = 1.0          # chain started before Entry 91: raw sigmas
+        try:
+            _kv, _, _ks = open(l3k_sidecar, encoding="utf-8").read().strip().partition(" | ")
+            l3_k_start = (float(_kv), _ks)
+        except (OSError, ValueError):
+            # no l3 for this star, or a chain started before Entry 139 (raw table values)
+            l3_k_start = (float("nan"), "unrecorded")
     else:
         already   = 0
         _setup_t0 = time.time()
+        # Crash-loop guard (Entry 105). A worker crash in PHOEBE's irradiation solver
+        # during the Nelder-Mead stage (V878 Her smoke, 20 Oct) kills the MPI job
+        # before any checkpoint exists; the wrapper restarts, the same start meets
+        # the same crash, and every restart is spent on one star. Each fresh start
+        # is counted in <checkpoint>.attempts (keyed to the input bundle); the
+        # count is cleared at the first checkpoint.
+        attempts_file = mcmc_checkpoint + ".attempts"
+        try:
+            _n_prev, _sha_prev = open(attempts_file, encoding="utf-8").read().split()
+            _n_prev = int(_n_prev) if _sha_prev == input_sha else 0
+        except (OSError, ValueError):
+            _n_prev = 0
+        if _n_prev >= SETUP_CRASH_LIMIT:
+            park_star(star_name, safe_name, input_sha, earlywarn.StarParked(
+                "setup", [("setup_crash_loop",
+                           f"the run died {_n_prev} times before this star's first "
+                           "checkpoint (setup or Nelder-Mead)",
+                           f"read the log for the crash; to try again delete {attempts_file}")]))
+            continue
+        if mpi_rank == 0:
+            with open(attempts_file, "w", encoding="utf-8") as fh:
+                fh.write(f"{_n_prev + 1} {input_sha}\n")
         try:
             prepared  = prepare_bundle_for_mcmc(star_name, variable_type, bundle_path)
         except earlywarn.StarParked as park:
@@ -2070,7 +2240,11 @@ for target_index, target in enumerate(target_list):
         nm_info = last_nm_start
         sigma_prescale = last_sigma_prescale
         mesh_info = last_mesh_info
+        l3_k_start = last_l3_k
         if mpi_rank == 0:
+            if np.isfinite(l3_k_start[0]):
+                with open(l3k_sidecar, "w", encoding="utf-8") as fh:
+                    fh.write(f"{l3_k_start[0]:.9g} | {l3_k_start[1]}\n")
             with open(mesh_sidecar, "w", encoding="utf-8") as fh:
                 fh.write(f"{mesh_info[0]} | {mesh_info[1]:.4g} | {mesh_info[2]}\n")
             with open(ps_sidecar, "w", encoding="utf-8") as fh:
@@ -2156,6 +2330,8 @@ for target_index, target in enumerate(target_list):
         _tmp_checkpoint = mcmc_checkpoint + ".tmp"
         bundle.save(_tmp_checkpoint)
         os.replace(_tmp_checkpoint, mcmc_checkpoint)
+        if mpi_rank == 0 and os.path.exists(mcmc_checkpoint + ".attempts"):
+            os.remove(mcmc_checkpoint + ".attempts")     # the setup survived (Entry 105)
         done = completed_iterations(bundle, "best_solution")
         master_print(f"  [checkpoint] {done}/{MCMC_MAX_NITERS} iters saved → {mcmc_checkpoint}")
 
@@ -2483,6 +2659,29 @@ for target_index, target in enumerate(target_list):
     posterior = compute_posterior_summary(bundle, "best_solution", burn_used)
     results   = extract_best_fit_parameters(bundle, free_params, posterior)
 
+    # ── 5J-0: THIRD LIGHT AS A SHARE OF THE LIGHT (Entries 136-139) ─────────────
+    # k is measured again on the adopted (posterior-median) bundle, with the final
+    # compute's settings, and the l3_frac median and interval ends are converted.
+    # The raw l3_frac row stays for provenance.
+    l3_k_final_src = ""
+    if "l3_frac" in results:
+        try:
+            _kf = measure_l3_k(bundle, irrad_method=irrad_method, distortion_method="roche")
+            l3_k_final_src = "measured"
+        except Exception as k_error:
+            _kf = l3_k_start[0] if np.isfinite(l3_k_start[0]) else L3_K_TYPICAL[bool(is_contact_binary)]
+            l3_k_final_src = "assumed"
+            master_print(f"  [l3] k on the final bundle unavailable ({k_error}); using {_kf:.3f}")
+        _v, _sm, _sp = results["l3_frac"]
+        _s = l3_share_of(_v, _kf)
+        _sm_s = _s - l3_share_of(_v - _sm, _kf) if np.isfinite(_sm) else np.nan
+        _sp_s = l3_share_of(_v + _sp, _kf) - _s if np.isfinite(_sp) else np.nan
+        results["l3_share"] = (_s, _sm_s, _sp_s)
+        results["l3_k"] = (_kf, np.nan, np.nan)
+        master_print(f"  [l3] l3_frac {_v:.5f} with k {_kf:.3f} ({l3_k_final_src}) = "
+                     f"{100 * _s:.2f} % of the mean light"
+                     + (f" (-{100 * _sm_s:.2f} / +{100 * _sp_s:.2f})" if np.isfinite(_sm_s) else ""))
+
     # ── 5J-a: RAILING FLAGS ──────────────────────────────────────────────────
     # A parameter is RAILED when its median lies within 2 raw σ (or 0.1 % of the
     # range) of a prior bound: its interval is then truncated by the prior, not
@@ -2664,6 +2863,16 @@ for target_index, target in enumerate(target_list):
             if star_name in PARK_OVERRIDDEN:
                 # An early-warning PARK was overridden with IGNORE_PARK (Entry 85).
                 flags.append("park_overridden")
+            for _tw in read_star_priors(paths.TARGETS_DIR).get(star_name, {}):
+                flags.append(f"star_prior:{_tw.split('@')[0]}")
+            if morphology_kind == CONTACT:
+                try:
+                    _ratio = (float(bundle.get_value("teff", component="secondary", context="component"))
+                              / float(bundle.get_value("teff", component="primary", context="component")))
+                    if _ratio < CONTACT_T2_FLAG_FRAC:
+                        flags.append(f"contact_large_temperature_difference:{_ratio:.3f}")
+                except Exception:
+                    pass
             if mesh_info[0] and mesh_info[0] > MESH_LADDER[0]:
                 flags.append(f"mesh_raised:{mesh_info[0]}")
             if MESH_NOISE_THRESHOLD > 0 and np.isfinite(mesh_info[1]) \
@@ -2673,6 +2882,11 @@ for target_index, target in enumerate(target_list):
             if _l3_row:
                 flags.append("third_light_fitted" if _l3_row["mode"] == "free"
                              else "third_light_fixed")
+                # Entry 139: k behind the priors / the reported share
+                if l3_k_start[1] == "unrecorded":
+                    flags.append("l3_priors_unconverted")
+                elif l3_k_start[1] == "assumed" or l3_k_final_src == "assumed":
+                    flags.append("l3_k_assumed")
             # Contact stars: where the FIXED mass ratio came from (Entry 90).
             q_info = read_q_adopted(paths.QSEARCH_DIR, star_name) if morphology_kind == CONTACT else {}
             if q_info.get("q_source") == "literature_spectroscopic":
@@ -2756,7 +2970,8 @@ for target_index, target in enumerate(target_list):
 
             # Target finished — drop the mid-run checkpoint (and its sidecar) so a
             # future relaunch is recognised as complete rather than resumed.
-            for _f in (mcmc_checkpoint, sidecar, nm_sidecar, ps_sidecar, mesh_sidecar):
+            for _f in (mcmc_checkpoint, sidecar, nm_sidecar, ps_sidecar, mesh_sidecar, l3k_sidecar,
+                       mcmc_checkpoint + ".attempts"):
                 if os.path.exists(_f):
                     os.remove(_f)
         else:

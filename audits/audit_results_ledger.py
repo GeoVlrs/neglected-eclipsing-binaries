@@ -59,8 +59,25 @@ ERA_BOUNDS = [
     (dt.datetime(2026, 8, 21, 23, 59), "E2 pre-gate (fixed 2850, i≥50, no f floor)"),
     (dt.datetime(2026, 9, 3, 12, 0), "E3 gate v1, old floors (i≥50, no f floor)"),
     (dt.datetime(2026, 9, 18, 12, 0), "E4 floors, pre-5D-b seeding fix"),
-    (dt.datetime(2100, 1, 1), "E5 current code (post-5D-b)"),
+    (dt.datetime(2100, 1, 1), "E5 post-5D-b, pre-campaign F"),
 ]
+# E6 is not a date: a result that records input_bundle_sha (campaign F, Oct 2026:
+# adopted q, mesh gate, multi-start, consistent irradiation) — Entry 126.
+ERA_CURRENT = "E6 current (recorded input bundle = today's bundle)"
+ERA_RECORDED_STALE = "E6s recorded input bundle, since rebuilt (05 refits it)"
+
+
+def bundle_sha(safe: str) -> str:
+    """sha256[:12] of data/bundles/bundle_<safe>.phoebe, as 05Optimization.file_sha."""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(os.path.join(paths.BUNDLE_DIR, f"bundle_{safe}.phoebe"), "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return ""
+    return h.hexdigest()[:12]
 DRIFT_LIMIT_CYC = 0.02          # ~3 phase bins of 0.0067
 PDC_RATIO_LIMIT = 3.0
 CONTAMINANT_PTP_LIMIT = 0.05
@@ -229,17 +246,40 @@ if __name__ == "__main__":
         safe = os.path.basename(path)[len("results_"):-len(".csv")]
         if safe.endswith(("_bug", "_walker8bug")) or "_superseded" in safe:
             continue                                     # archived, not published
+        if safe.startswith("ZZ_"):
+            continue                                     # scratch smoke-test stars
         star = safe.replace("_", " ")
         mtime = dt.datetime.fromtimestamp(os.path.getmtime(path))
         era = era_of(mtime)
         res = read_results(path)
         flag = ""
+        meta = {}
         with open(path, newline="", encoding="utf-8-sig") as fh:
             for row in csv.DictReader(fh):
                 if row["Symbol"] == "morphology_flag":
                     flag = row["Value"]
+                if row["Symbol"] in ("input_bundle_sha", "stop_reason", "morphology",
+                                     "morphology_source", "flags"):
+                    meta[row["Symbol"]] = row["Value"]
+        # E6 (Entry 126): a result that records its input bundle comes from the current
+        # campaign (the test GenerateThesisTables.notes_for uses for "pre-audit").
+        # Its railing, stop reason and model type are read from what 05 wrote, since
+        # railing() holds the bounds of the older eras.
+        # Current = the recorded input sha is the sha of today's bundle (05's own skip
+        # test); a recorded sha that no longer matches means 05 will refit the star.
+        recorded = meta.get("input_bundle_sha", "")
+        current = bool(recorded) and recorded == bundle_sha(safe)
+        if current:
+            era = ERA_CURRENT
+        elif recorded:
+            era = ERA_RECORDED_STALE
         contact = ("fillout_factor" in res) or "CONTACT" in flag.upper()
-        railed, crossing = railing(res, era, contact)
+        if recorded:
+            fl = [x.strip() for x in meta.get("flags", "").split(";") if x.strip()]
+            railed = [x for x in fl if "@low" in x or "@high" in x]
+            crossing = [x for x in fl if x.startswith("interval_clipped_at_bound")]
+        else:
+            railed, crossing = railing(res, era, contact)
         f = fold.get(star, {})
         c = crowd.get(star, {})
         drift = float(f["drift_new_cyc"]) if f.get("drift_new_cyc") else float("nan")
@@ -255,8 +295,14 @@ if __name__ == "__main__":
         except (KeyError, ValueError, TypeError):
             pdc = float("nan")
         gcvs = types.get(star, "")
-        routing = routing_verdict(gcvs, "CONTACT" if contact else "DETACHED")
-        if era.startswith(("E1", "E2")):
+        if recorded:
+            routing = (f"ok ({meta.get('morphology', '?')}, "
+                       f"{meta.get('morphology_source', '?')}; morphology.py)")
+        else:
+            routing = routing_verdict(gcvs, "CONTACT" if contact else "DETACHED")
+        if recorded:
+            stop = meta.get("stop_reason", "not recorded")
+        elif era.startswith(("E1", "E2")):
             stop = "fixed 2850 (no gate)"
         else:
             stop = stops.get(star, "no surviving log")
@@ -264,7 +310,7 @@ if __name__ == "__main__":
         reasons = []
         if math.isfinite(drift) and drift > DRIFT_LIMIT_CYC:
             reasons.append(f"period drift {drift:.3f}")
-        if contact:
+        if contact and not recorded:     # E6: 05 sets irrad_method in the compute options
             reasons.append("irrad mismatch")
         if not routing.startswith("ok") and not routing.startswith("EB (β"):
             reasons.append("routing")
@@ -276,10 +322,20 @@ if __name__ == "__main__":
             reasons.append("pre-gate fixed length")
         if railed:
             reasons.append("railed")
-        priority = ("BLOCKED (data)" if contam else
-                    "must re-run" if reasons else "keep")
-        decision = ("KEPT, documented (Entry 78)" if star in KEEP
-                    else "RE-RUN (Entry 78)")
+        if current:
+            # A current result is the published one; a railed value is reported as a
+            # limit (05 writes the flag), not re-run.
+            priority = ("BLOCKED (data)" if contam else
+                        "current, with caveats" if reasons else "current")
+            decision = "CURRENT (phase F)"
+        elif recorded:
+            priority = "superseded at refit"
+            decision = "REFIT PENDING (bundle rebuilt since)"
+        else:
+            priority = ("BLOCKED (data)" if contam else
+                        "must re-run" if reasons else "keep")
+            decision = ("KEPT, documented (Entry 78)" if star in KEEP
+                        else "RE-RUN (Entry 78)")
         try:
             amp_loss = float(f["amp_loss_pct"])
         except (KeyError, ValueError, TypeError):
@@ -287,7 +343,8 @@ if __name__ == "__main__":
 
         rows.append({
             "star": star, "results_date": mtime.strftime("%Y-%m-%d"), "era": era,
-            "gcvs_type": gcvs, "morphology": "contact" if contact else "detached",
+            "gcvs_type": gcvs,
+            "morphology": meta.get("morphology") or ("contact" if contact else "detached"),
             "routing": routing, "stop": stop,
             "chi2_red": (res.get("chi2_red") or (None,))[0],
             "err_scale": (res.get("err_scale") or (None,))[0],

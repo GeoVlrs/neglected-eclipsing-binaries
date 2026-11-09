@@ -174,6 +174,72 @@ NOTE_LETTERS = {
 MORPH_SHORT = {"contact": "C", "detached": "D", "semidetached": "SD"}
 
 
+def q_systematics() -> dict:
+    """{star: (incl_sys_q, fillout_sys_q)} from Audits/q_systematics.csv
+    (Audits/audit_q_systematics.py, Entry 112): the change in i and f over the
+    q range (published error, or +-15 % for a q-search value). {} if absent."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Audits", "q_systematics.csv")
+    out: dict = {}
+    try:
+        with open(path, newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                out[row["star"]] = (_to_float(row.get("incl_sys_q")), _to_float(row.get("fillout_sys_q")))
+    except OSError:
+        return {}
+    return out
+
+
+def with_systematic(cell: str, sys_value: float, decimals: int, label: str = "q") -> str:
+    r"""Append a second, systematic term to a math cell: $78.6 \pm 0.4$ -> $78.6 \pm 0.4 \pm 0.2_{q}$."""
+    if cell == "--" or math.isnan(sys_value) or not cell.endswith("$"):
+        return cell
+    return cell[:-1] + r" \pm " + f"{sys_value:.{decimals}f}" + "_{" + label + "}$"
+
+
+def t1_term(eb: dict) -> tuple:
+    """(lo, hi) of the T1 term on T2 (Entry 135, 142): T2_sys_T1_lo/_hi include the
+    gravity-darkening ramp, so they are asymmetric for non-contact stars inside
+    6600-8000 K; the blackbody-only T2_sys_T1 is the fallback."""
+    lo, hi = _to_float(eb.get("T2_sys_T1_lo")), _to_float(eb.get("T2_sys_T1_hi"))
+    if math.isnan(lo) or math.isnan(hi):
+        s = _to_float(eb.get("T2_sys_T1"))
+        return -s, s
+    return lo, hi
+
+
+def with_systematic_range(cell: str, lo: float, hi: float, decimals: int, label: str) -> str:
+    r"""Like with_systematic, but an asymmetric term prints as ${}^{+hi}_{-|lo|}$:
+    $5259 \pm 13$ -> $5259 \pm 13\,{}^{+220}_{-129}{}_{T_1}$. Symmetric (to the
+    printed precision) terms keep the $\pm$ form."""
+    if cell == "--" or math.isnan(lo) or math.isnan(hi) or not cell.endswith("$"):
+        return cell
+    if lo <= 0.0 <= hi and f"{-lo:.{decimals}f}" == f"{hi:.{decimals}f}":
+        return with_systematic(cell, hi, decimals, label)
+    return (cell[:-1] + r"\,{}^{" + f"{hi:+.{decimals}f}" + "}_{" + f"{lo:+.{decimals}f}"
+            + "}{}_{" + label + "}$")
+
+
+def audit_rows(name: str) -> dict:
+    """{star: row} from Audits/<name> (written by the audit scripts); {} if absent."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Audits", name)
+    try:
+        with open(path, newline="", encoding="utf-8") as handle:
+            return {row["star"]: row for row in csv.DictReader(handle)}
+    except OSError:
+        return {}
+
+
+def t1_source_mark(source: str) -> str:
+    """Superscript for a T1 that is not Gaia DR3 MSC (Entry 126; t1_anchor.csv)."""
+    if source.startswith("GSP-Phot"):
+        return "G"
+    if "LAMOST" in source:
+        return "L"
+    if "(SIMBAD)" in source:
+        return "S"
+    return ""
+
+
 def notes_for(data: dict) -> list[str]:
     """Footnote keys that apply to one results file."""
     text = data.get("_text", {})
@@ -217,17 +283,28 @@ err_scale in the results file). q is FIXED for contact stars at the adopted
     """
     used_notes: list[str] = []
     rows: list[str] = []
+    q_sys = q_systematics()
+    budget = audit_rows("error_budget.csv")        # Audits/audit_error_budget.py (Entry 126)
+    t1_anchor = audit_rows("t1_anchor.csv")       # Audits/audit_t1_anchor.py (Entry 126)
     for star_name in target_names:
         parameter_data = read_results_file(star_name)
         if parameter_data is None:
-            rows.append(fr"{star_name} & \multicolumn{{8}}{{c}}{{[Pending Optimization]}} \\")
+            rows.append(fr"{star_name} & \multicolumn{{9}}{{c}}{{[Pending Optimization]}} \\")
             continue
         text  = parameter_data.get("_text", {})
         morph = text.get("morphology", "")
         if not morph:   # pre-audit files: infer from the parameters present
             morph = "contact" if "fillout_factor" in parameter_data else "detached"
+        eb = budget.get(star_name, {})
         t1_cell   = format_with_uncertainty(parameter_data.get("T1_K"),     decimals=0)
+        mark = t1_source_mark(t1_anchor.get(star_name, {}).get("T1_source", ""))
+        if mark and t1_cell.endswith("$"):
+            t1_cell = t1_cell[:-1] + "^{" + mark + "}$"
         t2_cell   = format_with_uncertainty(parameter_data.get("T2_K"),     decimals=0)
+        # T2 is tied to the fixed T1 (Entry 110): second term = sigma_T1 x dT2/dT1,
+        # with the gravity-darkening ramp's change where it applies (Entries 135, 142).
+        t2_cell   = with_systematic_range(t2_cell, *t1_term(eb), 0, "T_1")
+        ratio_cell = format_with_uncertainty(parameter_data.get("T2_over_T1"), decimals=3)
         incl_cell = format_with_uncertainty(parameter_data.get("incl_deg"), decimals=1)
         q_entry   = parameter_data.get("q")
         q_fixed   = q_entry is not None and (math.isnan(q_entry[1]) or q_entry[1] == 0.0)
@@ -242,21 +319,34 @@ err_scale in the results file). q is FIXED for contact stars at the adopted
                 q_cell = q_cell[:-1] + "^{" + mark + "}$"
         if morph == "contact":
             geom_cell = format_with_uncertainty(parameter_data.get("fillout_factor"), decimals=3)
+            if star_name in q_sys:      # systematic from the fixed q (Entry 112)
+                incl_cell = with_systematic(incl_cell, q_sys[star_name][0], decimals=1)
+                geom_cell = with_systematic(geom_cell, q_sys[star_name][1], decimals=3)
         else:
             r1 = format_with_uncertainty(parameter_data.get("r1_frac"), decimals=4)
-            r2 = format_with_uncertainty(parameter_data.get("r2_frac"), decimals=4)
+            r2_entry = parameter_data.get("r2_frac")
+            if morph == "semidetached" and not math.isnan(_to_float(eb.get("r2"))):
+                # r2 follows q through the lobe constraint: its error comes from the
+                # q posterior (audit_error_budget.py), the value stays the results'.
+                r2_entry = (r2_entry[0] if r2_entry else _to_float(eb.get("r2")),
+                            _to_float(eb.get("r2_lo")), _to_float(eb.get("r2_hi")))
+            r2 = format_with_uncertainty(r2_entry, decimals=4)
             if morph == "semidetached":
-                r2 = r2[:-1] + r"^{\ddagger}$" if r2 != "--" else r2
+                r2 = r2[:-1] + r"\,{}^{\ddagger}$" if r2 != "--" else r2
             geom_cell = f"{r1}, {r2}"
         chi2 = parameter_data.get("chi2_red", (float("nan"),))[0]
         chi2_cell = "--" if math.isnan(chi2) else f"{chi2:.2f}"
         keys = notes_for(parameter_data)
+        # Near-lobe note from the posterior (share of draws above 0.97 of the lobe).
+        if _to_float(eb.get("r1_lobe_p97")) >= 0.10 and "near_lobe" not in keys:
+            keys.append("near_lobe")
         for k in keys:
             if k not in used_notes:
                 used_notes.append(k)
         notes_cell = ",".join(NOTE_LETTERS[k][0] for k in keys)
         rows.append(f"{star_name} & {MORPH_SHORT.get(morph, morph)} & {t1_cell} & {t2_cell} & "
-                    f"{incl_cell} & {q_cell} & {geom_cell} & {chi2_cell} & {notes_cell} \\\\")
+                    f"{ratio_cell} & {incl_cell} & {q_cell} & {geom_cell} & {chi2_cell} & "
+                    f"{notes_cell} \\\\")
 
     legend = "; ".join(f"$^{{{NOTE_LETTERS[k][0]}}}$ {NOTE_LETTERS[k][1]}"
                        for k in NOTE_LETTERS if k in used_notes)
@@ -265,19 +355,96 @@ err_scale in the results file). q is FIXED for contact stars at the adopted
     print(r"\centering")
     print(r"\sffamily\scriptsize")
     print(r"\caption{Derived parameters. Model: C contact, D detached, SD semi-detached. "
-          r"$T_1$ is held fixed. Contact $q$ is held fixed at the adopted value: "
+          r"$T_1$ is held fixed: Gaia DR3 MSC unless marked ($^{G}$\,Gaia GSP-Phot, "
+          r"$^{S}$\,spectral type, $^{L}$\,LAMOST and spectral type). The light curve "
+          r"measures $T_2/T_1$; $T_2$ is quoted for that $T_1$, and its second term "
+          r"$\pm s_{T_1}$ is the change of $T_2$ over the uncertainty of $T_1$ at a "
+          r"fixed TESS-band surface-brightness ratio (blackbody atmospheres); for "
+          r"detached and semi-detached stars it includes the change of gravity darkening "
+          r"along the 6600--8000\,K ramp, which can make it asymmetric. "
+          r"Contact $q$ is held fixed at the adopted value: "
           r"$^{\dagger}$\,published spectroscopic mass ratio, $^{\S}$\,photometric "
           r"$q$-search minimum; $q = m_2/m_1$ with star 1 the hotter component, so "
           r"$q > 1$ marks a W-type system. "
           r"$^{\ddagger}$\,set by the Roche-lobe constraint. Uncertainties are 1$\sigma$ "
-          r"MCMC intervals scaled by $\sqrt{\chi^2_\nu}$. Geometry: fill-out $f$ (C) or "
-          r"fractional radii $r_1, r_2$ (D, SD). "
+          r"MCMC intervals scaled by $\sqrt{\chi^2_\nu}$; for contact stars a second term "
+          r"$\pm s_q$ on $i$ and $f$ is the systematic from the fixed $q$ (published error, or "
+          r"$\pm15$\,\% for a $q$-search value). The residuals are correlated, so the "
+          r"statistical terms are lower limits; Table~\ref{tab:error-budget} gives the "
+          r"factor $\beta$ and the spot and limb-darkening terms. Geometry: fill-out $f$ (C) or "
+          r"fractional radii $r_1, r_2$ (D, SD); a lobe-filling $r_2$ takes its error from "
+          r"the $q$ posterior. "
           + (r"Notes: " + legend + "." if legend else "") + "}")
     print(r"\label{tab:results}")
-    print(r"\begin{tabular}{l c c c c c c c l}")
+    print(r"\begin{tabular}{l c c c c c c c c l}")
     print(r"\toprule")
-    print(r"Target & Model & $T_1$ (K) & $T_2$ (K) & $i$ ($^\circ$) & $q$ & $f$ / $r_1, r_2$ "
-          r"& $\chi^2_\nu$ & Notes \\")
+    print(r"Target & Model & $T_1$ (K) & $T_2$ (K) & $T_2/T_1$ & $i$ ($^\circ$) & $q$ & "
+          r"$f$ / $r_1, r_2$ & $\chi^2_\nu$ & Notes \\")
+    print(r"\midrule")
+    for row in rows:
+        print(row)
+    print(r"\bottomrule")
+    print(r"\end{tabular}")
+    print(r"\end{table}")
+
+
+def render_error_budget_table(target_names: list[str]) -> None:
+    """Second table (Entry 126): the terms behind each finished star's uncertainties,
+    from Audits/error_budget.csv. Only stars with a current result appear."""
+    budget = audit_rows("error_budget.csv")
+    rows = []
+    for star in target_names:
+        eb = budget.get(star)
+        if not eb:
+            continue
+        f = lambda k, d: ("--" if math.isnan(_to_float(eb.get(k))) else f"{_to_float(eb.get(k)):.{d}f}")
+        contact = eb.get("morphology") == "contact"
+        rng = lambda s: s.replace("..", "--") if s else "--"     # "+0.3..+1.0" -> "+0.3--+1.0"
+        spot_i = rng(eb.get("spot_i_deg"))
+        # l3 as a share of the system's mean light in the model (Entries 136-137);
+        # error_budget.csv carries the converted values (l3_pct, l3_pct_lo/_hi)
+        l3_txt = eb.get("l3", "none") or "none"
+        if not math.isnan(_to_float(eb.get("l3_pct"))) and l3_txt.startswith("fitted"):
+            l3 = f"{f('l3_pct', 1)} [{f('l3_pct_lo', 1)}, {f('l3_pct_hi', 1)}]"
+        elif not math.isnan(_to_float(eb.get("l3_pct"))) and l3_txt.startswith("fixed"):
+            l3 = f"{f('l3_pct', 1)} (fixed)"
+        elif l3_txt == "none":
+            l3 = "none"
+        else:
+            l3 = "k?"          # third light without a current k: do not print raw l3_frac
+        lo, hi = t1_term(eb)
+        if math.isnan(lo) or math.isnan(hi):
+            t1t = "--"
+        elif lo <= 0.0 <= hi and f"{-lo:.0f}" == f"{hi:.0f}":
+            t1t = f"$\\pm{hi:.0f}$"
+        else:
+            t1t = f"${lo:+.0f}/{hi:+.0f}$"
+        rows.append(
+            f"{star} & {f('beta', 1)} & {f('T2_sig', 0)} & {t1t} & "
+            f"{f('incl_sig', 2)} & {f('incl_sys_q', 2) if contact else '--'} & {spot_i} & "
+            f"{rng(eb.get('ld_incl'))} & "
+            f"{(f('fillout_sig', 3) + ' / ' + f('fillout_sys_q', 3)) if contact else '--'} & {l3} \\\\")
+    if not rows:
+        return
+    print("\n% --- ERROR BUDGET (generated by GenerateThesisTables.py from Audits/error_budget.csv) ---")
+    print(r"\begin{table}[htbp]")
+    print(r"\centering")
+    print(r"\sffamily\scriptsize")
+    print(r"\caption{Error budget of the finished stars. $\beta$: correlated-residual factor "
+          r"(time-averaging method; a lower limit), by which the statistical (MCMC) terms "
+          r"should be multiplied. $T_2$: statistical term and the term from $T_1$ "
+          r"(Table~\ref{tab:results}). $i$: statistical term, the term from the fixed $q$ "
+          r"(contact), the one-sided shift a cool spot produces where the O'Connell effect "
+          r"is $\geq 1$\,\% (tests on three stars), and the limb-darkening shift (linear 0.6 "
+          r"against tabulated coefficients, sample-wide). $f$: statistical / fixed-$q$ terms. "
+          r"$l_3$: third light in per cent of the system's mean light in the model "
+          r"(fitted: median and 68\,\% interval; converted from PHOEBE's fractional "
+          r"parameter), or none.}")
+    print(r"\label{tab:error-budget}")
+    print(r"\begin{tabular}{l c c c c c c c c l}")
+    print(r"\toprule")
+    print(r"Target & $\beta$ & $T_2$ stat & $T_2$ ($T_1$) & $i$ stat & $i$ ($q$) & $i$ (spot) "
+          r"& $i$ (LD) & $f$ stat / ($q$) & $l_3$ (\%) \\")
     print(r"\midrule")
     for row in rows:
         print(row)
@@ -297,3 +464,4 @@ if __name__ == "__main__":
     catalog        = sys.argv[1] if len(sys.argv) > 1 else None
     thesis_targets = load_target_names(catalog)
     render_latex_results_table(thesis_targets)
+    render_error_budget_table(thesis_targets)

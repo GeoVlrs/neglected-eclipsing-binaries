@@ -25,7 +25,14 @@
 # A deterministic Python error would also be retried up to MAX_RESTARTS times, then stop.
 #
 # Settings (environment variables): MAX_RESTARTS=3, PAUSE_S=60 (wait before a restart,
-# so MPI can clean up and you can cancel), NPROCS=8 (Entry 80; was 14).
+# so MPI can clean up and you can cancel), NPROCS=8 (Entry 80; was 14),
+# WATCHDOG_S=14400 (Entry 105: if the log has not changed for this many seconds the
+# run is taken as hung, killed and restarted; 0 turns the watchdog off).
+#
+# Hangs (Entry 105). A Python error on ONE MPI rank used to leave the other ranks
+# waiting for it forever (a V878 Her smoke sat for 21 h), so the wrapper never
+# restarted. 05 now runs under `python3 -m mpi4py`, which aborts the whole job on
+# an uncaught error on any rank; the watchdog catches any other kind of hang.
 # RUN_CMD replaces the mpirun command; it exists only to test this wrapper.
 #
 # Dynamic -n mode (Pipeline_Log Entry 78). One star can use at most 8 processes
@@ -46,6 +53,7 @@ LABEL=${3:-RUN 05 ($CATALOGUE)}
 MAX_RESTARTS=${MAX_RESTARTS:-3}
 PAUSE_S=${PAUSE_S:-60}
 NPROCS=${NPROCS:-8}   # Entry 80: -n 8 measured ~1.5x faster per star than -n 14
+WATCHDOG_S=${WATCHDOG_S:-14400}
 
 cd "$(dirname "$0")" || exit 2
 
@@ -63,7 +71,14 @@ if ! flock -n 9; then
 fi
 
 stop=0
-trap 'stop=1' INT TERM
+runpid=""
+# Background jobs of a script ignore Ctrl-C, so the signal is passed on by hand.
+stop_run() {   # $1 = signal; the run is a background subshell with mpirun as its child
+    [ -n "$runpid" ] || return 0
+    pkill "-$1" -P "$runpid" 2>/dev/null
+    kill "-$1" "$runpid" 2>/dev/null
+}
+trap 'stop=1; stop_run TERM' INT TERM
 
 note() {
     printf '[autorestart %s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"
@@ -73,7 +88,7 @@ run_05() {
     if [ -n "${RUN_CMD:-}" ]; then
         bash -c "$RUN_CMD"
     else
-        mpirun --use-hwthread-cpus -n "$NPROCS" python3 -u Optimization.py "$CATALOGUE"
+        mpirun --use-hwthread-cpus -n "$NPROCS" python3 -u -m mpi4py Optimization.py "$CATALOGUE"
     fi
 }
 
@@ -83,8 +98,29 @@ while :; do
     printf '\n\n########## %s%s — %s ##########\n' \
         "$LABEL" "$tag" "$(date '+%F %T')" >> "$LOG"
 
-    run_05 2>&1 | tee -a "$LOG"
-    rc=${PIPESTATUS[0]}
+    run_05 > >(tee -a "$LOG") 2>&1 &
+    runpid=$!
+    hung=0
+    while kill -0 "$runpid" 2>/dev/null; do
+        sleep 60 &
+        wait $! 2>/dev/null
+        if [ "$WATCHDOG_S" -gt 0 ] && [ "$stop" -eq 0 ]; then
+            age=$(( $(date +%s) - $(stat -c %Y "$LOG") ))
+            if [ "$age" -ge "$WATCHDOG_S" ]; then
+                note "watchdog: no output for ${age}s (limit ${WATCHDOG_S}s); the run is taken as hung and killed."
+                hung=1
+                stop_run TERM
+                sleep 30
+                stop_run KILL
+                pkill -KILL -f "Optimization.py $CATALOGUE" 2>/dev/null
+                break
+            fi
+        fi
+    done
+    wait "$runpid" 2>/dev/null
+    rc=$?
+    runpid=""
+    [ "$hung" -eq 1 ] && rc=124
 
     if [ "$rc" -eq 0 ]; then
         note "05 finished (exit 0)."

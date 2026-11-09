@@ -48,6 +48,8 @@ mkdir -p "$DIR"
 # Clear ONLY this scratch star's previous products (moved aside, never deleted).
 for f in data/bundles/bundle_${SAFE}.phoebe data/bundles/bundle_${SAFE}_mcmc.phoebe \
          data/bundles/bundle_${SAFE}_mcmc.phoebe.input_sha data/bundles/bundle_${SAFE}_mcmc.phoebe.nm_start \
+         data/bundles/bundle_${SAFE}_mcmc.phoebe.mesh data/bundles/bundle_${SAFE}_mcmc.phoebe.sigma_prescale \
+         data/bundles/bundle_${SAFE}_mcmc.phoebe.l3_k \
          data/bundles/bundle_${SAFE}_final.phoebe data/bundles/bundle_${SAFE}.lock \
          data/results/results_${SAFE}.csv data/results/parked_${SAFE}.txt; do
     [ -e "$f" ] && mv "$f" "$DIR/$(basename "$f").prev_${STAMP}"
@@ -69,7 +71,8 @@ X="-x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN -x NM_MAXITER -x IGNORE_PARK
 [ -n "${NM_SCOUT_MAXITER:-}" ] && { export NM_SCOUT_MAXITER; X="$X -x NM_SCOUT_MAXITER"; }
 [ -n "${SIGMA_PRESCALE:-}" ] && { export SIGMA_PRESCALE; X="$X -x SIGMA_PRESCALE"; }
 echo "[smoke] $SRC as $NAME ($TYPE) with $SCRIPT, NM_MAXITER=$NM_MAXITER, MCMC_NITERS=$MCMC_NITERS, IGNORE_PARK='${IGNORE_PARK}', log $LOG"
-mpirun --use-hwthread-cpus -n "${NPROCS:-8}" $X python3 -u "$SCRIPT" "$CSV" > "$LOG" 2>&1
+# -m mpi4py: an uncaught error on ANY rank aborts the whole job (Entry 105)
+mpirun --use-hwthread-cpus -n "${NPROCS:-8}" $X python3 -u -m mpi4py "$SCRIPT" "$CSV" > "$LOG" 2>&1
 rc=$?
 echo "[smoke] exit $rc"
 grep -aE "\[(preflight|post-NM|health|parked|morphology|multi-start|prior)|Nelder-Mead|PARK|OVERRIDDEN|Traceback|Error:|chunk statistics unavailable|check unavailable|MCMC sampling complete|Results saved|Final reduced|Reduced χ² at" "$LOG" \

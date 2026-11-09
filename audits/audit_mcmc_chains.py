@@ -27,6 +27,10 @@ Summary:
                            basins far apart — genuine posterior structure.
       BURNIN_MASKED        R̂ passes on the full chain but fails once burn-in
                            is trimmed, i.e. the convergence gate was optimistic.
+      DEGENERATE_MODES     (standalone audit only) walkers split into two tight
+                           groups in a parameter that fit equally well (FP Boo,
+                           ES UMa, Entries 66-67): the interval is the distance
+                           between two solutions, not a width.
 
     Two caveats the numbers here are meant to expose rather than hide:
 
@@ -409,8 +413,74 @@ def audit_mcmc_chains(star_name: str,
         result["detail"] = f"could not read chain: {exc}"
         return result
 
-    return audit_chain_arrays(star_name, chains, lnprob, twigs, burn=burn,
-                              chi2_red=_read_chi2_red(star_name, results_dir))
+    result = audit_chain_arrays(star_name, chains, lnprob, twigs, burn=burn,
+                                chi2_red=_read_chi2_red(star_name, results_dir))
+    # DEGENERATE_MODES is scored here, in the standalone audit only: 05Optimization.py
+    # calls audit_chain_arrays() directly, so its in-run verdicts are unchanged
+    # (no change to production behaviour mid-campaign, 28 Oct 2026).
+    try:
+        found = degenerate_modes(chains, lnprob, twigs, burn=result.get("burn_in", burn))
+    except Exception as exc:                     # diagnostics never raise
+        found = []
+        result["detail"] = (result.get("detail", "") + f"; degenerate-modes test failed: {exc}").strip("; ")
+    if found:
+        result["verdicts"] = [v for v in result["verdicts"] if v != "healthy"] + ["DEGENERATE_MODES"]
+        text = ", ".join(f"{d['param']} splits {d['n_below']}/{d['n_above']} walkers at gap {d['gap']:.4g} "
+                         f"({d['ratio']:.0f}x the within-mode scatter; ln-prob spread {d['lnprob_spread']:.1f})"
+                         for d in found)
+        result["detail"] = (result.get("detail", "") + "; " + text).strip("; ")
+    result["degenerate_modes"] = found
+    return result
+
+
+# DEGENERATE_MODES (Pipeline_Log Entries 66-67; plan item 2.3, 28 Oct 2026): the
+# walkers split into two tight groups in some parameter, each walker mixing well
+# inside its own group, while the groups fit equally well (ln-prob spread small).
+# FP Boo and ES UMa: gap about 50x the within-group scatter, spread 1.3-1.5 nats.
+# The quoted interval is then the distance between the modes, not a width.
+# Calibrated 28 Oct on every saved chain (burn-in 350): well-mixed chains, including
+# the four phase-F results, have gap / within-walker SD <= 0.35; ES UMa 1.7, FP Boo 8.4.
+DEGENERATE_SEP_RATIO = 10.0     # gap / mean within-group scatter of walker medians
+DEGENERATE_GAP_WIDTHS = 1.0     # gap / median within-walker posterior SD
+
+
+def degenerate_modes(chains, lnprob, twigs, burn: int = MCMC_BURN_IN_STEPS) -> list:
+    """Parameters whose per-walker medians split into two well-separated groups of
+    equal ln-probability. Returns one dict per such parameter ([] if none)."""
+    chains = np.asarray(chains, dtype=float)
+    lnprob = np.asarray(lnprob, dtype=float)
+    if chains.ndim != 3:
+        return []
+    if chains.shape[1] != lnprob.shape[1] and chains.shape[0] == lnprob.shape[1]:
+        chains = np.swapaxes(chains, 0, 1)
+    if lnprob.shape[0] != chains.shape[0] and lnprob.shape[1] == chains.shape[0]:
+        lnprob = lnprob.T
+    n_steps, n_walkers, n_params = chains.shape
+    burn = min(max(0, burn), max(0, n_steps - 2))
+    walkers = _walker_metrics(chains, lnprob, burn)
+    alive = [m["walker"] for m in walkers if m["frozen_frac"] <= FROZEN_FRAC_DEAD]
+    if len(alive) < 4:
+        return []
+    lp = [walkers[w]["median_lnprob"] for w in alive]
+    lp_spread = float(max(lp) - min(lp))
+    if lp_spread > LNPROB_GAP_MULTIMODAL:        # unequal modes: MULTIMODAL's case
+        return []
+    out = []
+    for i, twig in enumerate([str(t) for t in twigs][:n_params]):
+        post = chains[burn:, :, i][:, alive]
+        med = np.median(post, axis=0)
+        gap, n_below = _max_group_gap(list(med))
+        if gap <= 0 or n_below == 0:
+            continue
+        order = np.sort(med)
+        lower, upper = order[:n_below], order[n_below:]
+        scatter = max(0.5 * (float(np.std(lower)) + float(np.std(upper))), 1e-12)
+        width = float(np.median(np.std(post, axis=0, ddof=1)))
+        if gap / scatter >= DEGENERATE_SEP_RATIO and gap >= DEGENERATE_GAP_WIDTHS * width:
+            out.append(dict(param=twig.split("@")[0], gap=float(gap), ratio=float(gap / scatter),
+                            n_below=int(n_below), n_above=int(len(med) - n_below),
+                            lnprob_spread=lp_spread))
+    return out
 
 
 # ---------------------------------------------------------------------------

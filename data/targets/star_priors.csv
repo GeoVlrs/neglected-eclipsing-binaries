@@ -1,0 +1,2 @@
+name,twig,lo,hi,reason,reference
+FI Boo,fillout_factor@contact_envelope,0.03,0.45,"Two solution families fit TESS equally well: shallow (f 0.15-0.21, i 35-37.5 deg) and deep (f 0.6-0.9, i 30-33 deg). With the radial-velocity mass function (M1+M2) sin^3 i = 0.343 Msun the deep family implies 2.1-2.7 Msun and 3.2-4.4 Lsun; Gaia DR3 (parallax 8.280 mas, G 9.383) gives 1.9-2.15 Lsun. The deep family is excluded.","Entry 106; Lu et al. 2001 (DDO IV); Gaia DR3 1595631104093744256"

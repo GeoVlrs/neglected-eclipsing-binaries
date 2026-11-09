@@ -85,6 +85,10 @@ GLOBS: list[tuple[Path, str, Path]] = [
     # third-light table (references only; no pipeline products).
     (CODE / "Targets", "contact_q_literature.csv", REPO / "data" / "targets"),
     (CODE / "Targets", "third_light.csv",          REPO / "data" / "targets"),
+    # Per-star prior bounds read by morphology.py / Optimization.py, and the
+    # 60-star production queue that several audits take as their default (10 Nov 2026).
+    (CODE / "Targets", "star_priors.csv",          REPO / "data" / "targets"),
+    (CODE / "Targets", "phaseF_queue.csv",         REPO / "data" / "targets"),
 ]
 
 # Hard guard: never publish these, whatever a pattern might match.

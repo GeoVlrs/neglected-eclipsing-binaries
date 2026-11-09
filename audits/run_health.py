@@ -42,7 +42,8 @@ from audit_results_ledger import keep_list_from_05        # noqa: E402
 STATS_DIR   = os.path.join(CODE_DIR, "Runs", "run_stats")
 CHUNKS_CSV  = os.path.join(STATS_DIR, "05Optimization_chunks.csv")
 HEALTH_CSV  = os.path.join(STATS_DIR, "05Optimization_health.csv")
-QUEUE_LOGS  = sorted(glob.glob(os.path.join(CODE_DIR, "Runs", "phaseE_queue*.log")))
+QUEUE_LOGS  = sorted(glob.glob(os.path.join(CODE_DIR, "Runs", "phaseE_queue*.log"))
+                     + glob.glob(os.path.join(CODE_DIR, "Runs", "phaseF_*.log")))   # queue A: phaseF_A.log
 FRESH_S     = 6 * 3600        # a queue log written within this is treated as live
 
 
@@ -89,7 +90,7 @@ def live_stars() -> dict:
         stars = re.findall(r"OPTIMISATION: (.+?)  \(", text)
         tail  = text[text.rfind("OPTIMISATION: "):] if stars else ""
         if stars and "not restarting" not in tail and "giving up" not in tail:
-            label = re.sub(r"^phaseE_queue|\.log$", "", os.path.basename(log)) or "?"
+            label = re.sub(r"^phaseE_queue|^phaseF_|\.log$", "", os.path.basename(log)) or "?"
             out[stars[-1]] = label
     return out
 

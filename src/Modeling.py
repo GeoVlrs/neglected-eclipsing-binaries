@@ -207,11 +207,16 @@ DEFAULT_DETACHED_PARAMS: dict = {
 #     ≳ 7000 K) it is less reliable.
 #   - MSC grid-ceiling correction: a cluster of values pinned near ~7600 K was
 #     cross-checked against SIMBAD spectral types and replaced with spectral-type
-#     temperatures (Carroll & Ostlie): V1034 Cyg (B9) 10500 K, RU UMi (A2) 8970 K,
-#     V921 Her (A5) 8200 K, DN Cam (F0) 7200 K. The remaining A-type values are
-#     kept because their MSC and gspphot agree and are NOT ceiling-pinned.
+#     temperatures (Carroll & Ostlie): V1034 Cyg (B9) 10500 K, V921 Her (A5) 8200 K,
+#     DN Cam (F0) 7200 K. The remaining A-type values are kept because their MSC and
+#     gspphot agree and are NOT ceiling-pinned.
 #   - V836 Cyg and GK Cep are MSC-ceiling-pinned at 7600 K while GSP-Phot indicates
 #     ~9100 / ~8600 K; for those two the (hotter) teff_gspphot value is used instead.
+#   - Entry 126 (T1 cross-check, Audits/audit_t1_anchor.py -> t1_anchor.csv; user
+#     decisions 27 Oct): RU UMi uses GSP-Phot 7538 K like V836 Cyg / GK Cep (was 8970 K
+#     from an unreferenced SIMBAD A2; literature F0); BW Dra uses its OWN MSC value
+#     5576 K (was 5807 K, BV Dra's value: copy error); RZ Dra uses 8015 K, the mean of
+#     LAMOST DR11 (8121 K) and its A6 type (7910 K; Erdem et al. 2011), refitted.
 #
 # NOT pre-resolved here (fall through to live query / period estimate) — resolve
 # manually before publication:
@@ -231,7 +236,7 @@ GAIA_TEFF_OVERRIDE_K: dict[str, float] = {
     "NU Cyg":    5657.0,   # MSC T2 ~ 4629  (crowded field)
     "RT Hyi":    5306.0,   # MSC T2 ~ 4745
     "RW Dor":    5109.0,   # MSC T2 ~ 4900  (GSP-Phot N/A: G≈10.9)
-    "BW Dra":    5807.0,   # MSC T2 ~ 5390  (GSP-Phot N/A: G≈8.0)
+    "BW Dra":    5576.0,   # own MSC (DR3 1616589410627042688; T2 ~ 4965; GSP-Phot 5587). Was 5807 = BV Dra's (Entry 126)
     "TZ Boo":    6018.0,   # MSC T2 ~ 5271
     # ── Batch 2 ──────────────────────────────────────────────────────────────
     "V1128 Tau": 5399.0,   # MSC T2 ~ 5438
@@ -243,7 +248,7 @@ GAIA_TEFF_OVERRIDE_K: dict[str, float] = {
     "BV Dra":    5807.0,   # MSC T2 ~ 5390
     "TY UMa":    6100.0,   # MSC T2 ~ 5205
     # ── Batch 3 ──────────────────────────────────────────────────────────────
-    "V608 Cas":  5497.0,   # MSC T2 ~ 4912  (crowded field)
+    "V608 Cas":  6272.0,   # GSP-Phot 6209 + LAMOST 6335 (change rule; Bayestar19 colour 6585). Was MSC 5497 (Entry 158)
     "V857 Her":  7204.0,   # MSC T2 ~ 5612  (A-type)
     "FI Boo":    6001.0,   # MSC T2 ~ 5110
     "V1918 Cyg": 6909.0,   # MSC T2 ~ 5807
@@ -287,12 +292,12 @@ GAIA_TEFF_OVERRIDE_K: dict[str, float] = {
     "WZ Cyg":    6896.0,   # MSC T2 ~ 5786  (crowded field)
     # IM Cep, V1305 Cyg : held — see header note (crowded, uncertain ID)
     # ── Batch 8 ──────────────────────────────────────────────────────────────
-    "RZ Dra":    7329.0,   # MSC T2 ~ 5901  (A-type)
+    "RZ Dra":    8015.0,   # LAMOST DR11 (8121, 5 epochs) + A6 (7910; Erdem 2011) mean; MSC 7329 [7066, 8000]. Refit (Entry 126)
     "V1034 Cyg": 10500.0,  # B9 (SIMBAD) — MSC 7600 was grid-ceiling-pinned (~2900 K low); SP-based Teff
     "GW Gem":    7204.0,   # MSC T2 ~ 7287  (A-type)
-    "V404 Lyr":  7027.0,   # MSC T2 ~ 5686
+    "V404 Lyr":  7330.0,   # Lee et al. 2019, disentangled primary spectrum (BOES), +-150 K; MSC 7027 [6656, 7340]. Exception to the T1 rule (Entry 131)
     "BE Dra":    7137.0,   # MSC T2 ~ 5877
-    "RU UMi":    8970.0,   # A2 (SIMBAD) — MSC 7599 was grid-ceiling-pinned; SP-based Teff
+    "RU UMi":    7538.0,   # GSP-Phot (MSC 7599 grid-ceiling-pinned), as V836 Cyg / GK Cep. Was 8970 (unreferenced A2) (Entry 126)
     "V836 Cyg":  9101.0,   # GSP-Phot (MSC ceiling-pinned 7600) — hot A-type
     "TZ Lyr":    6393.0,   # MSC T2 ~ 5335
     "V343 Ori":  7407.0,   # MSC T2 ~ 6462  (A-type)

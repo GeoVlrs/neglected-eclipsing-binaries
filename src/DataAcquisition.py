@@ -291,15 +291,31 @@ def retrieve_pdcsap_light_curve(
     """
     search_target = f"TIC {tic_id}" if tic_id else star_name
 
+    def _drop_skipped(sr):
+        # Entry 106: drop caller-excluded sectors BEFORE choosing the product, so
+        # that skipping every SPOC 2-min sector falls through to TESS-SPOC / QLP
+        # (FI Boo: sectors 16, 23, 24 skipped to use the less spotted sector 78).
+        # For a star with other SPOC sectors left this changes nothing: those
+        # sectors were hard-rejected after download anyway.
+        if not skip_sectors or len(sr) == 0:
+            return sr
+        import re as _re
+        keep = []
+        for k in range(len(sr)):
+            m = _re.search(r"(\d+)", str(sr.table["mission"][k]))
+            if not (m and int(m.group(1)) in skip_sectors):
+                keep.append(k)
+        return sr[keep]
+
     print(f"  Searching MAST for SPOC 2-min light curves (target: {search_target})...")
-    search_result = lk.search_lightcurve(search_target, mission="TESS", author="SPOC")
+    search_result = _drop_skipped(lk.search_lightcurve(search_target, mission="TESS", author="SPOC"))
     author = "SPOC"
 
     if len(search_result) == 0:
         # FFI-based TESS-SPOC data as a fallback for targets that were not
         # included in the 2-minute pre-selected target list for a given sector.
         print("  SPOC 2-min not available. Searching TESS-SPOC FFI product...")
-        search_result = lk.search_lightcurve(search_target, mission="TESS", author="TESS-SPOC")
+        search_result = _drop_skipped(lk.search_lightcurve(search_target, mission="TESS", author="TESS-SPOC"))
         author = "TESS-SPOC"
 
     if len(search_result) == 0:
@@ -309,7 +325,7 @@ def retrieve_pdcsap_light_curve(
         # co-trending, so systematics removal is less rigorous than SPOC, but it
         # is the only available product for these targets.
         print("  TESS-SPOC not available. Searching QLP FFI product...")
-        search_result = lk.search_lightcurve(search_target, mission="TESS", author="QLP")
+        search_result = _drop_skipped(lk.search_lightcurve(search_target, mission="TESS", author="QLP"))
         author = "QLP"
 
     if len(search_result) == 0:

@@ -55,7 +55,8 @@ import numpy as np
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, CODE_DIR)
 import paths                                              # noqa: E402
-from morphology import CONTACT_FILLOUT_CEIL, resolve_morphology_kind   # noqa: E402
+from morphology import (CONTACT_FILLOUT_CEIL, CONTACT_T2_FLOOR_FRAC, CONTACT_INCL_FLOOR_DEG,   # noqa: E402
+                        resolve_morphology_kind)
 
 RADIATIVE_CONVECTIVE_BOUNDARY_K = 8000.0      # as Script 05
 COARSE_Q = [0.08, 0.13, 0.2, 0.3, 0.45, 0.7, 1.0, 1.4, 2.2, 3.3, 5.0, 7.7, 12.0]
@@ -252,7 +253,9 @@ def mode_job(a) -> int:
     t1 = float(b.get_value("teff", component="primary", context="component"))
     t2_seed = float(b.get_value("teff", component="secondary", context="component"))
     # Script 05's contact prior: 0.80-1.25 T1, clamped to the secondary's regime.
-    t2_lo, t2_hi = 0.80 * t1, 1.25 * t1
+    # Lower end shared with Script 05 (0.70 T1 since Entry 104; the 1466 q-search
+    # fits of 11-14 Oct used 0.80).
+    t2_lo, t2_hi = CONTACT_T2_FLOOR_FRAC * t1, 1.25 * t1
     if t2_seed < RADIATIVE_CONVECTIVE_BOUNDARY_K:
         t2_hi = min(t2_hi, RADIATIVE_CONVECTIVE_BOUNDARY_K)
     else:
@@ -265,7 +268,7 @@ def mode_job(a) -> int:
     def objective(z):
         x = np.asarray(z) * scale
         t2 = float(np.clip(x[0], t2_lo, t2_hi))
-        inc = float(np.clip(x[1], 40.0, 90.0))
+        inc = float(np.clip(x[1], CONTACT_INCL_FLOOR_DEG, 90.0))
         f = float(np.clip(x[2], f_lo, f_hi))
         penalty = 1e3 * (abs(x[0] - t2) / 200 + abs(x[1] - inc) / 1.5 + abs(x[2] - f) / 0.05)
         evals["n"] += 1
