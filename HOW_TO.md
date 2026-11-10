@@ -185,8 +185,8 @@ current directory, which only exists right after re-running stage 01.
 | File | Contents |
 |---|---|
 | `neglected_targets.csv` | Full selection (393 stars) from stage 01, with TIC added. |
-| `neglected_targets_batch1.csv` … `batch8.csv` | The working sample (60 stars). Batches 1–5: contact (EW). 6–7: EB. 8: semi-detached and other classes. |
-| `neglected_targets_batch9_held.csv` | 5 stars held back. |
+| `neglected_targets_batch1.csv` … `batch8.csv` | The working sample (60 stars) in its original batches. Batches 1–5: contact (EW). 6–7: EB. 8: semi-detached and other classes. Local only (not published since 10 Nov 2026); `phaseF_queue.csv` holds the same 60 stars. |
+| `neglected_targets_batch9_held.csv` | 5 stars held back. Local only. |
 | `phaseF_queue.csv` | **Queue A, the current campaign** (all 60 stars, launched 22 Oct 2026). |
 | `phaseF_queue_part2.csv` | Stars held back for per-star checks (empty since 22 Oct). |
 | `phaseF_kept22.csv` | The 22 stars whose old results were once kept; now refitted like the rest. |
@@ -208,21 +208,21 @@ current directory, which only exists right after re-running stage 01.
 cd <path-to>/Code
 
 # Windows (or Linux) — data and timing
-python 02DataAcquisition.py Targets/neglected_targets_batch1.csv
-python 03OCAnalysis.py      Targets/neglected_targets_batch1.csv
+python 02DataAcquisition.py Targets/phaseF_queue.csv
+python 03OCAnalysis.py      Targets/phaseF_queue.csv
 python Audits/audit_period_fold.py          # check: drift < 0.01 cycle for every star
 
 # Linux / WSL — model and fit
-python3 04Modeling.py Targets/neglected_targets_batch1.csv
+python3 04Modeling.py Targets/phaseF_queue.csv
 # contact stars only: fix the mass ratio (§5.4b, heavy), then rebuild their bundles
-bash Runs/qsearch/run_qsearch.sh Targets/neglected_targets_batch1.csv "coarse refine literature" batch1
-python3 ContactQSearch.py adopt Targets/neglected_targets_batch1.csv
-python3 04Modeling.py Targets/neglected_targets_batch1.csv
-bash run_05_autorestart.sh Targets/neglected_targets_batch1.csv Runs/batch1_05.log "BATCH 1"
+bash Runs/qsearch/run_qsearch.sh Targets/phaseF_queue.csv "coarse refine literature" queueA
+python3 ContactQSearch.py adopt Targets/phaseF_queue.csv
+python3 04Modeling.py Targets/phaseF_queue.csv
+bash run_05_autorestart.sh Targets/phaseF_queue.csv Runs/phaseF_A.log "QUEUE A"
 
 # Windows — renders and the table
-python 06Visualization.py Targets/neglected_targets_batch1.csv
-python GenerateThesisTables.py Targets/neglected_targets_batch1.csv > results_table.tex
+python 06Visualization.py Targets/phaseF_queue.csv
+python GenerateThesisTables.py Targets/phaseF_queue.csv > results_table.tex
 ```
 
 Stage 01 is only needed to rebuild the target selection from scratch (§5.1).
@@ -520,7 +520,7 @@ needed only across machines; `smoke_05.sh` adds it anyway.
 
 - **Run.** `python GenerateThesisTables.py [Targets/<catalogue>.csv] > table.tex`.
   With no argument it lists every `neglected_targets_batch<N>.csv` star (not the
-  held batch).
+  held batch); the batch catalogues are local only, so in a clone pass a catalogue.
 - **Columns:** model (C contact / D detached / SD semi-detached), T₁ (fixed), T₂, i,
   q († = fixed), fill-out or r₁, r₂ (‡ = set by the Roche-lobe constraint), χ²ν,
   and **Notes**:
@@ -941,7 +941,7 @@ All audits run from `Code/` and write their CSV next to themselves in `Audits/`.
 - **`audit_mcmc_chains.py`** checks per-walker chain health. Verdicts:
   `DEAD_WALKER`, `ACCEPTANCE_COLLAPSE`, `MULTIMODAL`, `BURNIN_MASKED`.
   ```bash
-  python Audits/audit_mcmc_chains.py Targets/neglected_targets_batch*.csv [--per-walker] [--plot | --plot-all] [--burnin N] [--skip-missing]
+  python Audits/audit_mcmc_chains.py Targets/phaseF_queue.csv [--per-walker] [--plot | --plot-all] [--burnin N] [--skip-missing]
   ```
   It loads every final bundle (moderate cost) and writes `mcmc_chain_audit.csv` and
   optionally `mcmc_chain_walkers.csv`. Stage 05 already runs the same check per
@@ -1072,8 +1072,8 @@ The public repository is a separate git repo, updated **only** through:
 python neglected-eclipsing-binaries/tools/sync_from_working_tree.py
 ```
 
-- It copies an **explicit** list of scripts plus `Audits/*.py`, `Notes/*.txt` and the
-  target catalogues.
+- It copies an **explicit** list of scripts plus `Audits/*.py` and the current target
+  tables. `Notes/*.txt` and the batch catalogues stay local (since 10 Nov 2026).
 - A guard refuses the private running log, any `*.phoebe`, `*.fits` and
   `results_*` file.
 - A new top-level module must be added to its list, or the published code fails at
@@ -1088,8 +1088,7 @@ python neglected-eclipsing-binaries/tools/sync_from_working_tree.py
 | `GenerateThesisTables.py`, `Schematic*.py`, `paths.py`, `runstats.py`, `morphology.py`, `earlywarn.py`, `limbdark.py`, `gravdark.py`, `ContactQSearch.py` | `src/` (same names) |
 | `run_05_autorestart.sh`, `smoke_05.sh` | `src/` (both call `Optimization.py`) |
 | `Audits/*.py` | `audits/*.py` |
-| `Notes/*.txt` | `docs/*.txt` |
-| `Targets/neglected_targets*.csv`, `triage_*.csv`, `contact_q_literature.csv`, `third_light.csv`, `star_priors.csv`, `phaseF_queue.csv` | `data/targets/` |
+| `Targets/neglected_targets.csv`, `triage_*.csv`, `contact_q_literature.csv`, `third_light.csv`, `star_priors.csv`, `phaseF_queue.csv` | `data/targets/` |
 | `HOW_TO.md` | `HOW_TO.md` |
 
 ### 9.3 Running from a clone
@@ -1101,7 +1100,7 @@ Create a working folder:
 git clone <repository-url> repo && mkdir run && cd run
 cp ../repo/src/*.py ../repo/src/run_05_autorestart.sh .
 mkdir -p Audits Targets && cp ../repo/audits/*.py Audits/ && cp ../repo/data/targets/*.csv Targets/
-python DataAcquisition.py Targets/neglected_targets_batch1.csv        # and so on
+python DataAcquisition.py Targets/phaseF_queue.csv        # and so on
 ```
 
 In a clone, substitute the published names in every command of this manual

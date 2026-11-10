@@ -4,7 +4,7 @@ sync_from_working_tree.py — publish-mirror updater for the TESS binary modelli
 
 Copies the CODE + DOCS of the working tree (the numbered scripts, the audit
 scripts, the notes, and the sample-definition CSVs) into this repository's
-published `src/`, `audits/`, `docs/`, and `data/targets/` layout, so a maintainer
+published `src/`, `audits/` and `data/targets/` layout, so a maintainer
 can then review and `git add / commit / push`.
 
 It DELIBERATELY never copies the private or heavy artefacts — the running
@@ -19,7 +19,8 @@ Layout assumption (post-2026-09 reorg — every script lives once in Code/):
     <CODE>/neglected-eclipsing-binaries/tools/sync_from_working_tree.py   (this file)
     <CODE>/paths.py, 01TargetSelection.py ... 06Visualization.py,
            GenerateThesisTables.py, SchematicRocheGeometry.py
-    <CODE>/Audits/*.py, Notes/*.txt, Targets/neglected_targets*.csv
+    <CODE>/Audits/*.py, Targets/neglected_targets.csv and the current target tables
+    (Notes/*.txt and the batch catalogues stay local since 10 Nov 2026)
     <CODE>/data/  (products, typed; never published)
 """
 from __future__ import annotations
@@ -78,8 +79,7 @@ TRANSLATED: list[tuple[Path, Path, list[tuple[str, str]]]] = [
 # (source_dir, glob_pattern, destination_dir)
 GLOBS: list[tuple[Path, str, Path]] = [
     (CODE / "Audits",  "*.py",                    REPO / "audits"),
-    (CODE / "Notes",   "*.txt",                   REPO / "docs"),
-    (CODE / "Targets", "neglected_targets*.csv",  REPO / "data" / "targets"),
+    (CODE / "Targets", "neglected_targets.csv",   REPO / "data" / "targets"),
     (CODE / "Targets", "triage_*.csv",            REPO / "data" / "targets"),
     # Published inputs of the contact-star stage: literature mass ratios and the
     # third-light table (references only; no pipeline products).

@@ -4,7 +4,7 @@ An automated, high-precision Python pipeline for the acquisition, reduction, tim
 
 ## Pipeline Architecture
 
-Six sequential stages take raw spacecraft data to physical stellar parameters and rendered geometry. Each stage is a standalone script under `src/` and accepts an optional target-catalogue argument so a single batch can be processed in isolation.
+Six sequential stages take raw spacecraft data to physical stellar parameters and rendered geometry. Each stage is a standalone script under `src/` and accepts an optional target-catalogue argument so a single catalogue can be processed in isolation.
 
 1. **Target Selection (`TargetSelection.py`):** Queries the Kreiner (2004) database and cross-references VSX/GCVS to identify short-period (P < 1 d), long-neglected EW/EB candidates with TESS coverage. Outputs `neglected_targets.csv`.
 2. **Data Acquisition (`DataAcquisition.py`):** Retrieves mission-standard PDCSAP light curves (SPOC → TESS-SPOC → QLP fallback, keyed on TIC ID to avoid name-resolution collisions), applies hard bitmasking and 4σ outlier rejection, and validates products by baseline/sector before use (rejecting corrupt partial-FFI stubs). Can stitch multiple sectors when coverage is thin.
@@ -12,7 +12,7 @@ Six sequential stages take raw spacecraft data to physical stellar parameters an
 4. **Stellar Modeling (`Modeling.py`):** Builds PHOEBE 2 forward-model bundles with blackbody atmospheres, the contact "double-flip" constraint hierarchy, gravity darkening and reflection by model type (`gravdark.py`), and Gaia DR3 temperature anchoring for the fixed primary.
    - **Contact mass ratio (`ContactQSearch.py`):** for contact systems, q is fixed per star: a published spectroscopic value where one exists, otherwise the minimum of a fixed-q search over the TESS light curve (flagged as weak).
 5. **Posterior Optimization (`Optimization.py`):** Solves the inverse problem with a multi-start Nelder–Mead pre-wash followed by the `emcee` affine-invariant MCMC sampler, MPI-parallelised over walkers. Uncertainties are pre-scaled before sampling, the surface mesh is refined for stars whose model is numerically noisy, and early-warning checks park a wrongly set-up star before hours of sampling. Chains are checkpointed and resumable, and posteriors are reported with asymmetric 1σ uncertainties.
-6. **Mesh Visualization (`Visualization.py`):** Renders the PHOEBE 2 surface mesh with Mayavi, colour-mapped by per-element effective temperature. Converged systems additionally get an animated GIF spanning one orbital cycle at the refined period, and a contact-sheet montage of the converged sample. Outputs are compared against bundle modification times, so re-running after a batch renders only what changed.
+6. **Mesh Visualization (`Visualization.py`):** Renders the PHOEBE 2 surface mesh with Mayavi, colour-mapped by per-element effective temperature. Converged systems additionally get an animated GIF spanning one orbital cycle at the refined period, and a contact-sheet montage of the converged sample. Outputs are compared against bundle modification times, so re-running after a run renders only what changed.
 
 `GenerateThesisTables.py` renders a LaTeX results table from the per-target output. `SchematicRocheGeometry.py` draws generic detached and contact Roche geometries from synthetic parameters, for use as a didactic illustration rather than a result.
 
@@ -66,8 +66,8 @@ audits/     standalone diagnostic scripts (period/fold check, time-of-minimum
             estimator, crowding and PDCSAP distortion, results ledger, per-walker
             MCMC chain health, phase alignment, fill-out identifiability; plus
             legacy light-curve / O–C / modeling checks)
-docs/       methodology notes, expansion plans and README images (docs/images/)
-data/       tominima tables and the sample definition (data/targets/)
+docs/       README images (docs/images/)
+data/       the sample definition and current target tables (data/targets/)
 tools/      sync_from_working_tree.py — publish-mirror updater
 ```
 
@@ -100,9 +100,9 @@ mkdir run && cd run
 cp ../src/*.py ../src/run_05_autorestart.sh . && mkdir -p Audits Targets
 cp ../audits/*.py Audits/ && cp ../data/targets/*.csv Targets/
 
-python DataAcquisition.py Targets/neglected_targets_batch1.csv
-python OCAnalysis.py      Targets/neglected_targets_batch1.csv
-python3 Modeling.py       Targets/neglected_targets_batch1.csv      # Linux / WSL
+python DataAcquisition.py Targets/phaseF_queue.csv
+python OCAnalysis.py      Targets/phaseF_queue.csv
+python3 Modeling.py       Targets/phaseF_queue.csv      # Linux / WSL
 ```
 
 Stage 05 runs under MPI (Linux / WSL) and is resumable: re-running the same command
@@ -112,9 +112,9 @@ efficient size. The supervised launcher restarts from the last checkpoint if a r
 crashes:
 
 ```bash
-bash run_05_autorestart.sh Targets/neglected_targets_batch1.csv Runs/batch1_05.log "BATCH 1"
+bash run_05_autorestart.sh Targets/phaseF_queue.csv Runs/phaseF_A.log "QUEUE A"
 # or directly:
-mpirun --use-hwthread-cpus -n 8 python3 -u Optimization.py Targets/neglected_targets_batch1.csv
+mpirun --use-hwthread-cpus -n 8 python3 -u Optimization.py Targets/phaseF_queue.csv
 ```
 
 Run-size knobs are environment-overridable for smoke tests (defaults are production
@@ -126,11 +126,11 @@ export MCMC_NITERS=45 MCMC_CHECKPOINT=15 MCMC_BURNIN=10 NM_MAXITER=20
 mpirun -n 8 -x MCMC_NITERS -x MCMC_CHECKPOINT -x MCMC_BURNIN -x NM_MAXITER python3 -u Optimization.py trial.csv
 ```
 
-Stage 06 (Windows, Mayavi) is safe to re-run after every batch — it renders only stars
+Stage 06 (Windows, Mayavi) is safe to re-run whenever more stars finish — it renders only stars
 whose bundles are newer than their images:
 
 ```bash
-python Visualization.py Targets/neglected_targets_batch1.csv
+python Visualization.py Targets/phaseF_queue.csv
 ```
 
 Pass `FORCE_RERENDER=1` to rebuild every image regardless of modification time.
