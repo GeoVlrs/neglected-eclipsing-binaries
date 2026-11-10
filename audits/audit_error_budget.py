@@ -79,6 +79,10 @@ N_DRAWS = 300
 # i +0.23/+0.45 deg, q -1.0/-3.7 %, T2 +14/+33 K). q is two-sided. A minimum,
 # from four stars, not a per-star error.
 SPOT = {"i_deg": "+0.2..+1.0", "q_pct": "-4..+3", "f": "+0.007", "T2_K": "<=35"}
+# Per-star spot terms (user decision 6 Nov, option 2; first used Entry 162):
+# Audits/spot_terms.csv (star, i_deg, q_pct, f, T2_K, source) replaces the
+# sample-wide term for a star whose own spotted fits exist, whatever its O'Connell.
+SPOT_TERMS_CSV = os.path.join(CODE, "Audits", "spot_terms.csv")
 LD_I = "+0.8..+2.1"
 GD_KEY = ("star", "label", "geometry", "ld", "irrad", "l3", "spot", "free_q", "T1")
 # Non-converged fits accepted in the slope, each named here, keyed by
@@ -209,6 +213,7 @@ def main() -> int:
     stars = [r["name"] for r in csv.DictReader(open(cat, encoding="utf-8"))]
     t1a = table(os.path.join(CODE, "Audits", "t1_anchor.csv"))
     qsys = table(os.path.join(CODE, "Audits", "q_systematics.csv"))
+    spot_terms = table(SPOT_TERMS_CSV)
     oc = table(os.path.join(CODE, "Audits", "oconnell.csv"))
     floor = table(os.path.join(CODE, "Audits", "error_floor.csv"))
     l3k = table(os.path.join(CODE, "Audits", "l3_scaling.csv"))
@@ -286,8 +291,10 @@ def main() -> int:
             ocp = math.nan
         row["oconnell_pct"] = ocp
         spot = math.isfinite(ocp) and abs(ocp) >= 1.0
+        own = spot_terms.get(star)
         for k, v in SPOT.items():
-            row[f"spot_{k}"] = v if spot else ""
+            row[f"spot_{k}"] = own.get(k, "") if own else (v if spot else "")
+        row["spot_src"] = (own.get("source", "own fits") if own else ("sample-wide" if spot else ""))
         row["ld_incl"] = LD_I
         fl = row["flags"]
         row.update(l3="none", l3_frac=math.nan, l3_k=math.nan, l3_pct=math.nan,
@@ -347,7 +354,7 @@ def main() -> int:
               + (f"  gd-choice {row['T2_sys_gd_lo']:+.0f}/{row['T2_sys_gd_hi']:+.0f} (x1 {row['gd_x1']:.2f}, S {row['gd_S_K'] if isinstance(row['gd_S_K'], str) else format(row['gd_S_K'], '.0f')}"
                  f"{' ' + row['gd_S_src'] if row['gd_S_src'] else ''})" if row["gd_x1"] != "" else "  gd-choice - (contact)")
               + f"  i {row['incl']:.2f} +-{row['incl_sig']:.2f} "
-              f"q-sys {row['incl_sys_q'] or '-'}  spot {'yes' if spot else 'no'} ({ocp:+.2f} %)  l3 {row['l3']}"
+              f"q-sys {row['incl_sys_q'] or '-'}  spot {'own' if own else ('yes' if spot else 'no')} ({ocp:+.2f} %)  l3 {row['l3']}"
               + (f"  r2 {row['r2']:.4f} +{row['r2_hi']:.4f}/-{row['r2_lo']:.4f} (results {row['r2_results']:.4f})"
                  f"  r1/lobe {row['r1_lobe_med']:.3f} P(>0.97) {row['r1_lobe_p97']:.2f}"
                  if morph == "semidetached" else ""))
@@ -359,7 +366,7 @@ def main() -> int:
             "fillout", "fillout_sig", "fillout_sys_q", "oconnell_pct", "spot_i_deg",
             "spot_q_pct", "spot_f", "spot_T2_K", "ld_incl", "l3", "l3_frac", "l3_k", "l3_pct",
             "l3_pct_lo", "l3_pct_hi", "r2", "r2_lo", "r2_hi",
-            "r1_lobe_med", "r1_lobe_p97", "flags"]
+            "r1_lobe_med", "r1_lobe_p97", "flags", "spot_src"]
     with open(OUT, "w", newline="", encoding="utf-8") as h:
         w = csv.DictWriter(h, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
