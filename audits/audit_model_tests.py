@@ -171,6 +171,9 @@ def mode_fit(a) -> int:
             f"_ld{a.ld}{'_gd' + a.gd if a.gd != 'step8000' else ''}"
             f"{'_irr' + a.irrad if a.irrad else ''}"
             f"{'_rad1' if a.radiative_primary else ''}"
+            f"{'_gdfree' if a.gd_free else ''}"
+            f"{'_atm' + a.atm if a.atm != 'blackbody' else ''}"
+            f"{'_ldman' if a.atm != 'blackbody' and a.atm_ld == 'manual' else ''}"
             f"{f'_gd1at{a.gd_primary_teff:.0f}' if a.gd_primary_teff is not None else ''}_l3{a.l3}"
             f"{'_spot' + a.spot if a.spot else ''}"
             f"{f'_i{a.incl:.1f}fix' if a.fix_incl else ''}"
@@ -241,6 +244,23 @@ def mode_fit(a) -> int:
         print(f"{a.star} [{a.label}] primary gravb_bol {beta:.3f}, albedo {albedo:.3f} "
               f"(ramp at {a.gd_primary_teff:.0f} K; T1 {t1:.0f} K)", flush=True)
     set_ld("primary", t1)
+    if a.atm != "blackbody":
+        # diagnostic (Entry 166): a model atmosphere instead of the blackbody, with the
+        # light-curve limb darkening taken from the atmosphere's own angle-dependent
+        # intensities (ld_mode "interp"). The passband table must hold that atmosphere:
+        # set PHOEBE_PBDIR to a folder with such a table (the installed TESS:T is
+        # blackbody-only). Bolometric (irradiation) settings stay as the pipeline's.
+        if a.ld != "legacy":
+            raise SystemExit("--atm needs --ld legacy (the atmosphere supplies the limb darkening)")
+        for comp in ("primary", "secondary"):
+            b.set_value(f"atm@{comp}", a.atm)
+            if a.atm_ld == "interp":
+                b.set_value(f"ld_mode@{comp}@lc01", "interp")
+            # --atm-ld manual: keep the pipeline's linear 0.6 (ld_mode manual), so only the
+            # intensities change; separates the atmosphere's intensity effect from its
+            # limb-darkening effect (Entry 167)
+        print(f"{a.star} [{a.label}] atmosphere {a.atm} (LD {a.atm_ld}); PHOEBE_PBDIR="
+              f"{os.environ.get('PHOEBE_PBDIR', '(not set)')}", flush=True)
     ld_free = a.ld == "free"
     l3_free = a.l3 == "free"
     # free third light: start, upper bound and simplex step in raw l3_frac
@@ -285,6 +305,12 @@ def mode_fit(a) -> int:
         # diagnostic: ONE linear coefficient for both stars, fitted — what value
         # of the pipeline's single coefficient do the data ask for?
         P.append(("u_fit", LEGACY_LINEAR_LD, 0.0, 1.0, 0.05))
+    if a.gd_free:
+        # diagnostic (Entry 166): ONE gravity-darkening exponent for both stars, fitted
+        # over 0-1 (0.32 convective, 1.0 radiative; von Zeipel 1924, Lucy 1967); the
+        # albedo stays at the rule's value
+        P.append(("beta_fit", float(b.get_value("gravb_bol", component="primary", context="component")),
+                  0.0, 1.0, 0.1))
     if a.spot:
         P += [("spot_long", a.spot_long, 0.0, 360.0, 30.0),
               ("spot_radius", a.spot_radius, 5.0, 60.0, 5.0),
@@ -317,6 +343,9 @@ def mode_fit(a) -> int:
         if "u_fit" in d:
             for comp in ("primary", "secondary"):
                 b.set_value(f"ld_coeffs@{comp}@lc01", [d["u_fit"]])
+        if "beta_fit" in d:          # after set_envelope, so the fitted value wins
+            for comp in ("primary", "secondary"):
+                b.set_value(f"gravb_bol@{comp}", d["beta_fit"])
         if "f" in d:
             comp_put(b, "fillout_factor@contact_envelope", d["f"])
         if "r1" in d:
@@ -378,6 +407,7 @@ def mode_fit(a) -> int:
               / b.get_value("period", component="binary", context="component")) % 1.0
     r1, r2 = snap["r1"], snap["r2"]
     out = {"star": a.star, "label": a.label, "geometry": a.geometry, "ld": a.ld, "gd": a.gd,
+           "atm": a.atm, "atm_ld": a.atm_ld if a.atm != "blackbody" else "", "pbdir": os.environ.get("PHOEBE_PBDIR", ""),
            "irrad": b.get_value("irrad_method", compute="phoebe01"),
            "converged": bool(res.success), "T1": t1,
            "n_failed": evals.get("failed", 0), "fail_msg": evals.get("fail_msg", ""),
@@ -438,7 +468,7 @@ def mode_collect(a) -> int:
         return 1
     keys = ["star", "label", "geometry", "ld", "gd", "irrad", "radiative_primary", "l3", "spot", "free_q",
             "start_tag", "q", "chi2", "chi2_red", "converged", "T2", "incl", "f", "r1_a", "r2_a",
-            "r1_over_lobe", "r2_over_lobe", "u_fit", "beta1", "l3_fit", "spot_long", "spot_radius",
+            "r1_over_lobe", "r2_over_lobe", "u_fit", "beta_fit", "beta1", "l3_fit", "spot_long", "spot_radius",
             "spot_relteff", "nfev", "wall_s", "T1", "albedo1", "gd_primary_teff",
             # appended in Entry 147 (readers key by name, so earlier columns keep their place)
             "fix_incl", "ntriangles", "lc_csv", "start_from", "maxfev", "n_failed", "l3_k", "l3_share_fit"]
@@ -478,6 +508,12 @@ def main() -> int:
     p.add_argument("--ld", choices=["legacy", "table", "quad", "free"], default="legacy",
                    help="legacy: linear 0.6; table: linear by Teff; quad: quadratic by Teff "
                         "(Claret 2017); free: one linear coefficient fitted (diagnostic)")
+    p.add_argument("--atm", choices=["blackbody", "ck2004"], default="blackbody",
+                   help="diagnostic: model atmosphere (needs a passband table with it; PHOEBE_PBDIR)")
+    p.add_argument("--atm-ld", choices=["interp", "manual"], default="interp",
+                   help="with --atm: limb darkening from the atmosphere (interp) or the pipeline's linear 0.6 (manual)")
+    p.add_argument("--gd-free", action="store_true",
+                   help="diagnostic: one gravity-darkening exponent for both stars, fitted over 0-1")
     p.add_argument("--gd", choices=["auto", "step8000", "ramp", "step6600"], default="auto",
                    help="gravity darkening and albedo: auto = production's rule (contact: the "
                         "8000 K step; others: the ramp over 6600-8000 K; Entry 147), or force "

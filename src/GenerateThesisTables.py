@@ -435,7 +435,7 @@ def render_error_budget_table(target_names: list[str]) -> None:
           r"should be multiplied. $T_2$: statistical term and the term from $T_1$ "
           r"(Table~\ref{tab:results}). $i$: statistical term, the term from the fixed $q$ "
           r"(contact), the shift a cool spot produces where the O'Connell effect "
-          r"is $\geq 1$\,\% (sample-wide, from spot tests on four stars), or the shift from the "
+          r"is $\geq 1$\,\% (sample-wide, from spot tests on eight stars), or the shift from the "
           r"star's own spotted fits where these exist, and the limb-darkening shift (linear 0.6 "
           r"against tabulated coefficients, sample-wide). $f$: statistical / fixed-$q$ terms. "
           r"$l_3$: third light in per cent of the system's mean light in the model "

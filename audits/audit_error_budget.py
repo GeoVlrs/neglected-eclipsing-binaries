@@ -35,9 +35,12 @@ Summary:
                 the T1 term, the larger for the gd term (both conservative). The
                 secondary's own ramp position is not varied (secondaries of the
                 finished stars are below 6600 K);
-      spot      stars with |O'Connell| >= 1 % (Audits/oconnell.csv): the
-                shifts of Entries 115-118 and 146 (i +0.2..+1.0 deg, q -4..+3 %,
-                f +0.007, T2 <= 35 K), a minimum from four stars;
+      spot      a star's own shifts where it has converged spotted fits
+                (Audits/spot_terms.csv); otherwise, for stars with |O'Connell|
+                >= 1 % (Audits/oconnell.csv), the sample-wide term from the spot
+                tests on six stars (i -0.9..+1.0 deg, q -4..+3 %, f -0.001..+0.008,
+                T2 <= 81 K, detached <= 120 K): interim values under the spot-term
+                rule of 11 Nov 2026 (see SPOT below);
       LD        sample-wide i +0.8..+2.1 deg (linear 0.6 against table LD);
       l3        fitted, fixed or none (from the flags). Fitted and fixed values are
                 converted to the share of the mean model flux (Entries 136-137):
@@ -77,12 +80,57 @@ BURN = 350
 N_DRAWS = 300
 # Spot term (Entries 115-118, widened in 146-147 by TZ Lyr's continued spot fits:
 # i +0.23/+0.45 deg, q -1.0/-3.7 %, T2 +14/+33 K). q is two-sided. A minimum,
-# from four stars, not a per-star error.
-SPOT = {"i_deg": "+0.2..+1.0", "q_pct": "-4..+3", "f": "+0.007", "T2_K": "<=35"}
+# not a per-star error. Since Entry 163 i and f are two-sided as well: V1128 Tau's
+# spotted fit moved i by -0.85 deg and f by -0.001 (the first negative shifts), so
+# the ranges now span the spot tests on six stars (V842 Her, V358 Cep, PX Car,
+# TZ Lyr, OT Cep, V1128 Tau). T2 is kept at <=35 K (OT Cep +41, V1128 Tau +81 K
+# exceed it; both carry their own term).
+SPOT = {"i_deg": "-0.9..+1.0", "q_pct": "-4..+3", "f": "-0.001..+0.008", "T2_K": "<=81"}
+# T2: <= 81 K is the largest shift among the contact and semi-detached spot tests
+# (V1128 Tau +81, OT Cep +41, the others <= 35 K); detached stars keep PX Car's
+# +120 K, quoted separately since Entry 117 (interim values, user decision 11 Nov).
+SPOT_T2_DETACHED = "<=120"
+#
+# SPOT-TERM RULE, fixed 11 Nov 2026 before any further spot fits (Entry 164).
+# Fixed in advance so that the term cannot drift towards whatever looks best.
+#  1. A spot shift = a CONVERGED spotted fit minus a no-spot reference fit of the
+#     same batch and settings (the better-chi2 converged spot fit if both stars were
+#     tried). Fits stopped at the model cap are continued to convergence or not used.
+#  2. Residual wave A_res of a finished star: the rms of a 4th-order Fourier series
+#     fitted by least squares to the 151 binned residuals (data - model) of its
+#     production fit, in % of the normalised flux (the constant term is fitted but
+#     not counted: an offset is not a wave). The Fourier series keeps the
+#     coherent wave and drops bin-to-bin noise. It measures any coherent misfit;
+#     the spot fit tests whether a spot explains it. (Reason: V1128 Tau's maxima
+#     differ by only 0.47 %, yet its residuals carry a +-1.5 % wave and it gave the
+#     largest T2 shift: the O'Connell size alone misses spots.)
+#  3. Trigger: a star carries a spot term if |O'Connell| >= 1 % or A_res >= 0.3 %
+#     (the systematic error floor of 04, SYS_ERROR_FLOOR). Each such finished star
+#     is proposed for spot fits (spot on each star, start longitudes 90 and 270, and
+#     the reference); the user approves each batch.
+#  4. A star with its own converged spotted fits uses its own shifts (spot_terms.csv).
+#  5. Any other triggered star: per quantity (i in deg, q in %, f, T2 in % of T2),
+#     the term is +-k * A_res, k = the 90th percentile of |shift| / A_res over the
+#     converged fits of its group (contact and semi-detached together; detached
+#     apart), PROVIDED the group has >= 8 converged fits and a one-sided Spearman
+#     test of |shift| against A_res gives p < 0.05 for that quantity. Otherwise the
+#     flat term: the largest |shift| (two-sided) while the group has fewer than 10
+#     converged fits, the 90th percentile of |shift| from 10 on.
+#  6. The term is recomputed ONCE, in the January audit pass after the production
+#     freeze, and reported with N, the statistic used and the test result; it is
+#     not retuned star by star.
+#  7. Until then (interim): the flat values above (SPOT, SPOT_T2_DETACHED), which
+#     include capped fits, and the trigger |O'Connell| >= 1 % (A_res is not computed
+#     yet).
 # Per-star spot terms (user decision 6 Nov, option 2; first used Entry 162):
 # Audits/spot_terms.csv (star, i_deg, q_pct, f, T2_K, source) replaces the
 # sample-wide term for a star whose own spotted fits exist, whatever its O'Connell.
 SPOT_TERMS_CSV = os.path.join(CODE, "Audits", "spot_terms.csv")
+# Blend terms (Entry 166): for a star whose TESS aperture holds a variable neighbour that
+# was NOT removed (Targets/variable_neighbours.csv lists the removed ones), the shift that
+# removing it produced in test fits (Audits/blend_terms.csv: star, i_deg, f, T2_K,
+# source). Optional; a missing file means no blend terms.
+BLEND_TERMS_CSV = os.path.join(CODE, "Audits", "blend_terms.csv")
 LD_I = "+0.8..+2.1"
 GD_KEY = ("star", "label", "geometry", "ld", "irrad", "l3", "spot", "free_q", "T1")
 # Non-converged fits accepted in the slope, each named here, keyed by
@@ -214,6 +262,7 @@ def main() -> int:
     t1a = table(os.path.join(CODE, "Audits", "t1_anchor.csv"))
     qsys = table(os.path.join(CODE, "Audits", "q_systematics.csv"))
     spot_terms = table(SPOT_TERMS_CSV)
+    blend_terms = table(BLEND_TERMS_CSV)
     oc = table(os.path.join(CODE, "Audits", "oconnell.csv"))
     floor = table(os.path.join(CODE, "Audits", "error_floor.csv"))
     l3k = table(os.path.join(CODE, "Audits", "l3_scaling.csv"))
@@ -293,8 +342,14 @@ def main() -> int:
         spot = math.isfinite(ocp) and abs(ocp) >= 1.0
         own = spot_terms.get(star)
         for k, v in SPOT.items():
+            if k == "T2_K" and morph == "detached":
+                v = SPOT_T2_DETACHED
             row[f"spot_{k}"] = own.get(k, "") if own else (v if spot else "")
         row["spot_src"] = (own.get("source", "own fits") if own else ("sample-wide" if spot else ""))
+        bl = blend_terms.get(star, {})
+        for k in ("i_deg", "f", "T2_K"):
+            row[f"blend_{k}"] = bl.get(k, "")
+        row["blend_src"] = bl.get("source", "")
         row["ld_incl"] = LD_I
         fl = row["flags"]
         row.update(l3="none", l3_frac=math.nan, l3_k=math.nan, l3_pct=math.nan,
@@ -366,7 +421,8 @@ def main() -> int:
             "fillout", "fillout_sig", "fillout_sys_q", "oconnell_pct", "spot_i_deg",
             "spot_q_pct", "spot_f", "spot_T2_K", "ld_incl", "l3", "l3_frac", "l3_k", "l3_pct",
             "l3_pct_lo", "l3_pct_hi", "r2", "r2_lo", "r2_hi",
-            "r1_lobe_med", "r1_lobe_p97", "flags", "spot_src"]
+            "r1_lobe_med", "r1_lobe_p97", "flags", "spot_src", "blend_i_deg", "blend_f",
+            "blend_T2_K", "blend_src"]
     with open(OUT, "w", newline="", encoding="utf-8") as h:
         w = csv.DictWriter(h, fieldnames=cols, extrasaction="ignore")
         w.writeheader()

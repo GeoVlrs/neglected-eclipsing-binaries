@@ -18,19 +18,25 @@ Summary:
         run time, not stored). Am stars use the hydrogen-line type; giants and
         unreferenced types are flagged;
       * LAMOST DR11 LRS/MRS Teff where the star is covered (VizieR V/162);
-      * literature T1 values already read for this project (LITERATURE_T1).
+      * literature T1 values already read for this project (LITERATURE_T1);
+      * colour temperatures from Audits/colour_teff.csv (audit_colour_teff.py), when
+        that table exists: 2MASS J-Ks (non-Gaia) and Gaia BP-RP dereddened with the
+        Bayestar19 map (Gaia; only where the map is reliable at the star's distance).
 
     Per star it reports sigma_T1 = max(250 K, half the MSC interval, half the
     spread of the credible estimates) and whether the change rule fires:
     at least two estimates, one of them not from Gaia, agree within 300 K and
-    differ from the pipeline T1 by more than 500 K. GSP-Phot and MSC come from the
-    same BP/RP spectra and count as one Gaia estimate.
+    differ from the pipeline T1 by more than 500 K. GSP-Phot, MSC and the BP-RP colour
+    come from the same BP/RP photometry and count as one Gaia estimate.
 
     Read-only on the pipeline; network reads only (VizieR, SIMBAD, the Mamajek
     table); nothing is downloaded to disk.
 
 Usage (WSL or Windows python with astroquery; from Code/; a few minutes):
     python3 Audits/audit_t1_anchor.py [Targets/phaseF_queue.csv]
+    python3 Audits/audit_t1_anchor.py --offline     # no network: rebuild from the existing
+        table (catalogue values kept; T1, status, literature and colours refreshed)
+    --no-colour ignores Audits/colour_teff.csv
 Output:
     Audits/t1_anchor.csv; a table on stdout.
 ================================================================================
@@ -48,6 +54,7 @@ import warnings
 warnings.filterwarnings("ignore")
 CODE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(CODE, "Audits", "t1_anchor.csv")
+COLOUR_CSV = os.path.join(CODE, "Audits", "colour_teff.csv")    # audit_colour_teff.py (optional)
 POS_JSON = os.path.join(CODE, "Runs", "modeltype", "catalog_lookup_60.json")
 MAMAJEK_URL = "https://www.pas.rochester.edu/~emamajek/EEM_dwarf_UBVIJHK_colors_Teff.txt"
 SIMBAD_TAP = "https://simbad.cds.unistra.fr/simbad/sim-tap/sync"
@@ -75,7 +82,11 @@ SIGMA_FLOOR_K = 250.0
 
 
 sys.path.insert(0, CODE)
-from morphology import resolve_morphology_kind        # noqa: E402
+from morphology import resolve_morphology_kind, read_third_light        # noqa: E402
+
+# Stars fitted with third light in production (mode free or fixed), as 05 reads them.
+THIRD_LIGHT = read_third_light(os.path.join(CODE, "Targets"))
+ESPHS_MIN_K = 7500.0      # ESP-HS's domain: stars hotter than 7500 K (Creevey et al. 2023)
 
 
 def file_sha(path: str) -> str:
@@ -173,11 +184,199 @@ def val(t, col):
         return math.nan
 
 
+def colour_table() -> dict:
+    """{star: row} of Audits/colour_teff.csv (audit_colour_teff.py), or {} if absent."""
+    try:
+        return {r["star"]: r for r in csv.DictReader(open(COLOUR_CSV, encoding="utf-8"))}
+    except OSError:
+        return {}
+
+
+def fnum(x) -> float:
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else math.nan
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def result_status(star: str) -> tuple:
+    """(status, fitted T2/T1). Done in this campaign = a results file whose
+    input_bundle_sha is the sha of the current bundle (05's own staleness test);
+    an older result is "pending (old result)"."""
+    safe = star.replace(" ", "_")
+    res = os.path.join(CODE, "data", "results", f"results_{safe}.csv")
+    status, ratio, res_sha = "pending", math.nan, ""
+    if os.path.exists(res):
+        for r in csv.DictReader(open(res, encoding="utf-8", errors="replace")):
+            if r["Symbol"] == "T2_over_T1":
+                ratio = float(r["Value"])
+            if r["Symbol"] == "input_bundle_sha":
+                res_sha = r["Value"]
+        cur = file_sha(os.path.join(CODE, "data", "bundles", f"bundle_{safe}.phoebe"))
+        status = "done" if res_sha and res_sha == cur else "pending (old result)"
+    return status, ratio
+
+
+def assess(row: dict, colour: dict) -> None:
+    """Fill estimates, flags, sigma_T1 and change_rule of one star's row (in place).
+
+    Estimates are (label, Teff, is_gaia). MSC, GSP-Phot and the Gaia BP-RP colour all
+    come from Gaia's BP/RP photometry: two of them never count as independent agreement.
+    The 2MASS J-Ks colour temperature (audit_colour_teff.py) counts as non-Gaia when that
+    audit marks it usable (good photometry; dust and colour error each <= 250 K in T);
+    the BP-RP one where the dust map is reliable at the star's distance, or the star is
+    so near that the reddening bracket moves T by <= 250 K.
+    Colours count for contact stars without third light in production only, and the
+    ESP-HS value only for a star that another estimate also puts at >= 7500 K (see the
+    comments below).
+    """
+    t1, tsp = row["T1_pipeline"], row["sp_teff"]
+    lit = LITERATURE_T1.get(row["star"])
+    est = []
+    for lab in ("msc_T1", "gspphot", "gspspec"):
+        if math.isfinite(row[lab]) and not (lab == "msc_T1" and "ceiling" in row["T1_source"]):
+            est.append((lab.replace("_T1", ""), row[lab], True))
+    if math.isfinite(tsp) and row["sp_bibcode"]:
+        est.append(("sptype", tsp, False))
+    if math.isfinite(row["lamost_teff"]):
+        est.append(("lamost", row["lamost_teff"], False))
+    if lit and not (lit[2] and lit[2] == row["sp_bibcode"]):
+        est.append(("lit", lit[0], lit[3]))               # lit[3]: depends on Gaia
+    flags = []
+    # ESP-HS analyses only stars it classifies as hotter than 7500 K (O, B, A), and some
+    # cooler stars were misclassified and processed anyway (Creevey et al. 2023, Sect. 3).
+    # Its value counts only where the star is hot by other evidence: another estimate at
+    # >= 7500 K, or a colour temperature with NO dust correction at >= 7500 K (reddening
+    # only cools a colour, so that is a lower limit). II UMa: ESP-HS 14310 K against MSC
+    # 6245 K and uncorrected colours of ~6600 K: not counted. SU Cep: uncorrected J-Ks
+    # gives an A star: counted.
+    if math.isfinite(row["esphs"]):
+        c0 = colour.get(row["star"], {})
+        floor = max([fnum(c0.get("T_bprp_unred")), fnum(c0.get("T_jk_unred"))],
+                    key=lambda v: v if math.isfinite(v) else -1.0)
+        if any(e[1] >= ESPHS_MIN_K for e in est) or (math.isfinite(floor) and floor >= ESPHS_MIN_K):
+            est.insert(min(len(est), 3), ("esphs", row["esphs"], True))
+        else:
+            flags.append(f"esphs_not_counted_{row['esphs']:.0f}K_no_other_hot_evidence")
+    c = colour.get(row["star"])
+    row["colour_jk_T"] = row["colour_bprp_T"] = math.nan
+    row["colour_bprp_range"] = row["map_status"] = ""
+    if c:
+        row["map_status"] = c.get("map_status", "")
+        tjk, tbp = fnum(c.get("T_jk")), fnum(c.get("T_bprp_est"))
+        lo, hi = fnum(c.get("T_bprp_16")), fnum(c.get("T_bprp_84"))
+        # A colour temperature is that of the combined light. In a contact binary the
+        # two stars have similar temperatures, so it estimates T1; with a much cooler
+        # secondary (semi-detached, detached) it is pulled towards T2, the infrared
+        # (J-Ks) most (GW Gem: J-Ks 6425 K against T1 7204 K at T2/T1 0.67; V404 Lyr,
+        # Entry 131). Those stars' colours are shown but not counted. The same holds for a
+        # contact star with third light in production (Targets/third_light.csv, mode free
+        # or fixed): its colours include the third star's light (TZ Boo: a second binary
+        # gives up to 28 % of the light, Pribulla et al. 2009).
+        third = row["star"] in THIRD_LIGHT
+        counts = row["routing"] == "contact" and not third
+        if c.get("jk_counts") == "True" and math.isfinite(tjk):
+            row["colour_jk_T"] = tjk
+            if counts:
+                est.append(("colour_jk", tjk, False))
+        if c.get("bprp_counts") == "True" and math.isfinite(tbp):
+            row["colour_bprp_T"] = tbp
+            if counts:
+                est.append(("colour_bprp", tbp, True))
+        if not counts and (math.isfinite(row["colour_jk_T"]) or math.isfinite(row["colour_bprp_T"])):
+            flags.append("colours_not_counted_third_light" if row["routing"] == "contact" and third
+                         else "colours_not_counted_unequal_pair")
+        if math.isfinite(lo):
+            row["colour_bprp_range"] = f"{lo:.0f}-{hi:.0f}" if math.isfinite(hi) else f">={lo:.0f}"
+        if c.get("bprp_counts") != "True" and math.isfinite(lo) and math.isfinite(t1):
+            # not an estimate, but a bound: BP-RP with no reddening is a lower limit
+            if lo - t1 > CHANGE_DIFF_K:
+                flags.append(f"bprp_lower_bound_{lo:.0f}K_above_T1")
+            if math.isfinite(hi) and t1 - hi > CHANGE_DIFF_K:
+                flags.append(f"bprp_upper_bound_{hi:.0f}K_below_T1")
+    if math.isfinite(row["msc_T1_hi"]) and row["msc_T1_hi"] >= 7999:
+        flags.append("msc_upper_bound_8000")
+    if math.isfinite(row["msc_T1"]) and 7190 <= row["msc_T1"] <= 7420:
+        flags.append("msc_cluster_7200_7420")
+    if row["sp_type"] and not row["sp_bibcode"]:
+        flags.append("sptype_unreferenced")
+    if math.isfinite(tsp) and math.isfinite(t1) and abs(tsp - t1) > CHANGE_DIFF_K:
+        flags.append(f"sptype_differs_{tsp - t1:+.0f}K")
+    if (row["routing"] != "contact" and math.isfinite(row["T2_over_T1_fit"])
+            and math.isfinite(row["msc_T2"]) and math.isfinite(row["msc_T1"])):
+        r_msc = row["msc_T2"] / row["msc_T1"]
+        if abs(r_msc - row["T2_over_T1_fit"]) > 0.15:
+            flags.append(f"msc_split_vs_lightcurve_{r_msc:.2f}_vs_{row['T2_over_T1_fit']:.2f}")
+    vals = [e[1] for e in est] + ([t1] if math.isfinite(t1) else [])
+    spread = 0.5 * (max(vals) - min(vals)) if len(vals) > 1 else 0.0
+    half_msc = (0.5 * (row["msc_T1_hi"] - row["msc_T1_lo"])
+                if math.isfinite(row["msc_T1_hi"]) and math.isfinite(row["msc_T1_lo"]) else 0.0)
+    row["sigma_T1"] = round(max(SIGMA_FLOOR_K, spread, half_msc))
+    fire = ""
+    for a in range(len(est)):
+        for b in range(a + 1, len(est)):
+            ea, eb = est[a], est[b]
+            if ea[2] and eb[2]:
+                continue                                   # two Gaia values: one estimate
+            if abs(ea[1] - eb[1]) <= CHANGE_AGREE_K and math.isfinite(t1):
+                mean = 0.5 * (ea[1] + eb[1])
+                if abs(mean - t1) > CHANGE_DIFF_K:
+                    fire = f"{ea[0]}+{eb[0]} agree at {mean:.0f} K ({mean - t1:+.0f} K)"
+    row["change_rule"] = fire
+    row["estimates"] = "; ".join(f"{e[0]} {e[1]:.0f}" for e in est)
+    row["flags"] = "; ".join(flags)
+
+
+NUMERIC = ("T1_pipeline", "msc_T1", "msc_T1_lo", "msc_T1_hi", "msc_T2", "msc_T2_lo", "msc_T2_hi",
+           "msc_logg1", "msc_flag", "gspphot", "gspphot_lo", "gspphot_hi", "gspspec", "esphs",
+           "sp_teff", "lamost_teff", "lit_T1", "T2_over_T1_fit", "Gmag")
+
+
+def offline(colour: dict) -> list:
+    """Rows rebuilt from the existing t1_anchor.csv (no VizieR or SIMBAD): the
+    catalogue values are kept; T1 and its source (04's table), the result status and
+    T2/T1, the literature T1 and the colour estimates are refreshed; estimates,
+    sigma_T1 and the change rule are recomputed."""
+    pipe = pipeline_t1()
+    rows = []
+    for r in csv.DictReader(open(OUT, encoding="utf-8")):
+        row = dict(r)
+        for k in NUMERIC:
+            row[k] = fnum(row.get(k))
+        star = row["star"]
+        t1, src = pipe.get(star, (math.nan, "not in GAIA_TEFF_OVERRIDE_K"))
+        row["T1_pipeline"], row["T1_source"] = t1, src
+        row["status"], row["T2_over_T1_fit"] = result_status(star)
+        lit = LITERATURE_T1.get(star)
+        row["lit_T1"], row["lit_note"] = (lit[0], lit[1]) if lit else (math.nan, "")
+        assess(row, colour)
+        rows.append(row)
+    return rows
+
+
+def write_table(rows: list, cols: list) -> None:
+    with open(OUT, "w", newline="", encoding="utf-8") as h:
+        w = csv.DictWriter(h, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: (round(x, 1) if isinstance(x, float) and math.isfinite(x) else
+                            ("" if isinstance(x, float) else x)) for k, x in r.items()})
+
+
 def main() -> int:
+    flags_cli = [a for a in sys.argv[1:] if a.startswith("--")]
+    pos_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    colour = {} if "--no-colour" in flags_cli else colour_table()
+    print(f"colour temperatures: {len(colour)} stars from {COLOUR_CSV}" if colour
+          else "colour temperatures: none (no table, or --no-colour)")
+    if "--offline" in flags_cli:
+        rows = offline(colour)
+        return finish(rows)
     from astroquery.vizier import Vizier
     from astropy.coordinates import SkyCoord
     import astropy.units as u
-    cat = sys.argv[1] if len(sys.argv) > 1 else os.path.join(CODE, "Targets", "phaseF_queue.csv")
+    cat = pos_args[0] if pos_args else os.path.join(CODE, "Targets", "phaseF_queue.csv")
     cat_rows = list(csv.DictReader(open(cat, encoding="utf-8")))
     stars = [r["name"] for r in cat_rows]
     types = {r["name"]: r.get("type", "") for r in cat_rows}
@@ -192,19 +391,7 @@ def main() -> int:
         row = {"queue_pos": k, "star": star}
         t1, src = pipe.get(star, (math.nan, "not in GAIA_TEFF_OVERRIDE_K"))
         row.update(T1_pipeline=t1, T1_source=src)
-        safe = star.replace(" ", "_")
-        res = os.path.join(CODE, "data", "results", f"results_{safe}.csv")
-        # Done in this campaign = a results file whose input_bundle_sha is the sha of
-        # the current bundle (05's own staleness test); an older result is "old".
-        row["status"], row["T2_over_T1_fit"], res_sha = "pending", math.nan, ""
-        if os.path.exists(res):
-            for r in csv.DictReader(open(res, encoding="utf-8", errors="replace")):
-                if r["Symbol"] == "T2_over_T1":
-                    row["T2_over_T1_fit"] = float(r["Value"])
-                if r["Symbol"] == "input_bundle_sha":
-                    res_sha = r["Value"]
-            cur = file_sha(os.path.join(CODE, "data", "bundles", f"bundle_{safe}.phoebe"))
-            row["status"] = "done" if res_sha and res_sha == cur else "pending (old result)"
+        row["status"], row["T2_over_T1_fit"] = result_status(star)
         row["routing"] = resolve_morphology_kind(star, types.get(star, ""))
         # Gaia DR3 source: the TIC's own Gaia id (TIC 8.2 lists the DR2 id, which is
         # the DR3 id for almost every star), so proper motion cannot pick a neighbour
@@ -268,68 +455,28 @@ def main() -> int:
             row["lamost_range"] = "query error: " + str(e)[:40]
         lit = LITERATURE_T1.get(star)
         row["lit_T1"], row["lit_note"] = (lit[0], lit[1]) if lit else (math.nan, "")
-        # estimates: (label, value, is_gaia). MSC and GSP-Phot both come from the
-        # BP/RP spectra: a pair of them never counts as independent agreement.
-        est = []
-        for lab in ("msc_T1", "gspphot", "gspspec", "esphs"):
-            if math.isfinite(row[lab]) and not (lab == "msc_T1" and "ceiling" in row["T1_source"]):
-                est.append((lab.replace("_T1", ""), row[lab], True))
-        if math.isfinite(tsp) and row["sp_bibcode"]:
-            est.append(("sptype", tsp, False))
-        if math.isfinite(row["lamost_teff"]):
-            est.append(("lamost", row["lamost_teff"], False))
-        if lit and not (lit[2] and lit[2] == row["sp_bibcode"]):
-            est.append(("lit", lit[0], lit[3]))           # lit[3]: depends on Gaia
-        flags = []
-        if math.isfinite(row["msc_T1_hi"]) and row["msc_T1_hi"] >= 7999:
-            flags.append("msc_upper_bound_8000")
-        if math.isfinite(row["msc_T1"]) and 7190 <= row["msc_T1"] <= 7420:
-            flags.append("msc_cluster_7200_7420")
-        if row["sp_type"] and not row["sp_bibcode"]:
-            flags.append("sptype_unreferenced")
-        if math.isfinite(tsp) and math.isfinite(t1) and abs(tsp - t1) > CHANGE_DIFF_K:
-            flags.append(f"sptype_differs_{tsp - t1:+.0f}K")
-        if (row["routing"] != "contact" and math.isfinite(row["T2_over_T1_fit"])
-                and math.isfinite(row["msc_T2"]) and math.isfinite(row["msc_T1"])):
-            r_msc = row["msc_T2"] / row["msc_T1"]
-            if abs(r_msc - row["T2_over_T1_fit"]) > 0.15:
-                flags.append(f"msc_split_vs_lightcurve_{r_msc:.2f}_vs_{row['T2_over_T1_fit']:.2f}")
-        vals = [e[1] for e in est] + ([t1] if math.isfinite(t1) else [])
-        spread = 0.5 * (max(vals) - min(vals)) if len(vals) > 1 else 0.0
-        half_msc = (0.5 * (row["msc_T1_hi"] - row["msc_T1_lo"])
-                    if math.isfinite(row["msc_T1_hi"]) and math.isfinite(row["msc_T1_lo"]) else 0.0)
-        row["sigma_T1"] = round(max(SIGMA_FLOOR_K, spread, half_msc))
-        # change rule
-        fire = ""
-        for a in range(len(est)):
-            for b in range(a + 1, len(est)):
-                ea, eb = est[a], est[b]
-                if ea[2] and eb[2]:
-                    continue                                   # two Gaia values: one estimate
-                if abs(ea[1] - eb[1]) <= CHANGE_AGREE_K and math.isfinite(t1):
-                    mean = 0.5 * (ea[1] + eb[1])
-                    if abs(mean - t1) > CHANGE_DIFF_K:
-                        fire = f"{ea[0]}+{eb[0]} agree at {mean:.0f} K ({mean - t1:+.0f} K)"
-        row["change_rule"] = fire
-        row["estimates"] = "; ".join(f"{e[0]} {e[1]:.0f}" for e in est)
-        row["flags"] = "; ".join(flags)
+        assess(row, colour)
         rows.append(row)
-        print(f"{k:2d} {star:10s} {row['status']:8s} T1 {t1:6.0f}  MSC {row['msc_T1']:6.0f} "
-              f"[{row['msc_T1_lo']:5.0f},{row['msc_T1_hi']:5.0f}]  T2msc {row['msc_T2']:5.0f}  "
-              f"GSP {row['gspphot']:5.0f}  SpT {row['sp_type'][:12]:12s} {tsp:5.0f}  "
-              f"LAM {row['lamost_teff']:5.0f}  sig {row['sigma_T1']:4d}  {fire}  {row['flags']}")
-    cols = ["queue_pos", "star", "status", "routing", "T1_pipeline", "T1_source", "msc_T1", "msc_T1_lo",
-            "msc_T1_hi", "msc_T2", "msc_T2_lo", "msc_T2_hi", "msc_logg1", "msc_flag", "gspphot",
-            "gspphot_lo", "gspphot_hi", "gspspec", "esphs", "sp_type", "sp_qual", "sp_bibcode",
-            "sp_teff", "sp_note", "lamost_teff", "lamost_n", "lamost_range", "lit_T1", "lit_note", "T2_over_T1_fit",
-            "gaia_source", "gaia_match", "Gmag", "estimates", "sigma_T1",
-            "change_rule", "flags"]
-    with open(OUT, "w", newline="", encoding="utf-8") as h:
-        w = csv.DictWriter(h, fieldnames=cols, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: (round(x, 1) if isinstance(x, float) and math.isfinite(x) else
-                            ("" if isinstance(x, float) else x)) for k, x in r.items()})
+    return finish(rows)
+
+
+# New columns go at the end so that readers keyed on the old order are unaffected.
+COLS = ["queue_pos", "star", "status", "routing", "T1_pipeline", "T1_source", "msc_T1", "msc_T1_lo",
+        "msc_T1_hi", "msc_T2", "msc_T2_lo", "msc_T2_hi", "msc_logg1", "msc_flag", "gspphot",
+        "gspphot_lo", "gspphot_hi", "gspspec", "esphs", "sp_type", "sp_qual", "sp_bibcode",
+        "sp_teff", "sp_note", "lamost_teff", "lamost_n", "lamost_range", "lit_T1", "lit_note", "T2_over_T1_fit",
+        "gaia_source", "gaia_match", "Gmag", "estimates", "sigma_T1",
+        "change_rule", "flags", "colour_jk_T", "colour_bprp_T", "colour_bprp_range", "map_status"]
+
+
+def finish(rows: list) -> int:
+    for row in rows:
+        print(f"{row['queue_pos']:>2} {row['star']:10s} {row['status'][:8]:8s} T1 {row['T1_pipeline']:6.0f}  "
+              f"MSC {row['msc_T1']:6.0f} [{row['msc_T1_lo']:5.0f},{row['msc_T1_hi']:5.0f}]  "
+              f"GSP {row['gspphot']:5.0f}  SpT {row['sp_type'][:12]:12s} {row['sp_teff']:5.0f}  "
+              f"LAM {row['lamost_teff']:5.0f}  JK {row['colour_jk_T']:5.0f}  BPRP {row['colour_bprp_T']:5.0f} "
+              f"({row['colour_bprp_range']})  sig {row['sigma_T1']:4d}  {row['change_rule']}  {row['flags']}")
+    write_table(rows, COLS)
     print("table:", OUT)
     return 0
 

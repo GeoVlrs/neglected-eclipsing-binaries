@@ -2126,7 +2126,7 @@ for target_index, target in enumerate(target_list):
         # would be overwritten by this refit — keep it, and the old final plot, under
         # the same suffix (blast radius; cf. the V899 Her incident, Entry 58).
         _old_final = os.path.join(paths.BUNDLE_DIR, f"bundle_{safe_name}_final.phoebe")
-        _old_plot  = os.path.join(paths.PLOT_FINAL_DIR, f"phoebe_final_{safe_name}.png")
+        _old_plot  = paths.final_plot_path(safe_name)   # ZZ_ test stars: models_final/ZZ_tests/
         if mpi_rank == 0:
             os.replace(results_path, superseded)
             for _src in (_old_final, _old_plot):
@@ -2813,7 +2813,7 @@ for target_index, target in enumerate(target_list):
             ax_res.grid(alpha=0.3)
 
             plt.tight_layout()
-            plot_path = os.path.join(paths.PLOT_FINAL_DIR, f"phoebe_final_{safe_name}.png")
+            plot_path = paths.final_plot_path(safe_name)   # ZZ_ test stars: models_final/ZZ_tests/
             plt.savefig(plot_path, dpi=150, bbox_inches="tight")
             plt.close()
 

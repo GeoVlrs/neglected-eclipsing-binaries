@@ -278,7 +278,7 @@ GAIA_TEFF_OVERRIDE_K: dict[str, float] = {
     "V358 Cep":  5845.0,   # MSC T2 ~ 5225
     "OT Cep":    6060.0,   # MSC T2 ~ 5365
     "V878 Her":  6400.0,   # MSC T2 ~ 5899
-    "V576 Lyr":  7336.0,   # MSC T2 ~ 5950  (A-type)
+    "V576 Lyr":  6820.0,   # change rule (Entry 164): spectral type F2V + 2MASS J-Ks agree at 6818; GSP-Phot 6930, LAMOST 7035, dereddened BP-RP 7022. Was MSC 7336 (T2 ~ 5950)
     "EG Cep":    7399.0,   # MSC T2 ~ 5899  (A-type)
     "EP Aur":    6403.0,   # MSC T2 ~ 5625
     "V505 Cyg":  7085.0,   # MSC T2 ~ 5614  (crowded field)
@@ -536,6 +536,70 @@ def apply_radiative_physics(bundle: object, component: str, teff_k: float,
               "convective physics  β₁=0.32, A=0.6  (Lucy 1967)")
 
 
+# Stars whose TESS aperture also holds a known VARIABLE neighbour (Targets/
+# variable_neighbours.csv; Entry 166). TESS pixels are 21", so a binary 16" away
+# shares the aperture, and SPOC's crowding correction removes only the neighbour's
+# MEAN light, not its eclipses (BW Dra: BV Dra's eclipses at 0.935 x BV Dra's own
+# amplitude). For a listed star the neighbour's signal is fitted and removed from the
+# unbinned light curve before binning.
+NEIGHBOUR_HARMONICS_DEFAULT: int = 30   # TUNABLE: Fourier harmonics per star in the
+                                        # separation; more follow sharper eclipses but
+                                        # cost conditioning (30 tested on BW Dra)
+
+
+def read_variable_neighbours(targets_dir: str = "Targets") -> dict:
+    """{star: {"neighbour": name, "harmonics": int, ...}} from variable_neighbours.csv;
+    {} if the file is absent."""
+    path = os.path.join(targets_dir, "variable_neighbours.csv")
+    out: dict = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("name") and row.get("neighbour"):
+                row["harmonics"] = int(row.get("harmonics") or NEIGHBOUR_HARMONICS_DEFAULT)
+                out[row["name"].strip()] = row
+    return out
+
+
+def remove_neighbour_signal(time_bjd: np.ndarray, flux: np.ndarray, period_own: float,
+                            period_nb: float, harmonics: int) -> tuple[np.ndarray, dict]:
+    """
+    Separate two periodic signals in one light curve and remove the neighbour's.
+
+    The flux is fitted by linear least squares with a constant plus two Fourier
+    series, `harmonics` terms each, one in the star's own phase and one in the
+    neighbour's (time measured from the mean time). Over a TESS sector the two
+    periods drift apart, so the series separate. The neighbour's series (zero mean
+    over the sector) is subtracted; the star's own signal and the noise are left.
+
+    Parameters
+    ----------
+    time_bjd : array, BJD_TDB (days)
+    flux : array, normalised flux
+    period_own, period_nb : float, days
+    harmonics : int, terms per series
+
+    Returns
+    -------
+    (cleaned flux, info) — info: neighbour peak-to-peak and rms (fraction of the
+    flux), and the rms of the two-series fit residual.
+    """
+    tc = time_bjd - time_bjd.mean()
+    cols = [np.ones_like(tc)]
+    for per in (period_own, period_nb):
+        ang = 2.0 * np.pi * tc / per
+        for k in range(1, harmonics + 1):
+            cols += [np.cos(k * ang), np.sin(k * ang)]
+    design = np.vstack(cols).T
+    coef, *_ = np.linalg.lstsq(design, flux, rcond=None)
+    n_own = 1 + 2 * harmonics
+    neighbour = design[:, n_own:] @ coef[n_own:]
+    info = {"neighbour_ptp": float(np.ptp(neighbour)), "neighbour_rms": float(np.std(neighbour)),
+            "fit_resid_rms": float(np.std(flux - design @ coef))}
+    return flux - neighbour, info
+
+
 def bin_phase_curve(
     phase: np.ndarray,
     flux: np.ndarray,
@@ -619,6 +683,8 @@ except FileNotFoundError:
 # SECTION 5 — MAIN BUNDLE CONSTRUCTION LOOP
 # =============================================================================
 
+VARIABLE_NEIGHBOURS: dict = read_variable_neighbours(paths.TARGETS_DIR)
+
 for target in target_list:
     star_name      = target["name"]
     variable_type  = target["type"]
@@ -653,6 +719,31 @@ for target in target_list:
         if hasattr(lc, "flux_err")
         else np.full_like(raw_flux, 0.002)
     )
+
+    # ── 5A2: REMOVE A KNOWN VARIABLE NEIGHBOUR (Entry 166) ──────────────────────
+    _nb = VARIABLE_NEIGHBOURS.get(star_name)
+    if _nb:
+        _nb_name = _nb["neighbour"].strip()
+        _nb_period = load_refined_ephemeris(_nb_name.replace(" ", "_")).get("P_new")
+        if not _nb_period:
+            print(f"  WARNING: no ephemeris for neighbour {_nb_name}; its signal is NOT removed.")
+        else:
+            ok = np.isfinite(raw_flux) & np.isfinite(time_bjd)
+            _clean, _info = remove_neighbour_signal(time_bjd[ok], raw_flux[ok], period_model,
+                                                    float(_nb_period), _nb["harmonics"])
+            raw_flux = raw_flux.copy()
+            raw_flux[ok] = _clean
+            print(f"  [neighbour] removed {_nb_name}'s signal (P {_nb_period:.7f} d, "
+                  f"{_nb['harmonics']} harmonics): peak-to-peak {100 * _info['neighbour_ptp']:.1f} %, "
+                  f"rms {100 * _info['neighbour_rms']:.2f} %; two-series fit residual rms "
+                  f"{100 * _info['fit_resid_rms']:.2f} %")
+            with open(os.path.join(paths.LIGHTCURVE_DIR, f"neighbour_removed_{safe_name}.txt"),
+                      "w", encoding="utf-8") as _h:
+                _lines = [f"neighbour = {_nb_name}", f"neighbour_period_d = {_nb_period:.10f}",
+                          f"own_period_d = {period_model:.10f}", f"harmonics = {_nb['harmonics']}"]
+                _lines += [f"{k} = {v:.6f}" for k, v in _info.items()]
+                _lines += ["source = Targets/variable_neighbours.csv (04Modeling.py section 5A2)"]
+                _h.write("\n".join(_lines) + "\n")
 
     # ── 5B: PHASE BINNING ─────────────────────────────────────────────────────
     print(f"  Raw light curve: {len(raw_flux)} data points — binning to {PHASE_BIN_COUNT}...")

@@ -39,6 +39,7 @@ PLOT_LC_DIR     = os.path.join(PLOT_DIR, "lightcurves")    # lc_*_raw_vs_clean.p
 PLOT_OC_DIR     = os.path.join(PLOT_DIR, "oc")             # oc_*.png                    (03)
 PLOT_INIT_DIR   = os.path.join(PLOT_DIR, "models_init")    # phoebe_init_*.png           (04)
 PLOT_FINAL_DIR  = os.path.join(PLOT_DIR, "models_final")   # phoebe_final_*.png          (05)
+PLOT_FINAL_ZZ_DIR = os.path.join(PLOT_FINAL_DIR, "ZZ_tests")  # the same for scratch/test stars (ZZ_*)
 PLOT_MESH_DIR   = os.path.join(PLOT_DIR, "mesh")           # mesh_*_*.png + .gif         (06)
 PLOT_THESIS_DIR = os.path.join(PLOT_DIR, "thesis")         # gallery + roche schematics  (06)
 PLOT_MCMC_DIR   = os.path.join(PLOT_DIR, "mcmc_diag")      # mcmc_chains_*.png           (audit)
@@ -48,7 +49,7 @@ THESIS_FIGURES_DIR = os.path.join("..", "Text", "Figures")  # from Code/ (was ..
 
 _ALL_DIRS = (
     LIGHTCURVE_DIR, TIMING_DIR, BUNDLE_DIR, RESULTS_DIR, QSEARCH_DIR,
-    PLOT_LC_DIR, PLOT_OC_DIR, PLOT_INIT_DIR, PLOT_FINAL_DIR, PLOT_MESH_DIR, PLOT_THESIS_DIR,
+    PLOT_LC_DIR, PLOT_OC_DIR, PLOT_INIT_DIR, PLOT_FINAL_DIR, PLOT_FINAL_ZZ_DIR, PLOT_MESH_DIR, PLOT_THESIS_DIR,
     PLOT_MCMC_DIR,
 )
 
@@ -57,3 +58,12 @@ def ensure_dirs() -> None:
     """Create every product/plot sub-folder (idempotent). Call once at script startup."""
     for d in _ALL_DIRS:
         os.makedirs(d, exist_ok=True)
+
+
+def final_plot_path(safe_name: str) -> str:
+    """Path of Script 05's final-fit plot. Scratch and test stars (names starting
+    "ZZ_", the trial convention) go to models_final/ZZ_tests/ so that they do not mix
+    with the science stars' plots."""
+    folder = PLOT_FINAL_ZZ_DIR if safe_name.startswith("ZZ_") else PLOT_FINAL_DIR
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, f"phoebe_final_{safe_name}.png")

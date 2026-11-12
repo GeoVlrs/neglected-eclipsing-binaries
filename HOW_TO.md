@@ -325,6 +325,13 @@ Stage 01 is only needed to rebuild the target selection from scratch (§5.1).
     and fill-out, come from `data/qsearch/q_adopted_<star>.txt` (§5.4b). Without
     that file the bundle gets the placeholder q = 0.5 and stage 05 parks the
     star.
+  - **Known variable neighbour** (`Targets/variable_neighbours.csv`, Entry 166): for a
+    listed star (BW Dra → BV Dra, 16″, same TESS aperture), the neighbour's signal is
+    fitted together with the star's own (two Fourier series, one per period; the
+    neighbour's period from its stage-03 ephemeris) and removed from the unbinned light
+    curve before binning. SPOC's crowding correction removes only the neighbour's mean
+    light, not its eclipses. Record: `data/lightcurves/neighbour_removed_<star>.txt`.
+    Rebuilding a listed star's bundle makes 05 refit it (§6.6).
   - **Data:** the light curve folded with stage 03's ephemeris and binned to **151**
     phase bins (odd, so one bin is centred on phase 0), with a 0.003 systematic
     error floor.
@@ -334,7 +341,10 @@ Stage 01 is only needed to rebuild the target selection from scratch (§5.1).
     ≥ 300 s, exposure-time integration (`exptime` + `fti_method="oversample"`,
     ×5).
   - **Fixed primary temperature:** Gaia DR3 where pre-resolved, else a live Gaia
-    query, else a period–spectral-type estimate.
+    query, else a period–spectral-type estimate. The table value is a reviewed
+    decision: before a new star's 04 run, check it with `audit_colour_teff.py` and
+    `audit_t1_anchor.py` (§7.4). A change-rule hit is decided per star; 04 never
+    changes T₁ by itself.
   - An initial forward model and plot as a sanity check.
 - **Run (Linux/WSL).** `python3 04Modeling.py Targets/<catalogue>.csv`
 - **Writes:** `data/bundles/bundle_<star>.phoebe` (overwrites) and
@@ -833,7 +843,7 @@ The staged-file workflow and the other test levels are in §12.
 |---|---|
 | `data/results/results_<star>.csv` | Parameters (`Parameter,Symbol,Value,Sigma_minus,Sigma_plus,Unit`) plus rows `chi2_red`, `chi2_red_map`, `err_scale`, `morphology*`, `run_id`, `code_sha`, `input_bundle_sha`, `steps`, `burn_in`, `stop_reason`, `flux_source`, `flags`. |
 | `data/bundles/bundle_<star>_final.phoebe` | The fitted bundle with the full chain. Written **before** the results file. |
-| `data/plots/models_final/phoebe_final_<star>.png` | Data, model, residuals. |
+| `data/plots/models_final/phoebe_final_<star>.png` | Data, model, residuals. Test and scratch stars (`ZZ_*`) go to `models_final/ZZ_tests/` (`paths.final_plot_path`). |
 | `data/plots/mcmc_diag/mcmc_chains_<star>.png` | Walker traces and chain-health verdict. |
 | `bundle_<star>_mcmc.phoebe` + `.input_sha`, `.nm_start`, `.sigma_prescale`, `.mesh`, `.l3_k` | Checkpoint and its notes: input checksum, winning start, error-bar factor, mesh chosen, third-light k₃ used for the priors (all deleted on success). |
 | `bundle_<star>.lock` | `host:pid` of the queue fitting the star. |
@@ -1024,7 +1034,7 @@ These feed the thesis tables. Rebuild them in this order after a star finishes
 (all light unless marked):
 
 ```
-model_tests, oconnell, q_systematics, l3_scaling, t1_anchor, error_floor (.csv)
+model_tests, oconnell, q_systematics, l3_scaling, colour_teff → t1_anchor, error_floor (.csv)
     → audit_error_budget.py → error_budget.csv → GenerateThesisTables.py
 ```
 
@@ -1032,7 +1042,8 @@ model_tests, oconnell, q_systematics, l3_scaling, t1_anchor, error_floor (.csv)
 |---|---|---|---|
 | `audit_l3_scaling.py` | Third-light k₃ per star (two models each) and the share of each fitted/fixed value. **Run for a finished free-l3 star before the error budget**, or its table cell prints `k?` | `l3_scaling.csv` | `python3 Audits/audit_l3_scaling.py [--any] ["Star" …]` (WSL) |
 | `audit_q_systematics.py` | Change of i and f over the q uncertainty (published error, or ±15 % for a q-search value), from the q-search profiles | `q_systematics.csv` | `python Audits/audit_q_systematics.py [Targets/phaseF_queue.csv]` |
-| `audit_t1_anchor.py` | Every T₁ against Gaia MSC / GSP-Phot / LAMOST / spectral type; σ_T1; the change rule (Entry 126). Uses astroquery (network) | `t1_anchor.csv` | `python3 Audits/audit_t1_anchor.py [Targets/phaseF_queue.csv]` (minutes) |
+| `audit_colour_teff.py` | Colour temperatures for the T₁ check: Gaia BP−RP dereddened with the Bayestar19 3D dust map (Green et al. 2019; Gaia coefficients of Babusiaux et al. 2018) and 2MASS J−Ks, through the Mamajek dwarf table (`Audits/EEM_dwarf_table.txt`). Reads ONE map pixel per star (about 200 MB of RAM; the `dustmaps` package would load ~12 GB). Map status per star: reliable / nearer_than_reliable / beyond_reliable / no_coverage (south of −30°). Network: ESA Gaia TAP and IRSA (not CDS); cached in `colour_inputs.csv`, `--cached` reruns offline. **Run before `audit_t1_anchor.py`** | `colour_teff.csv`, `colour_inputs.csv` | `PYTHONPATH=~/dustmaps_pkgs python3 Audits/audit_colour_teff.py [Targets/phaseF_queue.csv] [--cached]` (WSL; ~10 min with the network) |
+| `audit_t1_anchor.py` | Every T₁ against Gaia MSC / GSP-Phot / LAMOST / spectral type / literature and, when `colour_teff.csv` exists, the colour temperatures (J−Ks counts as non-Gaia; BP−RP counts as Gaia; both only for contact stars without third light in production, because a colour is that of the combined light); ESP-HS only where the star is hot by other evidence (another estimate, or an uncorrected colour, ≥ 7500 K); σ_T1; the change rule (Entry 126). Uses astroquery (network); `--offline` rebuilds from the existing table without the network (catalogue values kept; T₁, status, literature and colours refreshed) | `t1_anchor.csv` | `python3 Audits/audit_t1_anchor.py [Targets/phaseF_queue.csv]` (minutes) or `--offline` (seconds) |
 | `audit_error_floor.py` | Share of the bins where the 0.003 floor dominates the error | `error_floor.csv` | `python Audits/audit_error_floor.py Targets/phaseF_queue.csv` |
 | `audit_error_budget.py` | Per finished star: statistical error, β (correlated residuals), T₁ term (with the ramp, `_lo/_hi`), gravity-darkening term, q term, spot term (a minimum, two-sided q; Entries 146–147; a star listed in `Audits/spot_terms.csv` uses its own spotted-fit shifts instead, Entry 162; that table is local), LD shift, third-light share; r₂ of semi-detached stars from the q posterior. `ACCEPT_STALLED` names the one stalled fit allowed in the gravity-darkening slope (RZ Dra, Entry 139) | `error_budget.csv` | `python3 Audits/audit_error_budget.py <finished stars.csv>` (WSL; about a minute per star) |
 | `audit_test_registry.py` | Test registry: fits / converged / capped per label, settings that drifted from production, label check; writes the thesis tables | `test_registry_report.md`, `Text/generated/tab_*.tex` | `python Audits/audit_test_registry.py` (seconds; §12) |
@@ -1041,6 +1052,13 @@ model_tests, oconnell, q_systematics, l3_scaling, t1_anchor, error_floor (.csv)
 | `audit_eclipse_shapes.py` | Which star is larger, from the shapes of the two minima | `eclipse_shapes.csv` | `python Audits/audit_eclipse_shapes.py Targets/<queue>.csv [--all]` |
 | `audit_fourier_morphology.py` | Rucinski a₂–a₄ Fourier test of contact vs non-contact light curves (model-type research) | `fourier_morphology.csv` | `python Audits/audit_fourier_morphology.py` |
 | `audit_lobe_plausibility.py` | Main-sequence radius against the Roche lobe at the star's period and q | `lobe_plausibility.csv` | `python Audits/audit_lobe_plausibility.py` |
+
+**Spot-term rule (fixed 11 Nov 2026, Entry 164; full text above `SPOT` in `audit_error_budget.py`).** Fixed before further spot fits, so the term cannot drift towards whatever looks best.
+
+- A spot shift counts only from a **converged** spotted fit against a no-spot reference of the same batch; capped fits are continued or not used.
+- **Residual wave** A_res: rms of a 4th-order Fourier fit to the 151 binned residuals of the production fit (% of the flux; constant term not counted; first computed for the 8 finished stars by `Runs/spot_rule/residual_wave.py`). Trigger for a spot term: |O'Connell| ≥ 1 % **or** A_res ≥ 0.3 % (the 0.003 error floor). Each triggered finished star is proposed for spot fits (ask).
+- Own converged fits → own shifts (`Audits/spot_terms.csv`). Other triggered stars: ±k·A_res per quantity (k = 90th percentile of |shift|/A_res in its group: contact + semi-detached, or detached), **only if** the group has ≥ 8 converged fits and a one-sided Spearman test gives p < 0.05; otherwise the flat term (largest |shift| below 10 fits, 90th percentile from 10).
+- Recomputed **once**, in the January audit pass after the production freeze. Interim: i −0.9…+1.0°, q −4…+3 %, f −0.001…+0.008, T₂ ≤ 81 K (≤ 120 K detached), trigger |O'Connell| ≥ 1 % only (A_res not computed yet).
 
 ---
 

@@ -15,6 +15,7 @@ __pycache__/
 !third_light.csv
 !star_priors.csv
 !phaseF_queue.csv
+!variable_neighbours.csv
 
 # Per-target MCMC results stay PRIVATE (unpublished thesis data)
 results_*.csv

@@ -89,6 +89,8 @@ GLOBS: list[tuple[Path, str, Path]] = [
     # 60-star production queue that several audits take as their default (10 Nov 2026).
     (CODE / "Targets", "star_priors.csv",          REPO / "data" / "targets"),
     (CODE / "Targets", "phaseF_queue.csv",         REPO / "data" / "targets"),
+    # Known variable neighbours inside a star's aperture, read by Modeling.py 5A2 (12 Nov 2026).
+    (CODE / "Targets", "variable_neighbours.csv",  REPO / "data" / "targets"),
 ]
 
 # Hard guard: never publish these, whatever a pattern might match.

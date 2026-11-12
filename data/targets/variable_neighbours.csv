@@ -1,0 +1,2 @@
+name,neighbour,separation_arcsec,harmonics,evidence,reference
+BW Dra,BV Dra,16,30,"BV Dra's eclipses in BW Dra's sector-23 light curve: residuals folded at BV Dra's period = BV Dra's light curve x 0.935 (48 % of the aperture light; CROWDSAP 0.518); removing them changes the binned curve by 2.05 % rms and i by +1.4 deg (test fits)","This work: TESS sector 23 light-curve analysis, November 2026"
