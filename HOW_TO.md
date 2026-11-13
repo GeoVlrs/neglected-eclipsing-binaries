@@ -525,6 +525,10 @@ needed only across machines; `smoke_05.sh` adds it anyway.
   `data/plots/thesis/appendix_mesh_gallery.png` (also copied to `../Text/Figures/`).
 - **Re-run behaviour:** it renders only images missing or older than their bundle.
   `FORCE_RERENDER=1` renders everything.
+- **Mesh retry.** If PHOEBE raises "Projections are failing!" (seen on a
+  lobe-filling star, V1034 Cyg), the mesh is recomputed at 1.5× and then 2× the
+  bundle's triangle count, for the render only. The log prints `[mesh retry]` and
+  the run statistics record it (Pipeline_Log Entry 171).
 
 ### 5.7 `GenerateThesisTables.py`: LaTeX results table
 
@@ -1055,7 +1059,7 @@ model_tests, oconnell, q_systematics, l3_scaling, colour_teff → t1_anchor, err
 
 **Spot-term rule (fixed 11 Nov 2026, Entry 164; full text above `SPOT` in `audit_error_budget.py`).** Fixed before further spot fits, so the term cannot drift towards whatever looks best.
 
-- A spot shift counts only from a **converged** spotted fit against a no-spot reference of the same batch; capped fits are continued or not used.
+- A spot shift counts only from a **converged** spotted fit against a no-spot reference of the same batch; capped fits are continued or not used. Amendment of 13 Nov 2026 (item 1a, after DF Hya): a converged fit is not used while a capped fit of the same batch has less than half its χ²; the capped fit is continued once, and if it still has not converged the star takes the sample-wide term.
 - **Residual wave** A_res: rms of a 4th-order Fourier fit to the 151 binned residuals of the production fit (% of the flux; constant term not counted; first computed for the 8 finished stars by `Runs/spot_rule/residual_wave.py`). Trigger for a spot term: |O'Connell| ≥ 1 % **or** A_res ≥ 0.3 % (the 0.003 error floor). Each triggered finished star is proposed for spot fits (ask).
 - Own converged fits → own shifts (`Audits/spot_terms.csv`). Other triggered stars: ±k·A_res per quantity (k = 90th percentile of |shift|/A_res in its group: contact + semi-detached, or detached), **only if** the group has ≥ 8 converged fits and a one-sided Spearman test gives p < 0.05; otherwise the flat term (largest |shift| below 10 fits, 90th percentile from 10).
 - Recomputed **once**, in the January audit pass after the production freeze. Interim: i −0.9…+1.0°, q −4…+3 %, f −0.001…+0.008, T₂ ≤ 81 K (≤ 120 K detached), trigger |O'Connell| ≥ 1 % only (A_res not computed yet).

@@ -146,6 +146,13 @@ MESH_DATASET: str = "mesh01"
 MESH_MODEL: str = "vizmesh"
 COMPUTE_LABEL: str = "phoebe01"
 
+# Mesh densities tried, as multiples of the bundle's own, when the mesher fails on
+# a lobe-filling star (see compute_mesh_dataset). The notes are per star: the main
+# loop empties the list at each star and writes it to the run statistics.
+MESH_RETRY_ERROR: str = "Projections are failing"
+MESH_RETRY_FACTORS: tuple[float, ...] = (1.5, 2.0)
+mesh_retry_notes: list[str] = []
+
 # The contact sheet is emitted once this many stars have converged. Counted
 # from the bundles present on disk, so it grows as batches 3-8 complete.
 FINAL_STAR_GALLERY_THRESHOLD: int = 10
@@ -253,7 +260,37 @@ def compute_mesh_dataset(bundle, times: list[float],
                           distortion_method="roche")
     if irrad_method is not None:
         compute_kwargs["irrad_method"] = irrad_method
-    bundle.run_compute(**compute_kwargs)
+
+    # A star that fills its Roche lobe exactly has a cusp at L1, and the marching
+    # mesher can fail to project a vertex there ("Projections are failing!").
+    # Whether it does depends on the triangle size and on the first time computed
+    # (V1034 Cyg: the quadrature still fails at 2000 and 2100 triangles, passes at
+    # 3000; another start angle, mesh_init_phi, does not help). A denser mesh is
+    # tried, in memory only; the fitted geometry is not touched. Entry 171.
+    stored = int(max(p.get_value() for p in
+                     bundle.filter(qualifier="ntriangles", compute=COMPUTE_LABEL,
+                                   context="compute").to_list()))
+    for factor in (1.0,) + MESH_RETRY_FACTORS:
+        triangles = int(round(stored * factor))
+        if factor != 1.0:
+            for param in bundle.filter(qualifier="ntriangles", compute=COMPUTE_LABEL,
+                                       context="compute").to_list():
+                param.set_value(triangles)
+        try:
+            bundle.run_compute(**compute_kwargs)
+        except Exception as error:
+            if MESH_RETRY_ERROR not in str(error) or factor == MESH_RETRY_FACTORS[-1]:
+                raise
+            print(f"    [mesh retry] '{error}' at {triangles} triangles per star; "
+                  f"trying a denser mesh.")
+            continue
+        if factor != 1.0:
+            note = f"mesh retried at {triangles} triangles (stored {stored})"
+            print(f"    [mesh retry] computed at {triangles} triangles per star "
+                  f"(bundle stores {stored}).")
+            if note not in mesh_retry_notes:
+                mesh_retry_notes.append(note)
+        break
 
     return bundle.hierarchy.get_stars()
 
@@ -551,6 +588,7 @@ for target in target_list:
     is_contact_binary = resolve_morphology(star_name, variable_type)
     run_tracker.star_start(star_name)
     _rendered_before, _skipped_before = n_rendered, n_skipped
+    mesh_retry_notes.clear()
 
     print("\n" + "=" * 70)
     print(f"MESH VISUALISATION: {star_name}  (type: {variable_type})")
@@ -606,7 +644,7 @@ for target in target_list:
                              tier=tier)
         continue
 
-    run_tracker.star_end(star_name, "done", tier=tier,
+    run_tracker.star_end(star_name, "done", reason="; ".join(mesh_retry_notes), tier=tier,
                          rendered=n_rendered - _rendered_before,
                          already_current=n_skipped - _skipped_before)
 

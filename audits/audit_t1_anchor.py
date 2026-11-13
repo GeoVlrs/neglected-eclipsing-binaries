@@ -75,6 +75,9 @@ LITERATURE_T1 = {
                  "2011NewA...16....6E", False),
     "V404 Lyr": (7330, "Lee et al. 2019: Teff,1 7330 +- 150 K from the disentangled primary spectrum [R full text]",
                  "", False),
+    "II UMa":   (6550, "Rucinski et al. 2002 (DDO VI): F5III spectral type, on the dwarf scale (F5); "
+                       "the spectrum includes a third star, L3/(L1+L2) 0.17 [R full text]",
+                 "2002AJ....124.1738R", False),
 }
 CHANGE_AGREE_K = 300.0
 CHANGE_DIFF_K = 500.0

@@ -96,6 +96,16 @@ SPOT_T2_DETACHED = "<=120"
 #  1. A spot shift = a CONVERGED spotted fit minus a no-spot reference fit of the
 #     same batch and settings (the better-chi2 converged spot fit if both stars were
 #     tried). Fits stopped at the model cap are continued to convergence or not used.
+#  1a. ADDED 13 Nov 2026, after DF Hya (Entry 169-170); an amendment made after seeing
+#     that case, not part of the rule as first fixed. A converged spot fit is not used
+#     while a spot fit of the same batch that stopped at the model cap has a chi2 less
+#     than half of its own. The capped fit is then continued (once, up to the same
+#     cap). If it converges, item 1 applies (the better-chi2 converged fit). If it still
+#     has not converged, the star has no own term and takes the sample-wide term.
+#     Reason: Nelder-Mead "converged" means the simplex shrank, not that the best
+#     solution was found. chi2 of the converged fit / capped rival so far: V1128 Tau
+#     408 / 772, TY UMa 49.9 / equal, BV Dra 80.1 / 82.1 (unaffected), DF Hya
+#     244.7 / 44.2 (the one case the amendment acts on).
 #  2. Residual wave A_res of a finished star: the rms of a 4th-order Fourier series
 #     fitted by least squares to the 151 binned residuals (data - model) of its
 #     production fit, in % of the normalised flux (the constant term is fitted but
